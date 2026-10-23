@@ -70,20 +70,31 @@ def source_for(spv):
 
 
 def compile_one(glslang, source, extra, out):
-    """按 target-env 依次尝试，返回 (ok, info)。"""
+    """按 target-env 依次尝试，返回 (ok, info)。
+
+    失败时把**每个** target-env 的报错都带上：老版本 glslang 可能不认识
+    vulkan1.4，若只回最后一条，会把真正有用的 vulkan1.2 报错盖掉。
+    """
     ext = os.path.splitext(source)[1]
     if ext not in STAGE:
         return False, '无法从文件名判断 stage（扩展名 %r 不在 STAGE 表里）' % ext
     stage = STAGE[ext]
-    last = ''
+    errors = []
     for env in TARGET_ENVS:
         cmd = [glslang, '-V', '--target-env', env, '-S', stage, '-e', 'main']
+        # -I：部分 shader 用了 #include 但没声明 GL_GOOGLE_include_directive，
+        # 老版本 glslang 需要显式搜索路径才能解析。
+        cmd += ['-I' + SRC_DIR]
         cmd += BASE_FLAGS + extra + ['-o', out, os.path.join(SRC_DIR, source)]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode == 0:
             return True, env
-        last = (proc.stderr or proc.stdout).strip()
-    return False, last
+        msg = (proc.stderr or proc.stdout).strip()
+        if 'target-env' in msg and ('unknown' in msg.lower() or 'invalid' in msg.lower()):
+            errors.append('[%s] 该 glslang 不支持这个 target-env' % env)
+        else:
+            errors.append('[%s]\n%s' % (env, msg))
+    return False, '\n'.join(errors)
 
 
 def main():
