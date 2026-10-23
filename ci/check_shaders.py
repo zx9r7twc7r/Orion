@@ -69,15 +69,34 @@ def source_for(spv):
     return spv[:-len('.spv')], []
 
 
-def compile_one(glslang, source, extra, out):
-    """按 target-env 依次尝试，返回 (ok, info)。
+def supports_extension(glslang, name):
+    """探测当前 glslang 是否认识某个 GLSL 扩展。"""
+    probe_src = '#version 460\n#extension %s : require\nvoid main() {}\n' % name
+    tmp_dir = tempfile.mkdtemp(prefix='glslang_probe_')
+    src = os.path.join(tmp_dir, 'probe.comp')
+    with open(src, 'w') as fh:
+        fh.write(probe_src)
+    for env in TARGET_ENVS:
+        cmd = [glslang, '-V', '--target-env', env, '-S', 'comp', '-e', 'main',
+               '-o', os.path.join(tmp_dir, 'probe.spv'), src]
+        if subprocess.run(cmd, capture_output=True, text=True).returncode == 0:
+            return True
+    return False
+
+
+def compile_one(glslang, source, extra, out, ser_supported=True):
+    """按 target-env 依次尝试，返回 (status, info)，status ∈ {'ok','skip','fail'}。
 
     失败时把**每个** target-env 的报错都带上：老版本 glslang 可能不认识
     vulkan1.4，若只回最后一条，会把真正有用的 vulkan1.2 报错盖掉。
+
+    工具链缺少 GL_EXT_shader_invocation_reorder（SER）时，用到它的 shader
+    无法编译 —— 那不是源码的问题，标 skip 而不是 fail（本地用 Vulkan SDK
+    的 glslang 1.4.x 仍然会真正编译它们）。
     """
     ext = os.path.splitext(source)[1]
     if ext not in STAGE:
-        return False, '无法从文件名判断 stage（扩展名 %r 不在 STAGE 表里）' % ext
+        return 'fail', '无法从文件名判断 stage（扩展名 %r 不在 STAGE 表里）' % ext
     stage = STAGE[ext]
     errors = []
     for env in TARGET_ENVS:
@@ -88,13 +107,16 @@ def compile_one(glslang, source, extra, out):
         cmd += BASE_FLAGS + extra + ['-o', out, os.path.join(SRC_DIR, source)]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode == 0:
-            return True, env
+            return 'ok', env
         msg = (proc.stderr or proc.stdout).strip()
         if 'target-env' in msg and ('unknown' in msg.lower() or 'invalid' in msg.lower()):
             errors.append('[%s] 该 glslang 不支持这个 target-env' % env)
         else:
             errors.append('[%s]\n%s' % (env, msg))
-    return False, '\n'.join(errors)
+    joined = '\n'.join(errors)
+    if not ser_supported and 'GL_EXT_shader_invocation_reorder' in joined:
+        return 'skip', '当前 glslang 不支持 GL_EXT_shader_invocation_reorder（SER）'
+    return 'fail', joined
 
 
 def main():
@@ -115,7 +137,11 @@ def main():
         return 1
 
     failures = []
+    skipped = []
     tmp = tempfile.mkdtemp(prefix='spv_ci_')
+
+    ser_ok = supports_extension(glslang, 'GL_EXT_shader_invocation_reorder')
+    print('SER 扩展支持: %s' % ('是' if ser_ok else '否（SER 变体会标 SKIP）'))
 
     print('\n[1] 编译每个随包 shader')
     for spv in shipped:
@@ -124,9 +150,15 @@ def main():
             failures.append('%s：源码 %s 不存在' % (spv, src))
             print('  %-44s FAIL（源码 %s 不存在）' % (spv, src))
             continue
-        ok, info = compile_one(glslang, src, extra, os.path.join(tmp, spv))
-        print('  %-44s %s' % (spv, ('OK ' + info) if ok else 'FAIL'))
-        if not ok:
+        status, info = compile_one(glslang, src, extra,
+                                   os.path.join(tmp, spv), ser_ok)
+        if status == 'ok':
+            print('  %-44s OK %s' % (spv, info))
+        elif status == 'skip':
+            print('  %-44s SKIP（%s）' % (spv, info))
+            skipped.append('%s：%s' % (spv, info))
+        else:
+            print('  %-44s FAIL' % spv)
             failures.append('%s（源 %s）:\n%s' % (spv, src, info))
 
     print('\n[2] 源码/产物一一对应')
@@ -156,12 +188,17 @@ def main():
             print('  ! %-42s 本地副本与随包产物不同' % spv)
 
     print('\n================ 结果 ================')
+    if skipped:
+        print('SKIP（%d 项，工具链能力不足，非源码问题）' % len(skipped))
+        for item in skipped:
+            print('~ %s' % item)
     if failures:
         print('FAILED（%d 项）' % len(failures))
         for item in failures:
             print('- %s' % item)
         return 1
-    print('PASS：%d 个 shader 全部可编译，产物与源一致' % len(shipped))
+    print('PASS：%d 个 shader，编译通过 %d 个 / 跳过 %d 个'
+          % (len(shipped), len(shipped) - len(skipped), len(skipped)))
     return 0
 
 
