@@ -42,8 +42,19 @@ jobs:
           else
             chmod +x "$found"
             echo "GLSLANG=$found" >> "$GITHUB_ENV"
+            echo "SDK_OK=1" >> "$GITHUB_ENV"
             "$found" --version | head -3
           fi
+
+      # 硬性断言：SDK 装上了就必须支持 SER。否则 58 个 shader 里那两个只是被
+      # 静默跳过，"绿色"就变成了虚假的安全感 —— 宁可红一次。
+      - name: 断言 SER 扩展可用（SDK 档）
+        if: env.SDK_OK == '1'
+        run: |
+          set -euo pipefail
+          printf '#version 460\n#extension GL_EXT_shader_invocation_reorder : require\nvoid main() {}\n' > /tmp/ser_probe.comp
+          "$GLSLANG" -V --target-env vulkan1.2 -S comp -e main -o /tmp/ser_probe.spv /tmp/ser_probe.comp
+          echo "SER 扩展可用"
 
       - name: 校验 shader 源码与随包 .spv
         run: python3 ci/check_shaders.py --glslang "$GLSLANG"
