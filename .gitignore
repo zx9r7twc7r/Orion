@@ -143,6 +143,8 @@ cpp/external/**/.git
 
 # cpp/shaders 只放源码；编译产物只在 src/main/resources/shaders 存一份
 /cpp/shaders/*.spv
+/cpp/shaders/.perfvar/
+/cpp/shaders/.tmp*/
 
 # shader 目录里的说明文档（源码与 spv 保留）
 /cpp/shaders/*.md
