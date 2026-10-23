@@ -315,20 +315,31 @@ tasks.register("distZip", Zip) {
 
 	// rtx_backend.dll resolves SPIR-V relative to its own directory,
 	// so preserve the runtime shaders/ subdirectory in the distribution.
-	from("run/shaders") {
+	//
+	// 2026-10-23：源目录优先 run/shaders（开发机，可能被 _deploy_stale_spv.py 更新过），
+	// 缺失时回退到 src/main/resources/shaders —— 后者是仓库里唯一被跟踪的那份，
+	// 这样**全新 clone 也能直接 gradlew build**（原先只写 run/，而 run/ 是 gitignore 的，
+	// 新克隆一定抛 "Missing RTX shader files"）。
+	def rtxShaderSrc = file("run/shaders")
+	if (!rtxShaderSrc.isDirectory() || rtxRuntimeShaderFiles.any { !new File(rtxShaderSrc, it).exists() }) {
+		rtxShaderSrc = file("src/main/resources/shaders")
+	}
+	logger.lifecycle("[RTX distZip] shaders <- ${rtxShaderSrc}")
+
+	from(rtxShaderSrc) {
 		include rtxRuntimeShaderFiles
 		into "shaders"
 	}
 
 	doFirst {
 		def missingShaders = rtxRuntimeShaderFiles.findAll {
-			!file("run/shaders/${it}").exists()
+			!new File(rtxShaderSrc, it).exists()
 		}
 
 		if (!missingShaders.isEmpty()) {
 			throw new GradleException(
 					"Missing RTX shader files: " +
-							missingShaders.collect { "run/shaders/${it}" }.join(", ")
+							missingShaders.collect { new File(rtxShaderSrc, it) }.join(", ")
 			)
 		}
 	}

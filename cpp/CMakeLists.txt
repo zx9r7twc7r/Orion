@@ -44,31 +44,61 @@ set(SOURCES
 # 生成动态链接库
 add_library(rtx_backend SHARED ${SOURCES})
 
+# ---------------------------------------------------------------------------
+# 离线工具（可选）
+#
+# 2026-10-23：这些工具的源码在 tools/ 下，而 tools/ **不进公开仓库**
+# （仓库只保留 mod 与 RT 后端源码）。因此这里全部改成"文件存在才建 target"，
+# 只要 tools/ 不在，cmake 配置就能正常通过 —— 否则 configure 阶段会因为
+# 找不到 ../tools/**.cpp 直接失败。
+# ---------------------------------------------------------------------------
+
 # 2026-10-18 体积云离线预览器：跑 cloud_preview.comp.spv（与游戏内 v3 共用
 # cloud_v3_core.glsl），不需要启动客户端就能看到形状/明暗。
 # 用法见 tools/cloudpreview/preview.py。
-add_executable(cloudpreview ../tools/cloudpreview/preview.cpp)
-target_include_directories(cloudpreview PRIVATE ${Vulkan_INCLUDE_DIRS})
-target_link_libraries(cloudpreview PRIVATE ${Vulkan_LIBRARIES})
-if(MSVC)
-    target_compile_options(cloudpreview PRIVATE /utf-8)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/cloudpreview/preview.cpp)
+    add_executable(cloudpreview ../tools/cloudpreview/preview.cpp)
+    target_include_directories(cloudpreview PRIVATE ${Vulkan_INCLUDE_DIRS})
+    target_link_libraries(cloudpreview PRIVATE ${Vulkan_LIBRARIES})
+    if(MSVC)
+        target_compile_options(cloudpreview PRIVATE /utf-8)
+    endif()
+else()
+    message(STATUS "skip cloudpreview (tools/ 不在仓库内)")
+endif()
+
+# 2026-10-23 后处理离线验证器：把游戏同一份 rr_sdr_post.comp.spv 跑在 headless
+# Vulkan compute 上，把 ACES 2.0 等色彩映射的 GPU 结果读回 CPU（tools/aces2/gputest.py）。
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/aces2/gputest.cpp)
+    add_executable(aces2gputest ../tools/aces2/gputest.cpp)
+    target_include_directories(aces2gputest PRIVATE ${Vulkan_INCLUDE_DIRS})
+    target_link_libraries(aces2gputest PRIVATE ${Vulkan_LIBRARIES})
+    if(MSVC)
+        target_compile_options(aces2gputest PRIVATE /utf-8)
+    endif()
+else()
+    message(STATUS "skip aces2gputest (tools/ 不在仓库内)")
 endif()
 
 # 2026-10-18 交互式预览器：开窗口实时飞行查看（同一份 cloud_v3_core.glsl）。
-add_executable(cloudviewer
-    ../tools/cloudpreview/viewer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/imgui.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/imgui_draw.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/imgui_tables.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/imgui_widgets.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/backends/imgui_impl_win32.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/backends/imgui_impl_vulkan.cpp)
-target_include_directories(cloudviewer PRIVATE ${Vulkan_INCLUDE_DIRS}
-    ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui
-    ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/backends)
-target_link_libraries(cloudviewer PRIVATE ${Vulkan_LIBRARIES})
-if(MSVC)
-    target_compile_options(cloudviewer PRIVATE /utf-8)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../tools/cloudpreview/viewer.cpp)
+    add_executable(cloudviewer
+        ../tools/cloudpreview/viewer.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/imgui.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/imgui_draw.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/imgui_tables.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/imgui_widgets.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/backends/imgui_impl_win32.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/backends/imgui_impl_vulkan.cpp)
+    target_include_directories(cloudviewer PRIVATE ${Vulkan_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui/backends)
+    target_link_libraries(cloudviewer PRIVATE ${Vulkan_LIBRARIES})
+    if(MSVC)
+        target_compile_options(cloudviewer PRIVATE /utf-8)
+    endif()
+else()
+    message(STATUS "skip cloudviewer (tools/ 不在仓库内)")
 endif()
 
 # 仅链接 Vulkan 标准库，移除对 sl.interposer.lib 的强制链接
