@@ -1,0 +1,23 @@
+name: shader-check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shaders:
+    name: glslang 编译校验
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 glslang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools
+          glslangValidator --version | head -3
+
+      - name: 校验 shader 源码与随包 .spv
+        run: python3 ci/check_shaders.py
