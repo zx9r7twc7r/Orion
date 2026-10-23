@@ -316,3 +316,99 @@ denoiser's job"，guides.slang:277 "consumed by the denoiser/DLSS-RR"），
 
 回滚：把本行改回 true 即完整恢复（NRD 集成代码原地保留，未删任何东西）。
 =====================================================================
+
+<a id="diffuse-prepass"></a>
+
+## 第三次应用 D：关掉 diffuse prepass blur
+
+原位置：`cpp/VulkanCore.cpp:31139-31179`（41 行）
+
+★ 2026-09-27 第三次应用 D：关掉 diffuse prepass blur（这是 11 轮里从未碰过的参数）
+
+依据（来自用户截图 + Advisor 的方向性分析）：
+  截图里地面的条纹**基本水平**：沿屏幕 X 拉长、垂直方向只有几个像素，
+  而且平行于屏幕坐标轴。这是**屏幕空间的方向性相关**，采样方差不会长这样
+  （方差是随机颗粒）。方向性相关最常见的来源就是**可分离滤波**——而 REBLUR
+  的 prepass 正是一个大半径空间预滤波。
+
+关键：diffusePrepassBlurRadius 的 REBLUR 默认值是 30.0，我们 `settings = {}`
+一直吃到这个默认值，**从本次会话开始到现在从未被修改过**。这就解释了为什么
+条纹的"形状"对所有改动都不变——我一直改的都是别的参数（降噪器模型、累积窗口、
+sigma、antilag、候选数、种子、donor 信任、渲染分辨率），而真正产生条纹的
+这个参数**一次都没被碰过**。
+
+30 像素的半径在 707x376 的渲染分辨率上相当于屏幕宽度的 4%，对 1spp 输入来说
+是极重的空间滤波。
+
+回滚：把两行改回 30.0f / 50.0f 即恢复 REBLUR 默认行为。
+若本条无效（条纹不变），则说明条纹在滤波上游，下一步改用
+RESTIR_FINAL_DEBUG_RAW 直接转储 pre-NRD 原始估计值来定位。
+★ 2026-09-29：**恢复官方默认的 pre-pass**（30 / 50），撤销此前置 0 的改动。
+依据：NRD README 的命中距离要求里明确写着
+  "Pre-pass must be enabled (i.e. diffusePrepassBlurRadius and
+   specularPrepassBlurRadius must be non-0)"
+且 "Input signal quality can be improved by enabling pre-pass"。
+我们的输入是 1spp 二值可见性，属于"脏信号"，正是 pre-pass 的适用场景；
+13:46 录屏的满幅高频噪点也需要这道空间预滤波。
+旧结论（"prepass 产生水平条纹"）来自三层叠加时期，单降噪器下需重新评估；
+若条纹复现，回退两行为 0.0f（并记录）。
+★ 2026-09-29 第 2 项：diffuse 置 0，撤销 30 / 50 的"官方默认值"。
+
+依据一（Radiance）：REBLUR 实例（diffuse=0.0f, specular=20.0f）与
+  RELAX 实例（diffuse=0.0f, specular=0.0f）的 diffusePrepassBlurRadius **都是 0**。
+依据二（NRD README:905-910）："Pre-pass must be enabled" 这条约束只适用于
+  "In case of probabilistic diffuse / specular split at the primary hit"——
+  我们不做主命中的概率性 lobe 拆分（见本函数上方 19162 行的说明），前提不成立。
+依据三（NRD 源码 Reblur.cpp:119）：
+  skipPrePass = (diffRadius==0 || !hasDiffuse) && (specRadius==0 || !hasSpecular)
+  本实例只有 diffuse ⇒ 置 0 会**整条跳过 pre-pass**。AREA_5X5 的命中距离重建不受影响，仍然在跑
+  （Reblur.cpp:135-142 会把 passIndex 切到 +2 变体）。
+回退：改回 30.0f / 50.0f。
+
+<a id="diffuse-prepass"></a>
+
+## 第三次应用 D：关掉 diffuse prepass blur
+
+原位置：`cpp/VulkanCore.cpp:31139-31179`（41 行）
+
+★ 2026-09-27 第三次应用 D：关掉 diffuse prepass blur（这是 11 轮里从未碰过的参数）
+
+依据（来自用户截图 + Advisor 的方向性分析）：
+  截图里地面的条纹**基本水平**：沿屏幕 X 拉长、垂直方向只有几个像素，
+  而且平行于屏幕坐标轴。这是**屏幕空间的方向性相关**，采样方差不会长这样
+  （方差是随机颗粒）。方向性相关最常见的来源就是**可分离滤波**——而 REBLUR
+  的 prepass 正是一个大半径空间预滤波。
+
+关键：diffusePrepassBlurRadius 的 REBLUR 默认值是 30.0，我们 `settings = {}`
+一直吃到这个默认值，**从本次会话开始到现在从未被修改过**。这就解释了为什么
+条纹的"形状"对所有改动都不变——我一直改的都是别的参数（降噪器模型、累积窗口、
+sigma、antilag、候选数、种子、donor 信任、渲染分辨率），而真正产生条纹的
+这个参数**一次都没被碰过**。
+
+30 像素的半径在 707x376 的渲染分辨率上相当于屏幕宽度的 4%，对 1spp 输入来说
+是极重的空间滤波。
+
+回滚：把两行改回 30.0f / 50.0f 即恢复 REBLUR 默认行为。
+若本条无效（条纹不变），则说明条纹在滤波上游，下一步改用
+RESTIR_FINAL_DEBUG_RAW 直接转储 pre-NRD 原始估计值来定位。
+★ 2026-09-29：**恢复官方默认的 pre-pass**（30 / 50），撤销此前置 0 的改动。
+依据：NRD README 的命中距离要求里明确写着
+  "Pre-pass must be enabled (i.e. diffusePrepassBlurRadius and
+   specularPrepassBlurRadius must be non-0)"
+且 "Input signal quality can be improved by enabling pre-pass"。
+我们的输入是 1spp 二值可见性，属于"脏信号"，正是 pre-pass 的适用场景；
+13:46 录屏的满幅高频噪点也需要这道空间预滤波。
+旧结论（"prepass 产生水平条纹"）来自三层叠加时期，单降噪器下需重新评估；
+若条纹复现，回退两行为 0.0f（并记录）。
+★ 2026-09-29 第 2 项：diffuse 置 0，撤销 30 / 50 的"官方默认值"。
+
+依据一（Radiance）：REBLUR 实例（diffuse=0.0f, specular=20.0f）与
+  RELAX 实例（diffuse=0.0f, specular=0.0f）的 diffusePrepassBlurRadius **都是 0**。
+依据二（NRD README:905-910）："Pre-pass must be enabled" 这条约束只适用于
+  "In case of probabilistic diffuse / specular split at the primary hit"——
+  我们不做主命中的概率性 lobe 拆分（见本函数上方 19162 行的说明），前提不成立。
+依据三（NRD 源码 Reblur.cpp:119）：
+  skipPrePass = (diffRadius==0 || !hasDiffuse) && (specRadius==0 || !hasSpecular)
+  本实例只有 diffuse ⇒ 置 0 会**整条跳过 pre-pass**。AREA_5X5 的命中距离重建不受影响，仍然在跑
+  （Reblur.cpp:135-142 会把 passIndex 切到 +2 变体）。
+回退：改回 30.0f / 50.0f。

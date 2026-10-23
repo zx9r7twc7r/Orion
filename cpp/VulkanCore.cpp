@@ -2263,70 +2263,11 @@ static uint32_t g_perfL10SerPrimToggle = 0u;
 static uint32_t g_perfL10SerPathsPhase = 0u;
 
 
-// Perf-L10.9 - SER overhead attribution.
-//
-// The group rotation above measured all three path groups, and the visibility
-// group came out clearly worse (+1.99 ms on rt, t = 10.37, n = 28) while the
-// other two stayed inside the noise.  This rotation isolates WHERE that cost
-// sits by changing the shape of the SER sequence on the visibility group, the
-// one with by far the best signal-to-noise:
-//   0 = plain traceRayEXT, group lane off
-//   1 = hit object + fused reorder with the custom coherence hint (adopted)
-//   2 = hit object + fused reorder with the driver-picked key
-//   3 = hit object + execute with no reordering at all
-// Comparing 1 against 2 charges the custom hint and the extra SBT query it
-// needs; comparing 2 against 3 charges the reordering itself.
-//
-// The shader reads the group lane as the mode, so 1..3 also enable the group.
-// There is deliberately no separate mode lane: every perf lane is spoken for,
-// and historyPadding0 is not free either - it carries the upscaler-mode marker
-// that the ReSTIR/DLSS handoff reads.
-// Perf-L10.10 - SER pinned to what can pay for it, and the freed tail lane
-// measures the RTAO dead-ray removal instead.
-//
-// The mode rotation above settled where the entry fee lives: dropping the
-// reordering (mode 3) did not make the hit-object path cheaper, it made it the
-// most expensive of the three (+1.76 ms, t = 3.43), and dropping the custom hint
-// (mode 2) changed nothing measurable (+1.37 ms against +1.60 ms, well inside
-// the standard error).  So the cost is the hit-object plumbing itself - the
-// buffered traversal result plus the deferred shader launch - and a hit object
-// only pays when the deferred shading is heavy and divergent.
-//
-// The Khronos SER sample's "When to Use SER" section agrees: multi-bounce path
-// tracing, material diversity, secondary scattered rays and stochastic
-// divergence benefit; highly coherent primary rays and low-divergence shaders
-// do not.
-//
-// Pinned configuration from that reading:
-//   .x = 1  diffuse-GI secondary bounce  (the measured win, -20% / -41%)
-//   .y = 0  visibility group dropped     (measured +1.99 ms, t = 10.37)
-//   .z = 1  transmission / secondary scattered walks
-//   .w      reused: 1 skips the dead RTAO trace
-// 2026-10-07 SER key-shape ladder (replaces the retired 1/2/3 rotation).
-// When enabled, perfSerAb.z -- the radiance group lane that doubles as the
-// funnel mode in rt_test.rgen's serTraceRay -- rotates 1 -> 4 -> 5 -> 6 per
-// window so every shape of the hit-object sequence is measured in one session
-// against the same scene:
-//   1 the shipped custom-key reorder (baseline of the ladder)
-//   4 post-trace instance-class coherence key (role table + miss + SBT record)
-//   5 fully-fused hitObjectTraceReorderExecuteEXT with the driver-picked key
-//   6 mode 1 everywhere plus the DISTANCE_ONLY water-guide probe switched to
-//     an rgen-side hit-object query (the one pixel-unequal arm -- perf only)
-// Modes 4/5 are pixel-equal to mode 1 at every funnel call site (same ray,
-// same flags, only the scheduling/key differ); arm 6 trades the probe's
-// any-hit filtering for zero hit-shader dispatch, so it is a perf-only arm.
-// The window accumulator keys off the same phase, so windows never average
-// two modes together, and the GPU window log prints serMode= per window --
-// tools/ser/summarize_ser_ab.py turns a session's rt_debug.log into the
-// per-mode comparison table.  After the winning mode is chosen, set false
-// and pin that mode in updatePerfL10SerPathToggles.
-//
-// 2026-10-07 测量结论（三轮，最后一轮为修复流式后的干净样本，每 mode 34 个
-// 窗口）：gpuRt 均值 15.66 / 16.10 / 16.17 / 15.66（mode 1/4/5/6），峰值
-// 19.0~20.0 —— 全部落在 ±1.5% 噪声带内，前两轮被流式 bug 污染的样本符号
-// 互相矛盾也印证了这一点。结论：键内容与融合调用在真实场景里不产生可复现
-// 的收益（RTXPT 的 1-bit 键保守路线再次成立），生产 pin 回 mode 1；三条新
-// 臂保留在 shader 里备用（换驱动/换场景类型时改这个常量即可重测）。
+// Perf-L10.9 - SER overhead attribution：可见性组的轮换结论 ——
+// 键内容（自定义 coherence hint vs 驱动选键）与融合调用在真实场景里**没有可复现收益**
+// （2026-10-07 三轮，四个 mode 的 gpuRt 全落在 ±1.5% 噪声带内），因此生产 pin 回 mode 1；
+// 三条新臂保留在 shader 里，换驱动/换场景时改常量即可重测。
+// 轮换设计与逐轮读数见 docs/decisions/ser-overhead.md
 constexpr bool PERF_L10_ENABLE_SER_MODE_AB = false;
 // Measured and adopted: skipping those dead AO rays saves 0.54 ms on rt
 // (t = -6.15, n = 144, drift-corrected, both estimators agreeing) and 0.48 ms on
@@ -5814,39 +5755,8 @@ static VkImageLayout g_nrdValidationLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 // 布局里必须有对应项，否则创建管线时 shader 接口与 pipeline layout 不匹配。
 // 以下为原始说明，保留作为重建链路时的口径记录：
 //
-// 2026-09-29 ★ MV 读回探针（binding 57）。这是本会话要建的那台"可信 MV 仪器"。
 //
-// 为什么非要有它：IN_MV（binding 55）既是 NRD 的输入**也是它的输出** —— NRD 的
-// TemporalStabilization pass 会把**它自己跟踪出来的运动**写回同一张图
-// （Reblur_Diffuse.hpp 把 AsUint(ResourceType::IN_MV) 推进 PushOutput）。后果：
-//   * validation 视口 3 读到的是 NRD 的回写值，不是我们写的 MV；
-//   * 合成端 binding 55 读到的同样是被 NRD 覆写后的值。
-// 所以项目此前**不存在**任何能读回"我们自己喂进去的 MV"的仪器 —— 之前"三种不同
-// 的 MV 实现画出逐像素相同的视口 3"就是这么来的。
-//
-// 这张图是私有的：只有 rt_restir_final.rgen 写、rt_nrd_composite.comp 读，
-// NRD 从不碰它（它是我们自己的描述符项，不在 NRD 的 set 里）。
-//
-// 编码（RGBA16F）：
-//   R/G = mv.xy，单位是**渲染像素**（rgen 里已乘 renderSize）。UV 直接存的话
-//         典型量级只有 1e-3，屏幕上看不出任何东西（旧的 DEBUG==6 左半屏就是这样
-//         失效的）；像素单位可以直接按"每帧移动多少像素"判读。
-//   B   = mv.z（2.5D 的 viewZ 差，单位与 IN_VIEWZ 同口径）
-//   A   = 本帧这个像素的 MV 是**怎么得到的**，四态（rgen 侧赋值，取值都是 fp16 精确值）：
-//           0.00 = 天空 / 无效接收面（提前返回，那条路径只往 IN_MV 写 0）
-//           0.25 = 内层门 `previousClip.w > 1e-5` 失败 ⇒ MV 保持初值 0
-//           0.50 = 外闸 `historyValid==0 || frameCount==0` 失败 ⇒ MV 保持初值 0
-//           1.00 = 完整走完复投影
-//         加这一维的理由：MV 全 0 有三种完全不同的成因，只画数值无法区分；而
-//         「内层 previousClip.w 门整屏失败」正是源码里标注的头号嫌疑。
-//
-// 判读（合成端 NRD_COMPOSITE_DEBUG==8，见 rt_nrd_composite.comp）：
-//   白     = 整个屏幕都是 0.00（天空/无效接收面）
-//   绿     = 0.25 占了屏幕 ⇒ **内层 previousClip.w 门整屏失败，找到根因**
-//   黄     = 0.50 占了屏幕 ⇒ 外闸失败（historyValid/frameCount），往上查相机 UBO
-//   黑/红/青 = 真正算出的 MV 场（黑=0；红=+x/+y；青=−x/−y）
-//             相机匀速转动时应当是**光滑的渐变**（≈绕屏幕中心的旋转流场）⇒ MV 无罪；
-//             若是碎斑/随机反号 ⇒ MV 数值本身有问题。
+// 仪器说明书（设计动机、伪彩读法）见 docs/decisions/mv-probe.md
 static VkImage g_nrdMvProbeImage = VK_NULL_HANDLE;
 static VkDeviceMemory g_nrdMvProbeMemory = VK_NULL_HANDLE;
 static VkImageView g_nrdMvProbeView = VK_NULL_HANDLE;
@@ -31136,47 +31046,11 @@ static void nrdBuildReblurSettings(nrd::ReblurSettings& settings)
     settings.returnHistoryLengthInsteadOfOcclusion = true;
 #endif
 
-    // ★ 2026-09-27 第三次应用 D：关掉 diffuse prepass blur（这是 11 轮里从未碰过的参数）
-    //
-    // 依据（来自用户截图 + Advisor 的方向性分析）：
-    //   截图里地面的条纹**基本水平**：沿屏幕 X 拉长、垂直方向只有几个像素，
-    //   而且平行于屏幕坐标轴。这是**屏幕空间的方向性相关**，采样方差不会长这样
-    //   （方差是随机颗粒）。方向性相关最常见的来源就是**可分离滤波**——而 REBLUR
-    //   的 prepass 正是一个大半径空间预滤波。
-    //
-    // 关键：diffusePrepassBlurRadius 的 REBLUR 默认值是 30.0，我们 `settings = {}`
-    // 一直吃到这个默认值，**从本次会话开始到现在从未被修改过**。这就解释了为什么
-    // 条纹的"形状"对所有改动都不变——我一直改的都是别的参数（降噪器模型、累积窗口、
-    // sigma、antilag、候选数、种子、donor 信任、渲染分辨率），而真正产生条纹的
-    // 这个参数**一次都没被碰过**。
-    //
-    // 30 像素的半径在 707x376 的渲染分辨率上相当于屏幕宽度的 4%，对 1spp 输入来说
-    // 是极重的空间滤波。
-    //
-    // 回滚：把两行改回 30.0f / 50.0f 即恢复 REBLUR 默认行为。
-    // 若本条无效（条纹不变），则说明条纹在滤波上游，下一步改用
-    // RESTIR_FINAL_DEBUG_RAW 直接转储 pre-NRD 原始估计值来定位。
-    // ★ 2026-09-29：**恢复官方默认的 pre-pass**（30 / 50），撤销此前置 0 的改动。
-    // 依据：NRD README 的命中距离要求里明确写着
-    //   "Pre-pass must be enabled (i.e. diffusePrepassBlurRadius and
-    //    specularPrepassBlurRadius must be non-0)"
-    // 且 "Input signal quality can be improved by enabling pre-pass"。
-    // 我们的输入是 1spp 二值可见性，属于"脏信号"，正是 pre-pass 的适用场景；
-    // 13:46 录屏的满幅高频噪点也需要这道空间预滤波。
-    // 旧结论（"prepass 产生水平条纹"）来自三层叠加时期，单降噪器下需重新评估；
-    // 若条纹复现，回退两行为 0.0f（并记录）。
-    // ★ 2026-09-29 第 2 项：diffuse 置 0，撤销 30 / 50 的"官方默认值"。
-    //
-    // 依据一（Radiance）：REBLUR 实例（diffuse=0.0f, specular=20.0f）与
-    //   RELAX 实例（diffuse=0.0f, specular=0.0f）的 diffusePrepassBlurRadius **都是 0**。
-    // 依据二（NRD README:905-910）："Pre-pass must be enabled" 这条约束只适用于
-    //   "In case of probabilistic diffuse / specular split at the primary hit"——
-    //   我们不做主命中的概率性 lobe 拆分（见本函数上方 19162 行的说明），前提不成立。
-    // 依据三（NRD 源码 Reblur.cpp:119）：
-    //   skipPrePass = (diffRadius==0 || !hasDiffuse) && (specRadius==0 || !hasSpecular)
-    //   本实例只有 diffuse ⇒ 置 0 会**整条跳过 pre-pass**。AREA_5X5 的命中距离重建不受影响，仍然在跑
-    //   （Reblur.cpp:135-142 会把 passIndex 切到 +2 变体）。
-    // 回退：改回 30.0f / 50.0f。
+    // 第三次应用 D：关掉 diffuse prepass blur（REBLUR 默认 30.0 一直是隐式生效的）。
+    // 依据：截图里的条纹沿屏幕轴拉长、垂直方向只有几像素 —— 这是**可分离滤波**的特征，
+    // 而 pre-pass 正是一个大半径空间预滤波；本实例只有 diffuse，置 0 会整条跳过
+    // pre-pass（Reblur.cpp:119 的 skipPrePass），AREA_5X5 的命中距离重建仍在跑。
+    // 回退：改回 30.0f / 50.0f 即恢复。推导见 docs/decisions/nrd-tuning.md#diffuse-prepass
     settings.diffusePrepassBlurRadius = 0.0f;
     // 我们没有镜面分量（REBLUR_DIFFUSE），这一项对 skipPrePass 无影响，
     // 置 0 只是避免它继续扮演一个实际不生效的 20。

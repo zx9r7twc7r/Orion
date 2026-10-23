@@ -16,7 +16,9 @@
 | [`god-rays.md`](god-rays.md) | 体积光介质五度改动史；空气分支为何整体退役、只留水下分支 |
 | [`sun-shadow.md`](sun-shadow.md) | 为什么用阴影图而不是逐 march 样本射线；为什么存深度而不是二值可见性 |
 | [`water-wave-field.md`](water-wave-field.md) | 2026-10-03 移除解析波带的清单与副作用（GUI 四个滑条与解析焦散失去作用对象） |
-| [`nrd-tuning.md`](nrd-tuning.md) | NRD 本地光去噪：lag tuning 第二遍、antilag 对齐、motionVectorBias 曾被误判为根因、本地光全灭的定责过程 |
+| [`nrd-tuning.md`](nrd-tuning.md) | NRD 本地光去噪：lag tuning 第二遍、antilag 对齐、motionVectorBias 曾被误判为根因、本地光全灭的定责过程、关掉 diffuse prepass blur 的依据 |
+| [`ser-overhead.md`](ser-overhead.md) | SER 开销归因：可见性组的键形状/融合调用 A/B，结论是三者都在噪声带内、生产 pin 回 mode 1 |
+| [`mv-probe.md`](mv-probe.md) | MV 读回探针（binding 57）的仪器说明书：为什么必须有它、四种伪彩各代表什么 |
 
 其它文档：
 
