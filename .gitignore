@@ -107,6 +107,9 @@ cpp/external/**/.git
 # 第三方 "RTX40MFG" MFG 解锁模块：非本项目代码、许可未知，不进公开仓库
 /src/main/resources/natives/windows/RTXMFG.dll
 
+# 冗余副本：运行期只从 natives/windows/ 解压，这份是历史遗留
+/src/main/resources/rtx_backend.dll
+
 # 打包产物 / 旧发布 zip：走 GitHub Releases，不进仓库
 /Orion*.zip
 /src.zip

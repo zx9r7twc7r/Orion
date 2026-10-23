@@ -245,8 +245,10 @@ vec3 reinhardJodie(vec3 v)
 // 下方常量数组（着色器里不做 init）。
 //
 // ★ mat3 的构造口径：把 CTL 矩阵的**行**当成 GLSL mat3 的**列**（mat3(r0,r1,r2)），
-//   于是 `v * M` 就等于 CTL 的 mult_f3_f33(v, M)（out[j] = Σ_i v[i]*M[i][j]）。
-//   千万不要写成 M * v。
+//   于是只有 **`M * v`** 等于 CTL 的 mult_f3_f33(v, M)（out[j] = Σ_i v[i]*M[i][j]）。
+//   `v * M` 是行向量×矩阵（= vᵀM），语义与 CTL 转置。
+//   2026-10-23 正是把它写成了 `v * M`：实机 ACES 2.0 满屏纯红（GPU 把
+//   sRGB→AP0 算成了行点积，J 直接飙到 6.7e4，最后 clamp 成 (1,0,0)）。
 // ===========================================================================
 
 //@@ACES2_BAKED_BEGIN@@
@@ -254,7 +256,9 @@ vec3 reinhardJodie(vec3 v)
 // 参考：aces-core Lib.Academy.OutputTransform.ctl / Tonescale.ctl / DisplayEncoding.ctl
 // 预设：Output.Academy.Rec709-D65_100nit_in_Rec709-D65_Gamma2pt2.ctl
 //   limitingPri = Rec.709 primaries / D65 white, peakLuminance = 100, scale_white = false
-// GLSL 的 mat3 用「CTL 的行作为 GLSL 的列」构造 ⇒ 必须写成 v * M（行向量×矩阵）。
+// GLSL 的 mat3 用「CTL 的行作为 GLSL 的列」构造 ⇒ 只有 `M * v` 等价于
+// CTL 的 mult_f3_f33(v, M)；写成 `v * M` 是行向量×矩阵（vᵀM），语义转置。
+// 2026-10-23 事故：写成 v * M ⇒ 实机 ACES 2.0 满屏纯红。
 
 const float ACES2_REF_LUMINANCE = 100.0;
 const float ACES2_CONE_OFFSET = 2.713000000e+01f;
@@ -654,16 +658,16 @@ float a2YToJ(float y)
 
 vec3 a2RgbToAab(vec3 rgb, mat3 rgbToCam16c, mat3 coneToAab)
 {
-    vec3 m = rgb * rgbToCam16c;
+    vec3 m = rgbToCam16c * rgb;
     vec3 a = vec3(a2ConeFwd(m.x), a2ConeFwd(m.y), a2ConeFwd(m.z));
-    return a * coneToAab;
+    return coneToAab * a;
 }
 
 vec3 a2AabToRgb(vec3 aab, mat3 aabToCone, mat3 cam16cToRgb)
 {
-    vec3 a = aab * aabToCone;
+    vec3 a = aabToCone * aab;
     vec3 m = vec3(a2ConeInv(a.x), a2ConeInv(a.y), a2ConeInv(a.z));
-    return m * cam16cToRgb;
+    return cam16cToRgb * m;
 }
 
 vec3 a2AabToJmh(vec3 aab)
@@ -964,16 +968,16 @@ vec3 a2GamutCompressFwd(vec3 jmh)
 // OutputTransform.ctl: clamp_AP0_to_AP1
 vec3 a2ClampAp0ToAp1(vec3 aces)
 {
-    vec3 ap1 = aces * ACES2_AP0_TO_AP1;
+    vec3 ap1 = ACES2_AP0_TO_AP1 * aces;
     vec3 ap1Clamped = clamp(ap1, vec3(0.0), vec3(ACES2_TS_FORWARD_LIMIT));
-    return ap1Clamped * ACES2_AP1_TO_AP0;
+    return ACES2_AP1_TO_AP0 * ap1Clamped;
 }
 
 // 预设 main() 的前半段：线性 sRGB(D65) → AP0 → outputTransform_fwd →
 // clamp 到峰值 → （scale_white = false，跳过）→ limiting→display 矩阵。
 vec3 aces2DisplayLinear(vec3 linearSrgb)
 {
-    vec3 aces = linearSrgb * ACES2_SRGB_TO_AP0;
+    vec3 aces = ACES2_SRGB_TO_AP0 * linearSrgb;
     aces = a2ClampAp0ToAp1(aces);
 
     vec3 jmh = a2AabToJmh(a2RgbToAab(aces, ACES2_IN_RGB_TO_CAM16C, ACES2_IN_CONE_TO_AAB));
@@ -990,7 +994,48 @@ vec3 aces2DisplayLinear(vec3 linearSrgb)
     vec3 rgb = a2AabToRgb(a2JmhToAab(jmh), ACES2_LIM_AAB_TO_CONE, ACES2_LIM_CAM16C_TO_RGB);
     rgb = clamp(rgb, vec3(0.0), vec3(1.0));
     rgb = rgb * ACES2_WHITE_SCALE;
-    return rgb * ACES2_LIMIT_TO_DISPLAY;
+    return ACES2_LIMIT_TO_DISPLAY * rgb;
+}
+
+// 2026-10-23 临时诊断（mode 7..12）：逐段输出 ACES2 中间量，用于把 GPU 结果与
+// CPU 模型对齐。stage 1=AP0 输入 2=JMh 3=tonescale 后 4=色度压缩后 5=色域压缩后
+// 6=反变换 RGB。诊断完即删。
+vec3 aces2Debug(vec3 linearSrgb, int stage)
+{
+    vec3 aces = a2ClampAp0ToAp1(ACES2_SRGB_TO_AP0 * linearSrgb);
+    if(stage == 1)
+    {
+        return aces * 0.25;
+    }
+
+    vec3 jmh = a2AabToJmh(a2RgbToAab(aces, ACES2_IN_RGB_TO_CAM16C, ACES2_IN_CONE_TO_AAB));
+    if(stage == 2)
+    {
+        return vec3(jmh.x / 100.0, jmh.y / 200.0, jmh.z / 360.0);
+    }
+
+    float linear = a2JToY(jmh.x) / ACES2_REF_LUMINANCE;
+    float tonemappedY = a2TonescaleFwd(linear);
+    float jTs = a2YToJ(tonemappedY);
+    if(stage == 3)
+    {
+        return vec3(jTs / 100.0, tonemappedY / 100.0, 0.0);
+    }
+
+    vec3 jmhC = a2ChromaCompressFwd(jmh, jTs);
+    if(stage == 4)
+    {
+        return vec3(jmhC.x / 100.0, jmhC.y / 200.0, jmhC.z / 360.0);
+    }
+
+    vec3 jmhG = a2GamutCompressFwd(jmhC);
+    if(stage == 5)
+    {
+        return vec3(jmhG.x / 100.0, jmhG.y / 200.0, jmhG.z / 360.0);
+    }
+
+    vec3 rgb = a2AabToRgb(a2JmhToAab(jmhG), ACES2_LIM_AAB_TO_CONE, ACES2_LIM_CAM16C_TO_RGB);
+    return rgb * 0.25;
 }
 
 void main()
@@ -1066,6 +1111,10 @@ void main()
     else if(postPush.tonemapMode == 6)
     {
         displayLinear = aces2DisplayLinear(exposed);
+    }
+    else if(postPush.tonemapMode >= 7 && postPush.tonemapMode <= 12)
+    {
+        displayLinear = aces2Debug(exposed, postPush.tonemapMode - 6);
     }
     else
     {

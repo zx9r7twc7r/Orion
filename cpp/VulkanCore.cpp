@@ -1878,6 +1878,11 @@ enum PerfL10GpuBoundary : uint32_t
     PERF_L10_GPU_B_FAR,        // Minecraft far-raster snapshot copied
     PERF_L10_GPU_B_SETUP,      // RR guides / ReSTIR / VPT history prepared
     PERF_L10_GPU_B_WSIM,       // water simulation done
+    // 2026-10-23 细分：wsim 实测 21~37 ms（占整帧 60~75%），而它原本把三件事
+    // 打包在一个 scope 里 —— 波方程场 / FFT 频谱（34 趟 dispatch + mip 链）/
+    // 折射焦散图（4 遍 × 9 实例 × 256²，1024² 目标）。拆成三段才能定位。
+    PERF_L10_GPU_B_WFFT,       // water FFT update done
+    PERF_L10_GPU_B_WCAUS,      // water caustic map done
     PERF_L10_GPU_B_CAUS,       // water caustics done
     PERF_L10_GPU_B_SKY,        // sky atmosphere done
     PERF_L10_GPU_B_RT,         // main RayGen done
@@ -1900,6 +1905,8 @@ constexpr const char* PERF_L10_GPU_SCOPE_NAMES[PERF_L10_GPU_SCOPE_COUNT] =
     "far",
     "setup",
     "wsim",
+    "wfft",
+    "wcaus",
     "caus",
     "sky",
     "rt",
@@ -42147,6 +42154,15 @@ static void destroyWaterFftResources()
 // 安全阀：g_waterCausticMapAvailable → CameraUBO.waterFftParams2.w。模块失败时
 //   消费端绝不采样 binding 69/70（未写描述符）。
 // ===========================================================================
+// 2026-10-23：这一组**保持原档**（1024 / 256 / 11）。当天先试过降档
+// （512/128/10）验证成本，用户定案改为"雨天整条跳过"，质量不动。
+//
+// 雨天门在 recordWaterCausticMap 里（weatherParams[0] > 0.05 直接 return）：
+//   · 物理：满雨时水面被雨点打碎、直射只剩 10%（WEATHER_RF_SUN_BRIGHTNESS），
+//     焦散本来就看不见；
+//   · 性能：这条链单次 4 遍 × 9 实例 × 256²×6 ≈ 14.2M 顶点 + 4×1024² 光栅 +
+//     20 次 mip blit，而它跟着 FFT 的 30 Hz 时钟走 —— 帧越慢越可能每帧都跑，
+//     于是"雨天掉帧"会自我放大成悬崖（实测 21ms ↔ 34ms 两个平台）。
 constexpr uint32_t WATER_CAUSTIC_MAP_RESOLUTION = 1024u;
 constexpr uint32_t WATER_CAUSTIC_MAP_GRID = 256u;
 // 1024 → 1 共 11 级（与参考的 generateMipmap + mip:true 对应）。
@@ -42737,6 +42753,7 @@ static void createWaterCausticMapResources()
 }
 
 // 逐帧调度：只在 FFT 斜率图**本帧真的重写**时重建（同一 30 Hz 时钟）。
+// 2026-10-23：雨天直接跳过（见下面的雨天门）。
 static void recordWaterCausticMap(VkCommandBuffer cmd)
 {
     const bool fftUpdated = g_waterFftUpdatedThisFrame;
@@ -42757,6 +42774,18 @@ static void recordWaterCausticMap(VkCommandBuffer cmd)
     CameraUBO* ubo = static_cast<CameraUBO*>(g_cameraUboMapped);
     // 维度门：焦散只存在于主世界；下界/末地没有这套水。
     if(ubo->weatherParams[2] > 1.5f)
+    {
+        return;
+    }
+    // 2026-10-23 **雨天门**（用户定案：不降质量，雨天整条跳过）。
+    // 依据：
+    //   · 物理：满雨时水面被雨点打碎、直射只剩 10%（WEATHER_RF_SUN_BRIGHTNESS），
+    //     水下焦散本来就看不见；
+    //   · 性能：这条链跟着 FFT 的 30 Hz 时钟跑，而"帧越慢 ⇒ 越可能每帧都跑"
+    //     会把雨天掉帧放大成悬崖（实测 wsim 在 21ms / 34ms 两个平台间跳）。
+    // 阈值 0.05：MC 的 rainLevel 从 0 渐升到 1，0.05 表示"已经开始下雨"。
+    // 想要"只在大雨时才关"就把它提到 0.3~0.5。
+    if(ubo->weatherParams[0] > 0.05f)
     {
         return;
     }
@@ -60392,8 +60421,13 @@ if(rrGuideBarrierCount > 0)
 
     recordWaterSimulation(cmd);
 
+    // 2026-10-23：wsim scope 拆分（见 enum 处说明）。
+    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_WFFT);
+
     // 2026-10-03 FFT 频谱海面：按 rateHz 限频更新（默认 30 Hz ⇒ 全帧摊销 ~0.05 ms）
     recordWaterFftUpdate(cmd);
+
+    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_WCAUS);
 
     // 2026-10-19 折射焦散图：与 FFT 同一个 30 Hz 时钟（内部靠
     // g_waterFftUpdatedThisFrame 判断本帧是否需要重建），必须在 FFT 之后录。

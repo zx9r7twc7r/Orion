@@ -1965,14 +1965,16 @@ void main()
     // 不需要再加调色板。旧配色保留为 strength=0 的分支。
     const vec3 fogAmbientLegacy =
         mix(vec3(0.055, 0.070, 0.125), vec3(0.62, 0.72, 0.92), dayAmount);
-    const vec3 fogAmbientSky = clearSkyInscatter(
+    // 2026-10-23 修正：环境项取**半球平均**（fogSkyAmbient），不再用视线方向的
+    // 辐亮度 —— 后者含 Mie 前向瓣，会在太阳的屏幕位置烧出一块白斑，
+    // 而且只吃环境压暗地板（0.35）⇒ 隔墙/洞里照样发光。
+    const vec3 fogAmbientSky = fogSkyAmbient(
         worldDirection,
         sunElevation,
         lightDirection,
         directLightColor,
         daylight * clamp(elevationMagnitude, 0.0, 1.0),
-        mix(1.0, 0.20, rain),
-        vec3(1.0));
+        mix(1.0, 0.20, rain));
     const vec3 fogAmbient = mix(fogAmbientLegacy, fogAmbientSky,
         clamp(cam.fogExtrasParams.z, 0.0, 1.0));
 

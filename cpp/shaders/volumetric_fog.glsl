@@ -209,14 +209,18 @@ float fogGroundAnchorOffset(FogGround g, float strength)
 // 成本：每 march 步 2 次 3D 采样 + 1 次高度场采样；`profile > 0.01` 的早退让
 // 抬头上看的样本一次都不采样（雾浪只贴在层内）。
 // ===========================================================================
-// 每格消光（强度 1、满雨、噪声峰值）。与参考密度同量级（满雨带内 ≈2~4e-3/格），
-// 所以它能直接叠在现有雾上，不需要重新标定整个雾。
-const float FOG_WISP_EXTINCTION = 0.0030;
+// 每格消光（强度 1、满雨、噪声峰值）。参考密度满雨带内约 3.9e-3/格 ⇒ 这里的峰值
+// 取它的 2.3 倍，让"浪芯"明显比周围雾更浓（0.0030 只有 0.8 倍、被噪声阈值一削就
+// 看不见了 —— 用户第一版反馈"似乎没有"）。
+const float FOG_WISP_EXTINCTION = 0.0090;
 const float FOG_WISP_VERTICAL_STRETCH = 12.0;
 const float FOG_WISP_WARP = 0.32;
 // 阈值化区间：低于 LO 全透明、高于 HI 满密度 ⇒ 断续成团，不是一层灰纱。
-const float FOG_WISP_THRESHOLD_LO = 0.50;
-const float FOG_WISP_THRESHOLD_HI = 0.74;
+// 第一版是 0.50/0.74：cloudShapeNoise.R 的分布是 mean 0.50 / std 0.11，0.74 在
+// 约 p98 ⇒ 只有 2% 体积能到满强度，平均下来几乎不可见。现在 0.40/0.62（≈p82）
+// 覆盖率约 18%，浪头连成条而不是零星斑点。
+const float FOG_WISP_THRESHOLD_LO = 0.40;
+const float FOG_WISP_THRESHOLD_HI = 0.62;
 // 与 tyndallWind() 同一个风向（云的同一阵风），速度由滑杆独立控制。
 const vec3 FOG_WISP_WIND_DIRECTION = vec3(0.81915204429, 0.0, 0.57357643635);
 
@@ -257,6 +261,47 @@ float fogLightPhase(vec3 toLight, vec3 viewDirection)
 
 // 主入口。前 17 个参数与 2026-10-19 B 方案一致；末尾三个是 2026-10-23 追加的
 // 自创项（地面锚定 / 时域抖动 / 动态光源），全部"0 = 逐位旧档"。
+// ===========================================================================
+// 2026-10-23 修正：环境项**不能**取"视线方向的晴空辐亮度"
+//
+// 症状（用户报告）："有时候可以隔墙看到太阳所在位置的白光"。
+// 根因：clearSkyInscatter() 里含 Mie 前向瓣，正对太阳时比天顶亮一到两个数量级。
+// 我先前直接把它当环境入散射用，于是：
+//   1) 雾变成有方向的 —— 朝太阳看时整层雾发白，白斑钉在太阳的屏幕位置上；
+//   2) 环境项只吃 sunShadow 的"环境压暗地板"（FOG_AMBIENT_SHADOW_FLOOR = 0.35），
+//      所以躲在墙后 / 洞里照样按 35% 发光 ⇒ "隔墙可见"。
+// 物理上环境项是**半球积分**，不能用单方向辐亮度。这里改成对三个固定方向
+// （天顶 / 太阳侧水平 0.2 仰角 / 反太阳侧水平 0.2 仰角）取 HG 加权平均 ——
+// 与 v2/v4 的天光（D6）同一套口径，**不包含指向太阳的那一瓣**，
+// 因此不会在太阳位置形成亮斑；同时保留"日出日落雾自己泛色"的效果。
+// ===========================================================================
+vec3 fogSkyAmbient(
+    vec3 viewDirection,
+    float sunElevation,
+    vec3 lightDirection,
+    vec3 directLightColor,
+    float radianceScale,
+    float weatherFactor)
+{
+    const vec3 sunSideDir = normalize(vec3(lightDirection.x, 0.20, lightDirection.z));
+    const vec3 antiSunDir = normalize(vec3(-lightDirection.x, 0.20, -lightDirection.z));
+    const vec3 radianceZenith = clearSkyInscatter(
+        vec3(0.0, 1.0, 0.0), sunElevation, lightDirection,
+        directLightColor, radianceScale, weatherFactor, vec3(1.0));
+    const vec3 radianceSunSide = clearSkyInscatter(
+        sunSideDir, sunElevation, lightDirection,
+        directLightColor, radianceScale, weatherFactor, vec3(1.0));
+    const vec3 radianceAntiSun = clearSkyInscatter(
+        antiSunDir, sunElevation, lightDirection,
+        directLightColor, radianceScale, weatherFactor, vec3(1.0));
+    const float weightZenith = hgPhase(dot(viewDirection, vec3(0.0, 1.0, 0.0)), 0.25);
+    const float weightSunSide = hgPhase(dot(viewDirection, sunSideDir), 0.25);
+    const float weightAntiSun = hgPhase(dot(viewDirection, antiSunDir), 0.25);
+    return (radianceZenith * weightZenith +
+        radianceSunSide * weightSunSide +
+        radianceAntiSun * weightAntiSun) /
+        max(weightZenith + weightSunSide + weightAntiSun, 1.0e-4);
+}
 // 函数名 evaluateAnalyticFog 是旧名，当前内部已是参考的 march，不是解析闭式雾。
 // fogDensityAt() 来自共享头 fog_density_common.glsl。
 FogResult evaluateAnalyticFog(
@@ -423,7 +468,9 @@ FogResult evaluateAnalyticFog(
         {
             const float groundY = mix(
                 FOG_ANCHOR_REFERENCE_Y, ground.height, ground.weight);
-            const float layerHeight = clamp(wispWavelength * 0.035, 1.5, 20.0);
+            // 层厚 = 波长 × 0.05（180 格 ⇒ 9 格高）。第一版 0.035 只有 6.3 格，
+            // 而 march 只有 6 步、第一步就落在相机上 ⇒ 近场的薄层太容易被跳过。
+            const float layerHeight = clamp(wispWavelength * 0.05, 2.0, 24.0);
             const float profile =
                 exp(-max(fogPos.y - groundY, 0.0) / layerHeight);
             // 早退：离地太高的样本一次都不采样（抬头上看的视线因此零成本）。

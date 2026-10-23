@@ -371,8 +371,9 @@ void main()
     // 同一套标度），按 fogExtrasParams.z 混入 ⇒ 0 逐位旧档。
     const vec3 fogAmbientLegacy =
         mix(vec3(0.055, 0.070, 0.125), vec3(0.62, 0.72, 0.92), dayAmount);
-    const vec3 fogAmbientSky = clearSkyInscatter(worldDirection, sunElevation,
-        lightDirection, directLightColor, skyScale, mix(1.0, 0.20, rain), vec3(1.0));
+    // 2026-10-23 修正：半球平均，不用视线方向（否则太阳位置出白斑、隔墙发光）。
+    const vec3 fogAmbientSky = fogSkyAmbient(worldDirection, sunElevation,
+        lightDirection, directLightColor, skyScale, mix(1.0, 0.20, rain));
     const vec3 fogAmbient = mix(fogAmbientLegacy, fogAmbientSky,
         clamp(cam.fogExtrasParams.z, 0.0, 1.0));
 

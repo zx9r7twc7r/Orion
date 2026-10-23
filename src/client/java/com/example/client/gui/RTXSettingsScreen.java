@@ -313,10 +313,12 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     private int postRrFarCloudDistance;
     /** 2026-10-07 泛光强度：0 = 关。 */
     private float postBloomStrength;
-    /** 2026-10-23 调色调：线性光 R/G/B 增益（1 = 恒等）。 */
-    private float postGainR;
-    private float postGainG;
-    private float postGainB;
+    /** 2026-10-23 调色调：线性光 R/G/B 增益（1 = 恒等）。
+     *  必须显式初始化成 1：滑条最小值为 0.25，字段若还是 Java 默认 0，
+     *  滑条构造时归一化值会被钳到 0（= 0.25），一次「应用」就把 0.25 落盘。 */
+    private float postGainR = 1.0f;
+    private float postGainG = 1.0f;
+    private float postGainB = 1.0f;
 
     private boolean pendingFogEnabled;
     // 2026-10-19 B 方案体积雾（见 cpp/shaders/volumetric_fog.glsl）。旧的噪声尺度 /
