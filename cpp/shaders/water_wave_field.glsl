@@ -1,19 +1,16 @@
 // ===========================================================================
 // Shared water wave field.
 //
-// 2026-10-03：**旧解析自然波面已整体删除**（用户要求）。
-//
-// 现在水面形态由**波方程场单独决定**：
+// 水面形态由**波方程场单独决定**：
 //   · water_sim.comp 的常驻风源 + 交互脉冲 → 波高/速度场（RG16F 双缓冲）
 //   · 本文件只负责把该场转成光学斜率（waterInteractionSlope）
 // 这与参考 HPWater 的机制一致（HPWaterFluidDynamics.cs：没有解析波带、没有风场，
 // 只有一套波方程场 + 外部波源；HPWaterFluidHeightToNormal 就是同一套中心差分）。
 //
-// 被删除的内容：两条 Gerstner 长波带、三组域扭曲、三档噪声倍频程、以及只服务它们
-// 的辅助函数 accumulateFineGerstnerOpticalWave。
-// 副作用：GUI 的「波长倍率 / 主波向 / 涌浪陡度 / 波峰扭曲」失去作用对象（它们只
-// 作用在被删掉的解析波带上）；解析焦散也失去波前细节（焦散与波面同源）。
-// 需要这两层时，再按波方程场给它们重新接靶。
+// **契约：不要再往这里加解析波带**（Gerstner 长波带 / 域扭曲 / 噪声倍频程）。
+// GUI 的「波长倍率 / 主波向 / 涌浪陡度 / 波峰扭曲」与解析焦散目前没有作用对象，
+// 需要这两层时按波方程场重新接靶，而不是把删除的东西加回来。
+// 删除清单与副作用见 docs/decisions/water-wave-field.md
 //
 // Include this AFTER `cam` (CameraProperties) is declared: the field reads
 // cam.waterSim*.
@@ -21,9 +18,8 @@
 
 // 2026-10-15 退役重构：本头文件被两部分消费者共用 ——
 //   ① 水面/焦散（rchit / rgen）：需要 binding 33（交互场）与 59（FFT 涌浪）。
-//   ② 体积光波闪（volumetric_light.comp）：只要无描述符回退的解析细波斜率
-//，不能引入任何新 binding
-//      （否则要为本 pass 扩 C++ 描述符布局）。
+//   ② 体积光波闪（volumetric_light.comp）：只要无描述符回退的解析细波斜率，
+//      不能引入任何新 binding（否则要为本 pass 扩 C++ 描述符布局）。
 // 故这两个 sampler 声明用 WATER_WAVE_FIELD_NO_DESCRIPTORS 守卫：
 // 消费方在 include 之前 #define 它，即可拿到与本文件同一份纯计算函数，
 // 却不引入 binding。见 volumetric_light.comp 的 include 区。
