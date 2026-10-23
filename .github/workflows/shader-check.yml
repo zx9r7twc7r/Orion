@@ -13,11 +13,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 安装 glslang
+      # 用官方 Vulkan SDK 里的 glslang，与开发机（1.4.309.0）同版本。
+      # Ubuntu 自带的 glslang-tools 14.0 不认识 GL_EXT_shader_invocation_reorder（SER），
+      # 会让 rt_test_ser / rt_ser_probe 只能标 SKIP；换 SDK 后它们真正参与编译。
+      - name: 缓存 Vulkan SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/vulkan-sdk
+          key: vulkan-sdk-1.4.309.0-linux-v1
+
+      - name: 准备 glslang
         run: |
-          sudo apt-get update
-          sudo apt-get install -y glslang-tools
-          glslangValidator --version | head -3
+          set -euo pipefail
+          found=$(find "$HOME/vulkan-sdk" -name glslangValidator -type f 2>/dev/null | head -1 || true)
+          if [ -z "$found" ]; then
+            url="https://sdk.lunarg.com/sdk/download/1.4.309.0/linux/vulkan_sdk.tar.xz"
+            mkdir -p "$HOME/vulkan-sdk"
+            echo "下载 Vulkan SDK: $url"
+            curl -fsSL --retry 3 --max-time 900 -o /tmp/vulkan_sdk.tar.xz "$url"
+            tar -xJf /tmp/vulkan_sdk.tar.xz -C "$HOME/vulkan-sdk"
+            found=$(find "$HOME/vulkan-sdk" -name glslangValidator -type f 2>/dev/null | head -1 || true)
+          fi
+          if [ -z "$found" ]; then
+            echo "::warning::Vulkan SDK 不可用，退回 Ubuntu 自带 glslang（SER 变体会被跳过）"
+            sudo apt-get update
+            sudo apt-get install -y glslang-tools
+            echo "GLSLANG=glslangValidator" >> "$GITHUB_ENV"
+          else
+            chmod +x "$found"
+            echo "GLSLANG=$found" >> "$GITHUB_ENV"
+            "$found" --version | head -3
+          fi
 
       - name: 校验 shader 源码与随包 .spv
-        run: python3 ci/check_shaders.py
+        run: python3 ci/check_shaders.py --glslang "$GLSLANG"
