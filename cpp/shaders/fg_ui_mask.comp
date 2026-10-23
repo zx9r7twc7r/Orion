@@ -1,0 +1,94 @@
+#version 460
+
+layout(
+    local_size_x = 8,
+    local_size_y = 8,
+    local_size_z = 1
+) in;
+
+
+layout(
+    set = 0,
+    binding = 0
+)
+uniform sampler2D hudlessImage;
+
+
+layout(
+    set = 0,
+    binding = 1
+)
+uniform sampler2D finalImage;
+
+
+layout(
+    set = 0,
+    binding = 2,
+    r32f
+)
+writeonly uniform image2D uiAlphaImage;
+
+
+void main()
+{
+    ivec2 p =
+        ivec2(
+            gl_GlobalInvocationID.xy
+        );
+
+
+    ivec2 size =
+        imageSize(
+            uiAlphaImage
+        );
+
+
+    if(
+        p.x >= size.x ||
+        p.y >= size.y
+    )
+    {
+        return;
+    }
+
+
+    vec3 hudlessColor =
+        texelFetch(
+            hudlessImage,
+            p,
+            0
+        ).rgb;
+
+
+    vec3 finalColor =
+        texelFetch(
+            finalImage,
+            p,
+            0
+        ).rgb;
+
+
+    bvec3 changed =
+        notEqual(
+            finalColor,
+            hudlessColor
+        );
+
+
+    float alpha =
+        any(changed)
+            ? 1.0
+            : 0.0;
+
+
+    imageStore(
+        uiAlphaImage,
+        p,
+        vec4(
+            alpha,
+            0.0,
+            0.0,
+            1.0
+        )
+    );
+}

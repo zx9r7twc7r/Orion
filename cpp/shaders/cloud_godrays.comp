@@ -1,0 +1,97 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// ===========================================================================
+// 云隙光（god rays）—— 按 postProcess_GodRays.frag 移植
+//
+// 参考做法：
+//   · cloudRayMarch.comp 把 `1 - accumDensity`（云对太阳光的遮挡）写进一张数据图
+//   · postProcess_GodRays.frag 从当前像素沿"指向太阳"的方向做径向模糊
+//     （100 采样、固定衰减、乘 blendFactor 防止太阳转到身后时硬切），
+//     再 `frame += godRayColor`
+//
+// 本引擎的等价物：
+//   · 数据就是云图本身 —— 云输出的 alpha 是透射率，`1 - a` 即参考的遮挡值，
+//     所以不需要额外的数据图。
+//   · 本 pass 在**云分辨率**（通常 1/2）上做径向模糊，输出一张 rgba16f 光柱图；
+//     合成 pass 再乘太阳颜色加进场景。这样 100 次采样只花在 1/4 的像素上。
+//
+// push constant：xyz = 世界空间太阳方向（单位向量），w = 强度倍数；
+//                x/y 另用 params.xy = 采样数 / 衰减后权重归一（默认 48 / 1.0）
+// ===========================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D cloudImage;      // rgb=预乘辐亮度, a=透射率
+layout(rgba16f, set = 0, binding = 1) uniform writeonly image2D godRayOutput;
+
+layout(set = 0, binding = 2) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+layout(push_constant) uniform GodRayPush
+{
+    vec4 sunDirection;   // xyz = 世界空间太阳方向, w = 强度
+    vec4 params;         // x = 采样数, y = 权重, z = 太阳外圈衰减, w = 保留
+} pc;
+
+const int MAX_SAMPLES = 64;
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(godRayOutput);
+    if(any(greaterThanEqual(pixel, size)))
+    {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+
+    // ---- 相机基与太阳的屏幕位置（不需要 CPU 传矩阵）----
+    vec3 camRight = normalize(vec3(cam.viewInverse[0][0], cam.viewInverse[1][0],
+        cam.viewInverse[2][0]));
+    vec3 camUp = normalize(vec3(cam.viewInverse[0][1], cam.viewInverse[1][1],
+        cam.viewInverse[2][1]));
+    vec3 camForward = -normalize(vec3(cam.viewInverse[0][2], cam.viewInverse[1][2],
+        cam.viewInverse[2][2]));
+
+    vec3 sunDirection = normalize(pc.sunDirection.xyz);
+    // 太阳转到相机身后时淡出（参考 :79-87 的 blendFactor）
+    float blend = clamp(dot(sunDirection, camForward), 0.0, 1.0);
+    if(blend <= 0.0 || pc.sunDirection.w <= 0.0)
+    {
+        imageStore(godRayOutput, pixel, vec4(0.0));
+        return;
+    }
+
+    float tanHalfFov = 1.0 / max(abs(cam.projInverse[1][1]), 1.0e-6);
+    float aspect = float(size.x) / float(size.y);
+    vec2 ndc = vec2(dot(sunDirection, camRight) / (tanHalfFov * aspect),
+        dot(sunDirection, camUp) / tanHalfFov);
+    vec2 sunUV = clamp(ndc * 0.5 + 0.5, vec2(0.001), vec2(0.999));
+
+    // ---- 径向模糊（参考 :97-137）----
+    int samples = int(clamp(pc.params.x, 4.0, float(MAX_SAMPLES)));
+    float weight = max(pc.params.y, 0.0) / float(samples);
+    vec2 delta = (uv - sunUV) / float(samples);
+
+    vec3 accum = vec3(0.0);
+    float illuminationDecay = 1.0;
+    vec2 sampleUV = uv;
+    for(int i = 0; i < MAX_SAMPLES; ++i)
+    {
+        if(i >= samples) break;
+        // 参考的"数据"是云的遮挡值；这里直接读云图透射率取 1-a。
+        float occlusion = clamp(1.0 - textureLod(cloudImage, clamp(sampleUV, vec2(0.0),
+            vec2(1.0)), 0.0).a, 0.0, 1.0);
+        accum += occlusion * illuminationDecay * weight;
+        illuminationDecay *= 0.985;
+        sampleUV -= delta;
+    }
+
+    // 太阳在地平线附近时衰减更快（参考 :775-779 的 max(5, dir.y) 口径）
+    accum *= blend * pc.sunDirection.w;
+    imageStore(godRayOutput, pixel, vec4(accum, 1.0));
+}

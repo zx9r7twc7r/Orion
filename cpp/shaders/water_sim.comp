@@ -1,0 +1,720 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// Persistent local water simulation — 旧阻尼波方程（Eclipse 模型标定）。
+//
+// 2026-10-17 历史：本日曾重构为两 pass symplectic SWE（动量+高度、RGBA16F），
+// 用户实测"水面像附着一层什么 + 动画卡顿"，当日晚间回退到本波方程本体；
+// SWE 实现整体 #if 0 屏蔽保留在文件中部（含完整推导与稳定域分析）。
+// 当日同时上线的**实体交互波**（掉落物脉冲 + 船持续波源，binding 3 的
+// WaterSimEntities UBO）与 **48 格模拟盒**保留，波源已移植进本 main。
+//
+// 场通道 RGBA16F：(h, 标量速度, 空, 空)。速度单位 = 纹素/tick（tick = 30Hz）；
+// 消费者（water_wave_field.glsl / rt_test_translucent.rchit）只读 .r（h）。
+//
+// 单 dispatch：读 layersAndFlags.x 层（带滚动），写 layersAndFlags.y 层，
+// 宿主每 tick 翻转 g_waterSimReadLayer。
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2DArray waterStateInput;
+layout(rg16f, set = 0, binding = 1) uniform writeonly image2DArray waterStateOutput;
+
+layout(set = 0, binding = 2) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+// 2026-10-17 实体交互波（掉落物脉冲 + 船持续波源）。宿主 VulkanCore.cpp 的
+// WaterSimEntityUBO 每个模拟 tick 快照写入，std140 布局逐字段对应：
+//   counts.x = 本次 tick 消费的脉冲数（FIFO 头部，≤8）
+//   counts.y = 船数（Java 每帧整批上报，≤8，在水中且距玩家 ≤24 格）
+layout(set = 0, binding = 3) uniform WaterSimEntities
+{
+    ivec4 entityCounts;
+    vec4 entityImpulses[8];   // x, z, strength（带符号，正 = 入水挤压）
+    vec4 entityBoats[8];      // x, z, vx, vz
+    vec4 entityBoatParams[8]; // x = 幅值倍率
+} simEntities;
+
+layout(push_constant) uniform WaterSimulationPush
+{
+    uvec4 layersAndFlags; // source layer, destination layer, impulse, playerInWater
+    vec4 updateAndImpulse; // dt, impulse X, impulse Z, signed impulse strength
+    ivec4 scrollAndPadding; // source texel scroll X/Z；z = SWE pass 标志（0 动量 / 1 高度）
+    // 2026-10-02 参考重构（HPWater）新增四个量。push constant 原来只用 48 字节，
+    // 规范保证的下限是 128 ⇒ 加到 64 字节没有任何风险（且不必把整个 CameraUBO
+    // 尾链声明进这个 pass，这是选 push constant 而不是 UBO 的原因）。
+    //   x = 海绵层宽度（占半宽的比例，参考 thickness = width*0.1；0 = 关 = 旧档
+    //       的圆形幅度淡出）
+    //   y = 保留（障碍物反射已按需求移除；字段保留以维持 64 字节 push 布局）
+    //   z = 波源形状（0 = 旧档同心余弦环；1 = 参考的高斯凸起）
+    //   w = 阻尼倍率（1 = 与今天一致；>1 更快平息，<1 波纹传得更远）
+    vec4 waveParams;
+    // 波场传播速度（2026-10-02，参考 HPWaterWaveEquation 的 _WaveSpeed）。
+    // 2026-10-17 SWE 重构：它现在是浅水波速的平方 c² = g·H₀（纹素²/tick²），
+    // 同时驱动动量步的 −c²∇h 与高度步的波速；数值口径见文件头稳定域注释。
+    // 与该 vec4 之后的标量紧排（push constant 用 std430 式打包，前后端声明顺序一致）。
+    float waveSpeed;
+    // 2026-10-03：波形四旋钮接靶到风源（旧解析波面已删除，见 water_wave_field.glsl）。
+    //   x 波长倍率 / y 主波向(度) / z 涌浪陡度 / w 波峰扭曲。
+    // 默认 (1, 0, 1, 1) ⇒ 与上一版风源逐位一致。
+    float waveShapeScale;
+    float waveShapeAngle;
+    float waveShapeCrest;
+    float waveShapeWarp;
+} pushData;
+
+const ivec2 RESOLUTION = ivec2(512);
+
+vec3 readState(ivec2 texel)
+{
+    ivec2 clampedTexel = clamp(texel, ivec2(0), RESOLUTION - ivec2(1));
+    return texelFetch(
+        waterStateInput,
+        ivec3(clampedTexel, int(pushData.layersAndFlags.x)),
+        0
+    ).rgb;
+}
+
+// 高度 pass 读的是动量 pass 的输出层（layersAndFlags.y），坐标已对齐、无滚动。
+vec3 readHeightPassState(ivec2 texel)
+{
+    ivec2 clampedTexel = clamp(texel, ivec2(0), RESOLUTION - ivec2(1));
+    return texelFetch(
+        waterStateInput,
+        ivec3(clampedTexel, int(pushData.layersAndFlags.y)),
+        0
+    ).rgb;
+}
+
+float concentricRipples(vec2 delta, float radius, float rings)
+{
+    float dist = length(delta);
+    if(dist >= radius)
+    {
+        return 0.0;
+    }
+    // 余弦钟形平滑包络，确保中心连续且边界平滑归零，杜绝高频截断噪声
+    float envelope = 0.5 + 0.5 * cos((dist / radius) * 3.14159265359);
+    // 空间多频余弦调制，生成指定数量的同心圆环波列
+    float wave = cos((dist / radius) * rings * 6.28318530718);
+    return wave * envelope;
+}
+
+// 参考 HPWaterWaveEquation 的高斯波源：sigma = radius*0.4、中心连续、边界归零。
+// 参考另有 min(ripple, 0.05) 的安全帽 —— 那是它自己归一化下的值；本引擎的场是
+// 世界格量纲（height 另有 ±4 安全阀，见 main 末尾），所以这里保留形状与
+// "边界平滑归零"的语义，幅值仍按本引擎标定（调用处与旧路径同系数）。
+float gaussianWaveSource(vec2 delta, float radius)
+{
+    float r = length(delta);
+    if(r >= radius)
+    {
+        return 0.0;
+    }
+    float sigma = radius * 0.4;
+    return exp(-r * r / max(2.0 * sigma * sigma, 1.0e-6));
+}
+
+// ===========================================================================
+// 2026-10-17 二轮回退：**SWE 双 pass 本体 #if 0 屏蔽保留**。用户实测两宗罪：
+// ① 水面"像附着一层什么"（平流把交互场拖出涂抹状斑块 + 48 盒纹素变粗）；
+// ② 动画卡顿。传播引擎退回下方旧阻尼波方程；实体交互波（binding 3）与
+// 48 格盒保留，实体波源已移植进旧 main。回退本块：删这对 #if 0/#endif。
+// ===========================================================================
+#if 0
+void main()
+{
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(texel, RESOLUTION)))
+    {
+        return;
+    }
+
+    const float spongeWidth = clamp(pushData.waveParams.x, 0.0, 0.45);
+    const float dampingScale = max(pushData.waveParams.w, 0.0);
+
+    // ── 海绵层吸收（参考的动态阻尼"海绵层"）──────────────────────────
+    // 与旧档同式：absorption = 1 − (1−edgeX)(1−edgeY)，retention = 1 − absorption²。
+    // SWE 里这是标准的动量吸收层（动量 pass 乘在 u 上）+ 波源包络（高度 pass）。
+    float spongeRetention = 1.0;
+    if(spongeWidth > 0.0)
+    {
+        float thickness = float(RESOLUTION.x) * spongeWidth;
+        float distToEdgeX = float(min(texel.x, RESOLUTION.x - 1 - texel.x));
+        float distToEdgeY = float(min(texel.y, RESOLUTION.y - 1 - texel.y));
+        float edgeX = 1.0 - smoothstep(0.0, thickness, distToEdgeX);
+        float edgeY = 1.0 - smoothstep(0.0, thickness, distToEdgeY);
+        float absorption = 1.0 - (1.0 - edgeX) * (1.0 - edgeY);
+        spongeRetention = clamp(1.0 - absorption * absorption, 0.0, 1.0);
+    }
+
+    const float stepScale = clamp(pushData.updateAndImpulse.x * 30.0, 0.25, 1.5);
+    const float speedKnob = clamp(pushData.waveSpeed, 0.0, 2.0);
+    // c² = g·H₀（纹素²/tick²）：与旧波方程的 laplacianCoeff 同常数（0.185·speed²，
+    // 上限 0.45）⇒ 长波传播速度与旧档逐位一致，GUI 不需要重标定。
+    const float gravityTimesDepth = min(0.185 * speedKnob * speedKnob, 0.45);
+
+    if(pushData.scrollAndPadding.z == 0u)
+    {
+        // ================================================================
+        // pass 0 —— 动量步（C-grid 动量方程 + 半拉格朗日平流）
+        // ================================================================
+        ivec2 sourceTexel = texel + pushData.scrollAndPadding.xy;
+        vec3 self = readState(sourceTexel);
+        vec3 stateLeft = readState(sourceTexel + ivec2(-1, 0));
+        vec3 stateRight = readState(sourceTexel + ivec2(1, 0));
+        vec3 stateDown = readState(sourceTexel + ivec2(0, -1));
+        vec3 stateUp = readState(sourceTexel + ivec2(0, 1));
+
+        // 平流：沿速度场回溯半步取 u（LINEAR 采样器做双线性；无条件稳定）。
+        // u 单位 = 纹素/tick ⇒ 回溯位移 = u·stepScale 纹素。
+        vec2 advectUv =
+            (vec2(sourceTexel) + 0.5 - self.yz * stepScale) / vec2(RESOLUTION);
+        vec2 velocity = texture(
+            waterStateInput,
+            vec3(advectUv, float(pushData.layersAndFlags.x))
+        ).yz;
+
+        // 压力梯度：∂u/∂t = −g∇h（中心差分）。c² 已含 g·H₀，动量步只用 g ⇒
+        // 这里直接用 c² 当 g（H₀ 折进高度步），特征积仍等于 c²。
+        const vec2 heightGradient = vec2(
+            0.5 * (stateRight.x - stateLeft.x),
+            0.5 * (stateUp.x - stateDown.x)
+        );
+        velocity -= gravityTimesDepth * stepScale * heightGradient;
+
+        // 底部摩擦（阻尼倍率旋钮，与旧档同系数）+ 海绵层动量吸收。
+        velocity *= max(0.0, 1.0 - 0.026 * stepScale * dampingScale) *
+            spongeRetention;
+
+        velocity = clamp(velocity, vec2(-2.0), vec2(2.0));
+        if(any(isnan(velocity)))
+        {
+            velocity = vec2(0.0);
+        }
+
+        imageStore(
+            waterStateOutput,
+            ivec3(texel, int(pushData.layersAndFlags.y)),
+            vec4(self.x, velocity.x, velocity.y, 0.0)
+        );
+        return;
+    }
+
+    // ====================================================================
+    // pass 1 —— 高度步（连续方程，symplectic：用的是邻格**更新后**的 u）
+    // ====================================================================
+    // 本 texel 对应的世界 XZ（波源要用）。
+    vec2 worldPosition = cam.waterSimSurfaceAndOrigin.yz +
+        (vec2(texel) + 0.5) * cam.waterSimSurfaceAndOrigin.w;
+
+    vec3 self = readHeightPassState(texel);
+    vec3 stateLeft = readHeightPassState(texel + ivec2(-1, 0));
+    vec3 stateRight = readHeightPassState(texel + ivec2(1, 0));
+    vec3 stateDown = readHeightPassState(texel + ivec2(0, -1));
+    vec3 stateUp = readHeightPassState(texel + ivec2(0, 1));
+
+    float height = self.x;
+    const vec2 velocity = self.yz;
+
+    // 连续方程：∂h/∂t = −H₀∇·u（H₀ = 1，与动量步的 c² = g·H₀ 口径配套）。
+    const float divergence = 0.5 *
+        ((stateRight.y - stateLeft.y) + (stateUp.z - stateDown.z));
+    height -= stepScale * divergence;
+
+    // 棋盘格高频阻尼：轻量 5 点扩散（与旧档同系数、零额外采样）—— 交错网格下
+    // 它继续兜住 collocated 离散的 checkerboard 零模。
+    float neighborMean =
+        0.25 * (stateLeft.x + stateRight.x + stateDown.x + stateUp.x);
+    height = mix(height, neighborMean, 0.035);
+
+    height *= max(0.0, 1.0 - 0.010 * stepScale * dampingScale);
+
+    // ── 波源（全部注入 h；每 tick 一次，只在本 pass）──────────────────
+    const float sourceMode = clamp(pushData.waveParams.z, 0.0, 1.0);
+
+    // ====================================================================
+    // 2026-10-17 实体交互波。
+    // 掉落物：Java 侧检测入水沿（id 状态机），每 tick 经 FIFO 逐条注入；
+    //         形状/半径口径与玩家脉冲一致（入水半径 1.8、离水 1.0）。
+    // 船：持续移动波源，与玩家的"实体周身波源 + 尾波"同构，但船更大
+    //     —— 源半径 1.20 → 1.60，幅值乘 Java 上报的倍率（出厂 1.5）。
+    //     船的入水/离水沿另有一次性脉冲（与掉落物同路）。
+    // ====================================================================
+    const int entityImpulseCount = min(simEntities.entityCounts.x, 8);
+    for(int entityIndex = 0; entityIndex < entityImpulseCount; ++entityIndex)
+    {
+        const vec4 entityImpulse = simEntities.entityImpulses[entityIndex];
+        const vec2 eventDelta = worldPosition - entityImpulse.xy;
+        const bool isExitingWater = entityImpulse.z < 0.0;
+        if(sourceMode > 0.5)
+        {
+            height += (entityImpulse.z * 2.2) *
+                gaussianWaveSource(eventDelta, isExitingWater ? 1.00 : 1.80) *
+                spongeRetention;
+        }
+        else
+        {
+            height += (entityImpulse.z * 2.2) *
+                concentricRipples(
+                    eventDelta,
+                    isExitingWater ? 1.00 : 1.80,
+                    isExitingWater ? 2.00 : 3.50) *
+                spongeRetention;
+        }
+    }
+
+    const int entityBoatCount = min(simEntities.entityCounts.y, 8);
+    for(int boatIndex = 0; boatIndex < entityBoatCount; ++boatIndex)
+    {
+        const vec4 boat = simEntities.entityBoats[boatIndex];
+        const float boatScale = max(simEntities.entityBoatParams[boatIndex].x, 0.0);
+        const vec2 velocityXZ = boat.zw;
+        const float speed = length(velocityXZ);
+        const vec2 relative = worldPosition - boat.xy;
+
+        float boatRipples = (sourceMode > 0.5)
+            ? gaussianWaveSource(relative, 1.60)
+            : concentricRipples(relative, 1.60, 3.0);
+        height += boatScale * (0.121 + 0.088 * clamp(speed, 0.0, 2.5)) *
+            boatRipples * spongeRetention;
+
+        if(speed > 0.035)
+        {
+            const vec2 forward = velocityXZ / max(speed, 1.0e-4);
+            const float behind = -dot(relative, forward);
+            const float lateral = dot(relative, vec2(-forward.y, forward.x));
+            const float wakeLength = 1.8 + 1.25 * clamp(speed, 0.0, 3.0);
+            const float wakeWidth = 0.34 + 0.12 * clamp(speed, 0.0, 2.0);
+            const float wakePattern =
+                cos(behind * 6.5) * exp(-abs(lateral) / wakeWidth);
+            const float wakeEnvelope = smoothstep(0.05, 0.40, behind) *
+                (1.0 - smoothstep(wakeLength * 0.70, wakeLength, behind));
+            height += boatScale * 0.0528 * clamp(speed, 0.0, 3.0) *
+                (wakePattern * wakeEnvelope) * spongeRetention;
+        }
+    }
+
+    if(pushData.layersAndFlags.z != 0u)
+    {
+        vec2 eventDelta = worldPosition - pushData.updateAndImpulse.yz;
+        bool isExitingWater = pushData.updateAndImpulse.w < 0.0;
+        if(sourceMode > 0.5)
+        {
+            float gaussianRadius = isExitingWater ? 1.00 : 1.80;
+            height += (pushData.updateAndImpulse.w * 2.2) *
+                gaussianWaveSource(eventDelta, gaussianRadius) * spongeRetention;
+        }
+        else
+        {
+            float impulseRadius = isExitingWater ? 1.00 : 1.80;
+            float impulseRings  = isExitingWater ? 2.00 : 3.50;
+            height += (pushData.updateAndImpulse.w * 2.2) *
+                concentricRipples(eventDelta, impulseRadius, impulseRings) *
+                spongeRetention;
+        }
+    }
+
+    if(pushData.layersAndFlags.w != 0u)
+    {
+        vec2 playerPosition = cam.playerPositionAndWater.xz;
+        vec2 velocityXZ = cam.playerVelocityAndSpeed.xz;
+        float speed = length(velocityXZ);
+        vec2 forward = velocityXZ / max(speed, 1.0e-4);
+        vec2 relative = worldPosition - playerPosition;
+
+        float bodyRipples = (sourceMode > 0.5)
+            ? gaussianWaveSource(relative, 1.20)
+            : concentricRipples(relative, 1.20, 3.0);
+        height += (0.121 + 0.088 * clamp(speed, 0.0, 2.5)) * bodyRipples *
+            spongeRetention;
+
+        if(speed > 0.035)
+        {
+            float behind = -dot(relative, forward);
+            float lateral = dot(relative, vec2(-forward.y, forward.x));
+            float wakeLength = 1.8 + 1.25 * clamp(speed, 0.0, 3.0);
+            float wakeWidth = 0.34 + 0.12 * clamp(speed, 0.0, 2.0);
+
+            float wakePattern = cos(behind * 6.5) * exp(-abs(lateral) / wakeWidth);
+            float wakeEnvelope = smoothstep(0.05, 0.40, behind) *
+                (1.0 - smoothstep(wakeLength * 0.70, wakeLength, behind));
+
+            height += 0.0528 * clamp(speed, 0.0, 3.0) * (wakePattern * wakeEnvelope) *
+                spongeRetention;
+        }
+    }
+
+    const float windStrength = clamp(pushData.waveParams.y, 0.0, 2.0);
+    if(windStrength > 0.001)
+    {
+        const float phaseDriver = float(cam.frameCount);
+        const vec2 boxOrigin = cam.waterSimSurfaceAndOrigin.yz;
+        const float boxExtent = float(RESOLUTION.x) * cam.waterSimSurfaceAndOrigin.w;
+        const vec2 boxCenter = boxOrigin + 0.5 * boxExtent;
+        const float shapeScale = clamp(pushData.waveShapeScale, 0.35, 4.0);
+        const float shapeAngle = radians(pushData.waveShapeAngle);
+        const float shapeCrest = clamp(pushData.waveShapeCrest, 0.0, 2.0);
+        const float shapeWarp = clamp(pushData.waveShapeWarp, 0.0, 2.0);
+        const float shapeCos = cos(shapeAngle);
+        const float shapeSin = sin(shapeAngle);
+        const float radiusScale = (shapeScale > 1.0e-3) ? (1.0 / shapeScale) : 1.0;
+        const float warpJitter = 1.0 + 0.45 * (shapeWarp - 1.0) *
+            sin(phaseDriver * 0.0131 + 1.7);
+        const vec2 windLocal = worldPosition - boxCenter;
+        const vec2 windQuery = boxCenter +
+            mat2(shapeCos, shapeSin, -shapeSin, shapeCos) * windLocal;
+        const float windAmplitude = 0.055 * windStrength * shapeCrest;
+        vec2 windOrbit[5] = vec2[5](
+            vec2(0.72, 3.20), vec2(0.48, 2.35), vec2(0.88, 4.10),
+            vec2(0.36, 1.75), vec2(0.62, 2.75));
+        float windWeight[5] = float[5](1.00, 0.82, 0.70, 0.58, 0.64);
+        float windSpeedA[5] = float[5](0.0073, -0.0047, 0.0119, 0.0161, -0.0089);
+        float windSpeedB[5] = float[5](0.0051, 0.0092, -0.0131, 0.0067, 0.0103);
+        float windPhase[5] = float[5](0.0, 2.1, 0.7, 4.3, 3.1);
+        for(int windIndex = 0; windIndex < 5; ++windIndex)
+        {
+            vec2 windOrbitPos = vec2(
+                cos(phaseDriver * windSpeedA[windIndex] + windPhase[windIndex]),
+                sin(phaseDriver * windSpeedB[windIndex] + windPhase[windIndex]));
+            vec2 windPosition =
+                boxCenter + windOrbit[windIndex].x * boxExtent * windOrbitPos;
+            height += windAmplitude * windWeight[windIndex] *
+                gaussianWaveSource(
+                    windQuery - windPosition,
+                    windOrbit[windIndex].y * radiusScale * warpJitter) *
+                spongeRetention;
+        }
+    }
+
+    // 海绵层关闭时的旧档圆形幅度淡出（语义同旧档：防滚动边界反射）。
+    if(spongeWidth <= 0.0)
+    {
+        vec2 centered = (vec2(texel) + 0.5) / vec2(RESOLUTION) - 0.5;
+        float borderFade = 1.0 - smoothstep(0.40, 0.50, length(centered));
+        height *= borderFade;
+    }
+
+    height = clamp(height, -4.0, 4.0);
+    if(!(height == height))
+    {
+        height = 0.0;
+    }
+
+    imageStore(
+        waterStateOutput,
+        ivec3(texel, int(pushData.layersAndFlags.x)),
+        vec4(height, velocity.x, velocity.y, 0.0)
+    );
+}
+#endif // 2026-10-17 SWE 双 pass 本体屏蔽结束
+
+// ===========================================================================
+// 2026-10-17 二轮回退：旧阻尼波方程本体恢复现役（SWE 屏蔽见上）。
+// 通道仍是 RGBA16F(h, v, 空, 空) —— 旧方程只用 .x/.y，消费者只读 .r，格式不动。
+// 回退本块改回 SWE：删本注释、把上方 #if 0 对挪到这里即可。
+// ===========================================================================
+void main()
+{
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(texel, RESOLUTION)))
+    {
+        return;
+    }
+
+    // 本 texel 对应的世界 XZ（障碍判定与波源都要用）—— 原来在扩散之后才算，
+    // 现在提到最前（读数不变，只是顺序调整）。
+    vec2 worldPosition = cam.waterSimSurfaceAndOrigin.yz +
+        (vec2(texel) + 0.5) * cam.waterSimSurfaceAndOrigin.w;
+
+    const float spongeWidth = clamp(pushData.waveParams.x, 0.0, 0.45);
+    const float sourceMode = clamp(pushData.waveParams.z, 0.0, 1.0);
+    const float dampingScale = max(pushData.waveParams.w, 0.0);
+
+    // ── 海绵层吸收（参考的动态阻尼"海绵层"）──────────────────────────
+    // thickness = width*0.1；edgeX/edgeY = 1−smoothstep(0, thickness, 到边距离)；
+    // absorption = 1 − (1−edgeX)(1−edgeY)，再 saturate(1 − absorption²)。
+    // 角部两方向同时进入吸收带时吸收更强 ⇒ 波出界前被吃掉，而不是撞上软墙
+    // 反弹（旧档的圆形幅度淡出仍保留在 spongeWidth=0 时逐位运行）。
+    float spongeRetention = 1.0;
+    if(spongeWidth > 0.0)
+    {
+        float thickness = float(RESOLUTION.x) * spongeWidth;
+        float distToEdgeX = float(min(texel.x, RESOLUTION.x - 1 - texel.x));
+        float distToEdgeY = float(min(texel.y, RESOLUTION.y - 1 - texel.y));
+        float edgeX = 1.0 - smoothstep(0.0, thickness, distToEdgeX);
+        float edgeY = 1.0 - smoothstep(0.0, thickness, distToEdgeY);
+        float absorption = 1.0 - (1.0 - edgeX) * (1.0 - edgeY);
+        spongeRetention = clamp(1.0 - absorption * absorption, 0.0, 1.0);
+    }
+
+    ivec2 sourceTexel = texel + pushData.scrollAndPadding.xy;
+    // 2026-10-17 回退 RGBA16F：.y 从"速度标量"短暂当过 SWE 的 u.x，切回旧方程
+    // 后 .y 复位为标量速度；切换瞬间的残留值会被阻尼在一个 tick 内吃掉。
+    vec3 oldState = readState(sourceTexel);
+    float height = oldState.x;
+    float velocity = oldState.y;
+
+    float left = readState(sourceTexel + ivec2(-1, 0)).x;
+    float right = readState(sourceTexel + ivec2(1, 0)).x;
+    float down = readState(sourceTexel + ivec2(0, -1)).x;
+    float up = readState(sourceTexel + ivec2(0, 1)).x;
+
+    // Stable damped 2D wave equation.  The constants retain Eclipse's model
+    // (pressure/velocity, restoring spring and damping), scaled to this
+    // 30 Hz, 512-cell local field.
+    // 数值稳定域：symplectic Euler 要求 0.185*stepScale^2*8 <= 4，
+    // 即 stepScale <= 1.644（dt 约 54.8ms）。旧上限 2.0 在低帧/区块加载
+    // 卡顿时让最高频棋盘格模每 tick 增益约 3.64 倍并发散，经交互梯度
+    // (0.19/世界纹素) 放大后把水面法线逐纹素打乱，呈现马赛克玻璃伪影。
+    // float stepScale = clamp(pushData.updateAndImpulse.x * 30.0, 0.25, 2.0);
+    float stepScale = clamp(pushData.updateAndImpulse.x * 30.0, 0.25, 1.5);
+    float laplacian = left + right + down + up - 4.0 * height;
+    // 波场传播速度（2026-10-02）：参考 _WaveSpeed 的等价物 —— 缩放 Laplacian 系数。
+    // 稳定域：系数 × Σ|五点模板| ≤ 4 ⇒ 系数 ≤ 0.5（2D 五点模板和为 8）。这里硬顶在
+    // 0.45 以下，所以旋钮拉到 2.0 也不会发散；1.0 时逐位等于原来的 0.185。
+    float speedKnob = clamp(pushData.waveSpeed, 0.0, 2.0);
+    float laplacianCoeff = min(0.185 * speedKnob * speedKnob, 0.45);
+    velocity += laplacianCoeff * stepScale * laplacian;
+    height += velocity * stepScale;
+    velocity -= 0.0014 * stepScale * height;
+    // 阻尼倍率（参考 _DampingFactor 的等价旋钮；1 = 与今天一致）：参考把阻尼折进
+    // energyRetention，我们乘在既有两个阻尼系数上。海绵层吸收乘在 **velocity** 上
+    //（参考的惯性项 (u−u_prev) 被 energyRetention 缩放，等价位置就是这里），
+    // 不动 height —— 参考也只缩惯性项。
+    velocity *= max(0.0, 1.0 - 0.026 * stepScale * dampingScale) * spongeRetention;
+    height *= max(0.0, 1.0 - 0.010 * stepScale * dampingScale);
+
+    // 棋盘格高频阻尼：轻量 5 点扩散，专杀最高频交替模（发散的主要形态）。
+    // 扩散系数 0.035 对 8 纹素以上波长的可见波纹几乎无影响；
+    // 复用上方已读取的四个邻域，零额外纹理采样，仅 2 条 ALU。
+    float neighborMean = 0.25 * (left + right + down + up);
+    height = mix(height, neighborMean, 0.035);
+
+    // Entering and leaving water inject opposite signed pressure impulses at
+    // the actual entity position.  Afterwards the field propagates on its own.
+    // 落水/出水瞬时脉冲：依据冲量极性区分进出水参数。
+    // 2026-10-02 参考重构：sourceMode=1 时改用参考 HPWater 的**高斯凸起**
+    //（sigma = 0.4R，中心连续、边界归零），而不是同心余弦环 —— 参考 Demo 里
+    //"拖动交互"鼓出的就是一个平滑包，不是一圈圈环。0 = 旧档逐位保留。
+    // 源一律乘 spongeRetention（参考也是 u_next += ripple * absorption）。
+    if(pushData.layersAndFlags.z != 0u)
+    {
+        vec2 eventDelta = worldPosition - pushData.updateAndImpulse.yz;
+        bool isExitingWater = pushData.updateAndImpulse.w < 0.0;
+        if(sourceMode > 0.5)
+        {
+            float gaussianRadius = isExitingWater ? 1.00 : 1.80;
+            height += (pushData.updateAndImpulse.w * 2.2) *
+                gaussianWaveSource(eventDelta, gaussianRadius) * spongeRetention;
+        }
+        else
+        {
+            float impulseRadius = isExitingWater ? 1.00 : 1.80;
+            float impulseRings  = isExitingWater ? 2.00 : 3.50;
+            height += (pushData.updateAndImpulse.w * 2.2) *
+                concentricRipples(eventDelta, impulseRadius, impulseRings) * spongeRetention;
+        }
+    }
+
+    // ====================================================================
+    // 2026-10-17 实体交互波（SWE 回退后从高度 pass 原样移植）。
+    // 掉落物：Java 侧检测入水沿（id 状态机），每 tick 经 FIFO 逐条注入；
+    //         形状/半径口径与玩家脉冲一致（入水半径 1.8、离水 1.0）。
+    // 船：持续移动波源，与玩家的"实体周身波源 + 尾波"同构，但船更大
+    //     —— 源半径 1.20 → 1.60，幅值乘 Java 上报的倍率（出厂 1.5）。
+    // ====================================================================
+    const int entityImpulseCount = min(simEntities.entityCounts.x, 8);
+    for(int entityIndex = 0; entityIndex < entityImpulseCount; ++entityIndex)
+    {
+        const vec4 entityImpulse = simEntities.entityImpulses[entityIndex];
+        const vec2 eventDelta = worldPosition - entityImpulse.xy;
+        const bool isExitingWater = entityImpulse.z < 0.0;
+        if(sourceMode > 0.5)
+        {
+            height += (entityImpulse.z * 2.2) *
+                gaussianWaveSource(eventDelta, isExitingWater ? 1.00 : 1.80) *
+                spongeRetention;
+        }
+        else
+        {
+            height += (entityImpulse.z * 2.2) *
+                concentricRipples(
+                    eventDelta,
+                    isExitingWater ? 1.00 : 1.80,
+                    isExitingWater ? 2.00 : 3.50) *
+                spongeRetention;
+        }
+    }
+
+    const int entityBoatCount = min(simEntities.entityCounts.y, 8);
+    for(int boatIndex = 0; boatIndex < entityBoatCount; ++boatIndex)
+    {
+        const vec4 boat = simEntities.entityBoats[boatIndex];
+        const float boatScale = max(simEntities.entityBoatParams[boatIndex].x, 0.0);
+        const vec2 velocityXZ = boat.zw;
+        const float speed = length(velocityXZ);
+        const vec2 relative = worldPosition - boat.xy;
+
+        float boatRipples = (sourceMode > 0.5)
+            ? gaussianWaveSource(relative, 1.60)
+            : concentricRipples(relative, 1.60, 3.0);
+        height += boatScale * (0.121 + 0.088 * clamp(speed, 0.0, 2.5)) *
+            boatRipples * spongeRetention;
+
+        if(speed > 0.035)
+        {
+            const vec2 forward = velocityXZ / max(speed, 1.0e-4);
+            const float behind = -dot(relative, forward);
+            const float lateral = dot(relative, vec2(-forward.y, forward.x));
+            const float wakeLength = 1.8 + 1.25 * clamp(speed, 0.0, 3.0);
+            const float wakeWidth = 0.34 + 0.12 * clamp(speed, 0.0, 2.0);
+            const float wakePattern =
+                cos(behind * 6.5) * exp(-abs(lateral) / wakeWidth);
+            const float wakeEnvelope = smoothstep(0.05, 0.40, behind) *
+                (1.0 - smoothstep(wakeLength * 0.70, wakeLength, behind));
+            height += boatScale * 0.0528 * clamp(speed, 0.0, 3.0) *
+                (wakePattern * wakeEnvelope) * spongeRetention;
+        }
+    }
+
+    // 持续移动波源：主体扰动与尾波多环波包调制
+    if(pushData.layersAndFlags.w != 0u)
+    {
+        vec2 playerPosition = cam.playerPositionAndWater.xz;
+        vec2 velocityXZ = cam.playerVelocityAndSpeed.xz;
+        float speed = length(velocityXZ);
+        vec2 forward = velocityXZ / max(speed, 1.0e-4);
+        vec2 relative = worldPosition - playerPosition;
+
+        // 实体周身波源：旧档 3 圈发散同心环；sourceMode=1 时换成参考的高斯鼓包。
+        float bodyRipples = (sourceMode > 0.5)
+            ? gaussianWaveSource(relative, 1.20)
+            : concentricRipples(relative, 1.20, 3.0);
+        height += (0.121 + 0.088 * clamp(speed, 0.0, 2.5)) * bodyRipples *
+            spongeRetention;
+
+        if(speed > 0.035)
+        {
+            float behind = -dot(relative, forward);
+            float lateral = dot(relative, vec2(-forward.y, forward.x));
+            float wakeLength = 1.8 + 1.25 * clamp(speed, 0.0, 3.0);
+            float wakeWidth = 0.34 + 0.12 * clamp(speed, 0.0, 2.0);
+
+            // 尾波沿前进方向与侧向叠加高频余弦波动，形成多道波峰交替的扩散尾迹
+            float wakePattern = cos(behind * 6.5) * exp(-abs(lateral) / wakeWidth);
+            float wakeEnvelope = smoothstep(0.05, 0.40, behind) *
+                (1.0 - smoothstep(wakeLength * 0.70, wakeLength, behind));
+
+            height += 0.0528 * clamp(speed, 0.0, 3.0) * (wakePattern * wakeEnvelope) *
+                spongeRetention;
+        }
+    }
+
+    // =====================================================================
+    // 2026-10-03 按 HPWater 重构"波面的样子"。
+    //
+    // 参照事实（HPWaterFluidDynamics.cs / HPWaterFluidSample.hlsl）：参考的自然波纹
+    // **全部来自波方程场** —— 没有解析波带、没有风场、没有多层叠加，每帧只有单点
+    // 波源脉冲（_WaveSourceUV/Intensity/Radius），经 _WaveSpeed = 1.0 传播、
+    // _DampingFactor = 0.02 衰减；没有输入时水面归于平静。
+    //
+    // 所以我们也不再"用噪声把水面画出来"，而是给**同一个波方程场**加两个缓慢游走
+    // 的风源持续供能 ⇒ 无交互时水面也是平滑、连贯、非周期的流动波纹（模拟质量，
+    // 不是噪声颗粒）。这就是 HPWater 的形状来源，只是把"外部单点输入"换成了
+    // "常驻风源"。
+    //
+    // 强度放在 push 的保留槽 waveParams.y（0 = 关 = 回到"只有交互才起浪"）：
+    //   宿主写 1.0 出厂（见 VulkanCore 的 kWaterWindStrength）。
+    // 安全：幅值刻意很小、乘 spongeRetention，并且后面仍有幅度安全阀（±4/±2）与
+    // NaN 保险丝 —— 不会推高能量、不会发散（防炸那套原样保留）。
+    // =====================================================================
+    const float windStrength = clamp(pushData.waveParams.y, 0.0, 2.0);
+    if(windStrength > 0.001)
+    {
+        // 与"波场阻尼/传播速度"共用同一套稳定域：风源只是外部力，不进 Laplacian 系数。
+        const float phaseDriver = float(cam.frameCount);
+        const vec2 boxOrigin = cam.waterSimSurfaceAndOrigin.yz;
+        const float boxExtent = float(RESOLUTION.x) * cam.waterSimSurfaceAndOrigin.w;
+        const vec2 boxCenter = boxOrigin + 0.5 * boxExtent;
+        // 2026-10-03 波形四旋钮接靶到风源（它们原本只作用于已删除的解析波带）：
+        //   波长倍率 → 源半径 ×1/s；主波向 → 图案整体旋转；涌浪陡度 → 幅值倍率；
+        //   波峰扭曲 → 源半径缓慢抖动（用 (w-1) 偏移 ⇒ w=1 时严格恒等）。
+        const float shapeScale = clamp(pushData.waveShapeScale, 0.35, 4.0);
+        const float shapeAngle = radians(pushData.waveShapeAngle);
+        const float shapeCrest = clamp(pushData.waveShapeCrest, 0.0, 2.0);
+        const float shapeWarp = clamp(pushData.waveShapeWarp, 0.0, 2.0);
+        const float shapeCos = cos(shapeAngle);
+        const float shapeSin = sin(shapeAngle);
+        const float radiusScale = (shapeScale > 1.0e-3) ? (1.0 / shapeScale) : 1.0;
+        const float warpJitter = 1.0 + 0.45 * (shapeWarp - 1.0) *
+            sin(phaseDriver * 0.0131 + 1.7);
+        // 主波向：对世界坐标做正交旋转（等价于旋转两条漂移轨迹；0 度 = 恒等）。
+        const vec2 windLocal = worldPosition - boxCenter;
+        const vec2 windQuery = boxCenter +
+            mat2(shapeCos, shapeSin, -shapeSin, shapeCos) * windLocal;
+        // 2026-10-03：**5 个风源**（半径/周期/相位/幅值互不成谐波）⇒ 叠加出的波前
+        // 非周期、方向杂乱，接近"风生波纹"而不是两个规则旋转的包。
+        // 幅值 0.055/源：与交互脉冲（0.42~0.76）同量级但更分散。旧值 0.010 是当时
+        // 按"只是点缀"定的，实测比交互脉冲小约 40 倍 ⇒ 即便可见也太淡（用户反馈
+        // "水面太平静"）。配合阻尼（速度 2.6%/tick、高度 1%/tick）几秒内达到平稳，
+        // 且有后面的幅度安全阀（±2/±4）与 NaN 保险丝兜底 ⇒ 不会发散。
+        const float windAmplitude = 0.055 * windStrength * shapeCrest;
+        vec2 windOrbit[5] = vec2[5](
+            vec2(0.72, 3.20), vec2(0.48, 2.35), vec2(0.88, 4.10),
+            vec2(0.36, 1.75), vec2(0.62, 2.75));
+        float windWeight[5] = float[5](1.00, 0.82, 0.70, 0.58, 0.64);
+        float windSpeedA[5] = float[5](0.0073, -0.0047, 0.0119, 0.0161, -0.0089);
+        float windSpeedB[5] = float[5](0.0051, 0.0092, -0.0131, 0.0067, 0.0103);
+        float windPhase[5] = float[5](0.0, 2.1, 0.7, 4.3, 3.1);
+        for(int windIndex = 0; windIndex < 5; ++windIndex)
+        {
+            vec2 windOrbitPos = vec2(
+                cos(phaseDriver * windSpeedA[windIndex] + windPhase[windIndex]),
+                sin(phaseDriver * windSpeedB[windIndex] + windPhase[windIndex]));
+            vec2 windPosition =
+                boxCenter + windOrbit[windIndex].x * boxExtent * windOrbitPos;
+            height += windAmplitude * windWeight[windIndex] *
+                gaussianWaveSource(
+                    windQuery - windPosition,
+                    windOrbit[windIndex].y * radiusScale * warpJitter) *
+                spongeRetention;
+        }
+    }
+
+    // 旧档：把移动场在边界前淡到 0（防止滚动边界把能量反射回近处水面）。
+    // 2026-10-02 参考重构：**只在海绵层关闭时生效** —— 参考用吸收带
+    //（spongeRetention，已乘在 velocity 与各波源上）替代幅度淡出；两者叠加会把
+    // 边界带压得太死（吸收带内本就该有的衰减会被二次削平）。spongeWidth=0 时逐位旧档。
+    if(spongeWidth <= 0.0)
+    {
+        vec2 centered = (vec2(texel) + 0.5) / vec2(RESOLUTION) - 0.5;
+        float borderFade = 1.0 - smoothstep(0.40, 0.50, length(centered));
+        height *= borderFade;
+        velocity *= borderFade;
+    }
+
+    // 幅度安全阀：阻断持续注入（游走波源/尾波/脉冲）的能量无界堆积，
+    // 同时消除大幅度下的 RG16F 量化噪声自持——fp16 在 |h|>16 时
+    // eps 约 0.0156，会每 tick 重注入高频棋盘噪声，即使帧率正常
+    // 也会让水面保持马赛克玻璃观感。
+    height = clamp(height, -4.0, 4.0);
+    velocity = clamp(velocity, -2.0, 2.0);
+
+    // NaN 保险丝：一旦任何 texel 变成 NaN，它会通过 Laplacian 逐 tick
+    // 蔓延毒化整个场（NaN 经 clamp/borderFade 无法消除），表现为水面
+    // 永久马赛克。这里直接归零，保证单次异常不可能永久污染。
+    if(!(height == height))
+    {
+        height = 0.0;
+        velocity = 0.0;
+    }
+
+    imageStore(
+        waterStateOutput,
+        ivec3(texel, int(pushData.layersAndFlags.y)),
+        vec4(height, velocity, 0.0, 0.0)
+    );
+}

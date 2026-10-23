@@ -1,0 +1,54 @@
+#version 460
+
+// ===============================================================
+// 2026-10-07 泛光第 4 步：合成回场景（**原地**）
+//
+//     scene.rgb += bloom.rgb * strength
+//
+// 这条 pass 必须录在「显示变换（rr_sdr_post）之前」：那边是**原地**读写
+// g_dlssOutputImage 的，一旦它跑完，图里就再也不是线性 HDR，泛光就没有正确的相加域了。
+// 反过来，泛光本身也**必须**在色调映射之前加：泛光是"亮部溢出"，属于曝光/曲线**之前**
+// 的线性域物理量；加在曲线之后会变成"给暗部糊一层灰"。
+//
+// strength 走**本 pass 自己的 push constant**（4 字节），不碰 rr_sdr_post 的
+// PostPush、也不碰 CameraUBO —— 后处理这条链在本工程的标准标量通道就是 push constant
+//（见 rr_sdr_post.comp 的 PostPush 先例）。
+// ===============================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform BloomCompositePush
+{
+    // 泛光强度：0 = 关（下面直接早退，连采样都省掉）。
+    float strength;
+} bloomPush;
+
+// 泛光 mip 链第 0 级（1/2 分辨率）。采样器 linear + clamp。
+layout(binding = 0, set = 0) uniform sampler2D bloomImage;
+
+// 场景（线性 HDR，输出分辨率）：读 + 写。
+layout(binding = 1, set = 0, rgba16f) uniform image2D sceneImage;
+
+void main()
+{
+    if(bloomPush.strength <= 0.0)
+    {
+        return;
+    }
+
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sceneSize = imageSize(sceneImage);
+    if(any(greaterThanEqual(pixel, sceneSize)))
+    {
+        return;
+    }
+
+    // 1/2 分辨率 → 全分辨率：双线性上采样就够（泛光本身是低频量，
+    // mip 链已经把高频磨掉了；再叠一次深度/边缘感知滤波是纯浪费）。
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(sceneSize);
+    vec3 bloom = textureLod(bloomImage, uv, 0.0).rgb;
+
+    vec4 scene = imageLoad(sceneImage, pixel);
+    scene.rgb += bloom * bloomPush.strength;
+    imageStore(sceneImage, pixel, scene);
+}

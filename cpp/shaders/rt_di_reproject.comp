@@ -1,0 +1,329 @@
+#version 460
+// =====================================================
+// 本地光 DI 项：时域复投影累积
+//
+// 移植自 
+//   src/shader/world/svgf/direct_reproject.comp
+// 与原文逐行对应，四处必要的换算/裁减在下面逐条注明。
+//
+// 为什么这一步最值得照搬：我此前用的是自写 EMA（窗口 64/256 帧、判据是
+// 位置/法线/深度的固定容差），实测表现为"窗口越深，椒盐越明显"——因为浅判据
+// 会把**邻域像素**的历史混进来，等于在时间上把噪声去相关成逐像素独立。
+// 做法完全不同：
+//   * 固定 alpha = 0.1（≈10 帧窗口，注释 "Slower for direct light"）
+//   * 复投影后先做**邻域 AABB 钳制**（clamp 到当帧 3x3 的 min/max 之间）
+//   * 深度/法线判据只用来决定"能不能用历史"，不用来缩放混合系数
+// 于是"去遮挡不被拖影"由 AABB 钳制承担，而不是由收紧判据承担。
+//
+// ==== 与原文的差异（逐条） ====
+// 1) 本文件同时做 YCoCg 解码：本项目每帧能拿到的 DI 项图是 REBLUR 打包图
+//（.xyz = YCoCg，.w = 归一化命中距离），而直接吃线性 radiance。
+//    解码函数逐字照抄 rt_nrd_composite.comp。
+// 2) **不做 albedo 解调**：存的是 radiance，需要 /albedo 变成"信号"再
+//    滤波；本项目这一项本来就是**辐照度**（解调后），合成端才乘 albedo。
+//    因此 neighborhoodClamp 的两次 /albedo 也一并去掉，比较直接在线性项上
+// 进行 —— 与在解调域上的比较等价。
+// 3) 运动矢量单位： motion 是**像素**（prevPixelF = pixel + motion）；
+//    本项目的 MV 是 NRD 契约的**归一化 UV 增量**（mv = prevUv - curUv，
+//    见 rt_restir_final.rgen 的 NRD_USE_REAL_MOTION_VECTORS 段），
+//    故乘渲染尺寸换算成像素。
+// 4) 深度用 NRD 的 IN_VIEWZ（r32f 线性视深度）而不是裁剪空间 z/w：
+//    判据是相对的（abs(Δ)/max(curr,0.01) < 0.1），要求线性量纲才成立。
+// =====================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// =====================================================
+// 2026-09-28 接受判据的取值（用"历史长度可视化"探针定下来的）
+//
+// 实测：打开历史长度可视化后，本地光方块遮挡阴影那两片**明显变暗**（计数≈0），
+// 周围也是**花斑状的灰**（计数不稳定）⇒ 判据在被违反、历史反复被拒 ⇒ 每帧退化成
+// 1spp ⇒ 二值可见性在硬遮挡边界上的逐帧翻转全部透出（这正是那个噪点的来源）。
+//
+// 为什么会违反： direct_reproject 用 0.9，是给**平滑插值法线**的场景写的；
+// 本项目法线来自体素/块面量化（我们源码里早记过"体素插值法线在块边缘正好会翻过
+// 这个门"）。拿 0.9 去套方块法线，等于在块边缘随机拒史。
+//
+// 取值依据（不是拍脑袋）：
+// * 法线门 0.90 -> **0.50**：这是自己的 **GI 链**用的值
+//     （`svgf_denoiser.cpp` 的 gi_temporal：`normalThresh = 0.5`）。同一作者、
+//     同一套缓存、面向同一类量化几何 —— 比 DI 链里那个 0.9 更适合本项目。
+//   * 相对深度门 0.10 -> **0.15**：块面/体素量化的接收面位置在亚像素抖动下有抖动，
+//     放宽以避免"临界失败"（我们此前在 EMA 上踩过完全一样的坑）。
+// * 真正负责防去遮挡拖影的是**邻域 AABB 钳制**，
+//     放宽这两个门不会失去它。
+//
+// 回退：-DRT_DI_REPROJECT_NORMAL_MIN=0.9 -DRT_DI_REPROJECT_DEPTH_REL=0.1
+// （注意这两个宏必须定义在**使用点之前**，也就是这里，不能挪到 main() 内部。）
+// =====================================================
+#ifndef RT_DI_REPROJECT_NORMAL_MIN
+#define RT_DI_REPROJECT_NORMAL_MIN 0.50
+#endif
+#ifndef RT_DI_REPROJECT_DEPTH_REL
+#define RT_DI_REPROJECT_DEPTH_REL 0.15
+#endif
+
+// 0：当帧打包项
+layout(binding = 0, rgba16f) uniform readonly image2D diPackedTermImage;
+// 1：运动矢量（NRD 契约，归一化 UV 增量）
+layout(binding = 1, rg16f) uniform readonly image2D diMotionImage;
+// 2：线性视深度（NRD IN_VIEWZ）
+layout(binding = 2, r32f) uniform readonly image2D diViewZImage;
+// 3：法线（RR guide，.xyz 为线性法线）
+layout(binding = 3, rgba16f) uniform readonly image2D diNormalImage;
+
+// 4..6：上一帧历史
+layout(binding = 4, rgba16f) uniform readonly image2D diHistoryColorPrev;
+layout(binding = 5, r32f) uniform readonly image2D diHistoryDepthPrev;
+layout(binding = 6, rgba16f) uniform readonly image2D diHistoryNormalPrev;
+
+// 7..9：本帧写出的历史（对应 ...Out）
+layout(binding = 7, rgba16f) uniform writeonly image2D diHistoryColorOut;
+layout(binding = 8, r32f) uniform writeonly image2D diHistoryDepthOut;
+layout(binding = 9, rgba16f) uniform writeonly image2D diHistoryNormalOut;
+
+// 10/11：历史长度
+layout(binding = 10, r16ui) uniform readonly uimage2D diHistoryLengthPrev;
+layout(binding = 11, r16ui) uniform writeonly uimage2D diHistoryLengthOut;
+
+// 12：本帧的线性项（= 本帧历史颜色；交给 direct_moments 与 à-trous 第一级）
+layout(binding = 12, rgba16f) uniform writeonly image2D diLinearTermOut;
+
+layout(push_constant) uniform DiReprojectPushConstants
+{
+    uint width;
+    uint height;
+    // 1 = 历史图刚（重）建，本帧不得读取历史：直接写当帧值、historyLength = 1。
+    // 没有这一档会读到未初始化的历史图（我们的历史图是 storage image，
+    // nrdCreateImage2D 留的是 UNDEFINED/GENERAL 的裸内存，不是清零）。
+    uint resetHistory;
+} reprojectPush;
+
+// =====================================================
+// 2026-09-28 时域混合系数
+//
+// 原值 0.1（≈10 帧窗口）。改成 0.05（≈20 帧）的依据：
+//   判据放宽 + 萤火虫钳制之后，残余已经从"二值翻转/椒盐"变成**低频云斑**，
+//   而云斑的成因只剩"输入给 à-trous 的残差方差"本身——空间核只能把它摊成块，
+//   只有时域能降低它。加深窗口的直接代价是运动拖影，而用户已实测确认
+//   在 0.1 时**移动无拖影**，说明还有余量。
+//
+// 回退：-DRT_DI_TEMPORAL_ALPHA=0.1
+// =====================================================
+#ifndef RT_DI_TEMPORAL_ALPHA
+#define RT_DI_TEMPORAL_ALPHA 0.05
+#endif
+const float MCVR_DIRECT_ALPHA = RT_DI_TEMPORAL_ALPHA;
+const uint MCVR_DIRECT_HISTORY_MAX = 64u;
+
+float luminance(vec3 c)
+{
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// 照抄 rt_nrd_composite.comp 的 _NRD_YCoCgToLinear
+vec3 nrdYCoCgToLinear(vec3 color)
+{
+    float t = color.x - color.z;
+
+    vec3 r;
+    r.y = color.x + color.z;
+    r.x = t + color.y;
+    r.z = t - color.y;
+
+    return max(r, vec3(0.0));
+}
+
+vec3 linearAt(ivec2 q)
+{
+    return nrdYCoCgToLinear(imageLoad(diPackedTermImage, q).rgb);
+}
+
+// 2026-09-28 23:xx 还原：邻域 AABB 钳制直通实验结束（幻影边缘实验的动机是
+// "等贡献弧缝被边缘保持型钳制当真边缘保护"；但直通后 α=0.05 的深时域失去
+// 唯一的防拖影闸门——历史不再被当帧邻域约束，相机一动，过期历史的光池
+// 直接混进画面，表现为"光源随屏幕移动而变化/漂移"。0.1 时"移动无拖影"
+// 的实测本就是在钳制在场的前提下做的，α 加深与直通不能同时成立）。
+// 原始实现按 variants/*.alpha_010_mcvr / strict_090 / debug_histlen 三个
+// 变体反汇编交叉确证，逐字还原；"去掉两次 /albedo"的理由见文件头差异 2。
+vec3 neighborhoodClamp(ivec2 pixel, vec3 centerColor, ivec2 size)
+{
+    vec3 mn = centerColor;
+    vec3 mx = centerColor;
+
+    for(int dy = -1; dy <= 1; ++dy)
+    {
+        for(int dx = -1; dx <= 1; ++dx)
+        {
+            ivec2 q = clamp(pixel + ivec2(dx, dy), ivec2(0), size - 1);
+            vec3 c = linearAt(q);
+            mn = min(mn, c);
+            mx = max(mx, c);
+        }
+    }
+
+    return clamp(centerColor, mn, mx);
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(diPackedTermImage);
+
+    if(pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    // 1) 当帧信号（解码；本项目该项已是解调后的辐照度，不再除 albedo）
+    vec3 currDirect = linearAt(pixel);
+    vec2 motionUv = imageLoad(diMotionImage, pixel).xy;
+    float currDepth = imageLoad(diViewZImage, pixel).r;
+    vec3 currNormalRaw = imageLoad(diNormalImage, pixel).xyz;
+    float currNormalLen = length(currNormalRaw);
+    vec3 currNormal = currNormalLen > 1.0e-4
+        ? currNormalRaw / currNormalLen
+        : vec3(0.0, 0.0, 1.0);
+
+    // 2) 复投影（MV 是归一化 UV 增量 -> 换算成像素）
+    //
+    // =====================================================
+    // 2026-09-28 拒史原因判决实验 v2（v1 四符号变体全黑之后的下一步）：
+    // v1 结论：mv 的方向/翻转约定不是根因（四个符号变体全部塌黑）。
+    // 剩余假设收敛为三个，本实验一次分辨：
+    //   区 0（最左）: mv 原样 + 判据         （= 线上行为，基线，已知运动时黑）
+    //   区 1: mv 原样 + 无条件接受历史        （跳过深度/法线门）
+    //   区 2: 同像素直读（不用 mv）+ 判据
+    //   区 3: 同像素直读 + 无条件接受         （控制组）
+    // 判读（先静止 3 秒四区应全白，再**缓慢**转动视角）：
+    //   区 1 亮  => mv 落点在屏内、判据在拒；结合 v1 四变体全黑 ⇒ mv≈0 嫌疑最大
+    //               （mv=0 时同像素落点在转动中换面，判据当然拒）→ 查 rgen 侧
+    //               historyValid / previousClip.w / MV 图归属；
+    //   区 1 黑  => mv 出界或 NaN（无条件接受也救不了 valid=false）→ 查 mv 数值；
+    //   区 3 黑  => 与 mv 无关的底层问题（parity 翻转/历史缓冲被清）；
+    //   区 2 亮  => 同像素连续帧的深度/法线在慢转下能过门 ⇒ 判据数据本身健康。
+    // 回退：不加 -DRT_DI_REJECT_SPLIT=1 编译即不含此代码。
+    // =====================================================
+#ifndef RT_DI_REJECT_SPLIT
+#define RT_DI_REJECT_SPLIT 0
+#endif
+#if RT_DI_REJECT_SPLIT
+    const int rejectRegion = pixel.x * 4 / size.x;
+    const bool useMv = rejectRegion != 2 && rejectRegion != 3;
+    const bool unconditionalAccept = rejectRegion == 1 || rejectRegion == 3;
+    vec2 prevPixelF = vec2(pixel) +
+        (useMv ? motionUv : vec2(0.0)) * vec2(size);
+#else
+    vec2 prevPixelF = vec2(pixel) + motionUv * vec2(size);
+#endif
+    ivec2 prevPixel = ivec2(round(prevPixelF));
+    bool valid =
+        prevPixel.x >= 0 && prevPixel.y >= 0 &&
+        prevPixel.x < size.x && prevPixel.y < size.y;
+
+    vec3 outDirect = currDirect;
+    uint historyLength = 1u;
+
+    // =====================================================
+    // 2026-09-28 23:4x 拒史原因探针（RT_DI_REJECT_REASON=1）：
+    // 按"哪一道判据失败"给像素上色，顺着 DI 链上屏（色相经反照率乘法仍可辨）。
+    //   红   = prevPixel 出界（mv 落点不在屏内）
+    //   洋红 = 历史重置帧（resetHistory）
+    //   绿   = 深度门失败
+    //   蓝   = 法线门失败
+    //   黄   = 接受（历史累积中）
+    // 判读（相机**缓慢转动**时看主色）：
+    //   整屏绿 ⇒ 深度门在运动时系统性失败（prevDepth 与当帧对不上）
+    //   整屏蓝 ⇒ 法线门系统性失败
+    //   整屏红 ⇒ mv 落点出界（但 23:15 量化已证 mv 量级正确 ⇒ 多半是尺寸/口径）
+    //   整屏黄 ⇒ 判据没问题，塌黑来自更下游（moments/atrous/合成端）
+    // 回退：不加 -DRT_DI_REJECT_REASON=1 编译即无此分支。
+    // =====================================================
+#ifndef RT_DI_REJECT_REASON
+#define RT_DI_REJECT_REASON 0
+#endif
+#if RT_DI_REJECT_REASON
+    vec3 rejectReason = vec3(1.0, 0.0, 0.0);
+#endif
+
+    // 历史刚重建：这一帧必须当"首帧"处理（见 push 里的说明）。
+    if(valid && reprojectPush.resetHistory == 0u)
+    {
+        vec3 prevDirect = imageLoad(diHistoryColorPrev, prevPixel).rgb;
+        float prevDepth = imageLoad(diHistoryDepthPrev, prevPixel).r;
+        vec3 prevNormalRaw = imageLoad(diHistoryNormalPrev, prevPixel).xyz;
+        float prevNormalLen = length(prevNormalRaw);
+        uint prevLength = imageLoad(diHistoryLengthPrev, prevPixel).r;
+
+ // 结构、本项目调过的门（取值依据见文件上方那段注释）
+        const bool depthOk =
+            abs(currDepth - prevDepth) / max(currDepth, 0.01) <
+                RT_DI_REPROJECT_DEPTH_REL;
+        const bool normalOk =
+            prevNormalLen > 1.0e-4 &&
+            dot(currNormal, prevNormalRaw / prevNormalLen) >
+                RT_DI_REPROJECT_NORMAL_MIN;
+        bool sameSurface = depthOk && normalOk;
+#if RT_DI_REJECT_REASON
+        rejectReason = depthOk
+            ? (normalOk ? vec3(1.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0))
+            : vec3(0.0, 1.0, 0.0);
+#endif
+
+#if RT_DI_REJECT_SPLIT
+        if(unconditionalAccept || sameSurface)
+#else
+        if(sameSurface)
+#endif
+        {
+            prevDirect = neighborhoodClamp(pixel, prevDirect, size);
+            outDirect = mix(prevDirect, currDirect, MCVR_DIRECT_ALPHA);
+            historyLength = min(prevLength + 1u, MCVR_DIRECT_HISTORY_MAX);
+        }
+    }
+#if RT_DI_REJECT_REASON
+    else if(reprojectPush.resetHistory != 0u)
+    {
+        rejectReason = vec3(1.0, 0.0, 1.0);
+    }
+#endif
+
+#ifndef RT_DI_DEBUG_HISTORY_LEN
+#define RT_DI_DEBUG_HISTORY_LEN 0
+#endif
+
+// 接受判据的门（RT_DI_REPROJECT_NORMAL_MIN / _DEPTH_REL）定义在文件顶部：
+// GLSL 的 #define 必须在**使用点之前**，这里在 main() 内、只放与本节紧邻的调试开关。
+
+#if RT_DI_REJECT_REASON
+    // 拒史原因色码（见上方说明）：红=出界、洋红=重置帧、绿=深度门、蓝=法线门、黄=接受。
+    imageStore(diHistoryColorOut, pixel, vec4(rejectReason, 1.0));
+    imageStore(diLinearTermOut, pixel, vec4(rejectReason, 1.0));
+#elif RT_DI_DEBUG_HISTORY_LEN
+    // =====================================================
+    // 2026-09-28 调试：把本帧历史长度画成灰阶，顺着链一路到合成端。
+    //
+    // 判读（针对"本地光方块遮挡阴影边界"的噪点）：
+    //   边界处明显变暗（≈0）  => 那些像素的历史被拒，计数反复压回 1
+    //                            => 病根在历史接受判据（深度/法线/AABB 钳制），
+    //                               而不是在采样或降噪核
+    //   边界处与周围一样亮   => 历史正常累积，那噪点来自链的更下游（或输出端）
+    // 灰阶标尺：0 = 0 帧（黑），1.0 = 64 帧（白）。
+    // =====================================================
+    const float historyVisual = float(historyLength) / 64.0;
+
+    imageStore(
+        diHistoryColorOut,
+        pixel,
+        vec4(historyVisual, historyVisual, historyVisual, 1.0)
+    );
+    imageStore(diLinearTermOut, pixel, vec4(historyVisual, historyVisual, historyVisual, 1.0));
+#else
+    imageStore(diHistoryColorOut, pixel, vec4(outDirect, 1.0));
+    imageStore(diLinearTermOut, pixel, vec4(outDirect, 1.0));
+#endif
+
+    imageStore(diHistoryDepthOut, pixel, vec4(currDepth, 0.0, 0.0, 0.0));
+    imageStore(diHistoryNormalOut, pixel, vec4(currNormal, 0.0));
+    imageStore(diHistoryLengthOut, pixel, uvec4(historyLength, 0u, 0u, 0u));
+}

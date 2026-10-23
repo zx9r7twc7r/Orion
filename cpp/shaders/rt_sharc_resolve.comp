@@ -1,0 +1,51 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// ============================================================================
+// 2026-10-11 rt_sharc_resolve.comp —— SHaRC 的 Resolve pass（5b-1）
+//
+// 职责（与 SDK 的三段式一致）：每个缓存元素跑一次 SharcResolveEntry ——
+//   · 把本帧 accumulated 的新样本并进 resolved（时域累积）；
+//   · 处理陈旧元素的驱逐（staleFrameNum > staleFrameNumMax ⇒ 整条清零并放掉哈希键）；
+//   · 清掉 accumulation，给下一帧的 update 腾地方。
+//
+// 这个 pass 的特别之处：**它只绑一个描述符 —— 相机 UBO（binding 2）**。
+// 三块缓存缓冲不是绑进来的，而是从 UBO 里的**64 位设备地址**还原出来的
+// buffer_reference（见 sharc_ubo.glsl 与 CameraUBO 尾块的说明）。所以：
+//   · 不需要新的描述符集布局 / 池 —— C++ 侧可以直接复用 RT 那套 set 0；
+//   · 但**必须在 C++ 侧保证**：派发时那三块缓冲已经清零过（否则 Resolve 会把
+//     随机数据当成已有样本并进 resolved），且 update 与 resolve 之间有 UAV 屏障。
+//
+// local_size_x = 64：与 C++ 侧"每帧派发 ceil(entries/64) 个工作组"配套。
+// ============================================================================
+
+#include "sharc_enable.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 2, set = 0) uniform CameraProperties {
+    #include "camera_ubo.glsl"
+} cam;
+
+#include "sharc_ubo.glsl"
+
+void main()
+{
+    const uint entryIndex = gl_GlobalInvocationID.x;
+
+    // 参数逐 invocation 重建：全是 UBO 读 + 几十条算术，相比每条目的原子读写可忽略。
+    // （注意不能加 const —— 结构体里含 buffer_reference 成员，GLSL 禁止 reference
+    // 类型带 const 限定符，2026-10-11 实测 glslang 会直接报错。）
+    SharcParameters sharcParameters = sharcBuildParameters();
+
+    if(entryIndex >= sharcParameters.hashGridData.capacity)
+    {
+        return;
+    }
+
+    SharcResolveEntry(
+        entryIndex,
+        sharcParameters,
+        sharcBuildResolveParameters());
+}

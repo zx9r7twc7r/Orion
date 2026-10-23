@@ -1,0 +1,1145 @@
+#version 460
+
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+
+struct VertexData
+{
+    float x;
+    float y;
+    float z;
+
+    float u;
+    float v;
+
+    float r;
+    float g;
+    float b;
+    float a;
+
+    float materialId;
+    float pad1;
+    float pad2;
+};
+
+
+struct DisplacedQuadRefData
+{
+    uint baseVertex;
+    uint flags;
+};
+
+
+layout(
+    buffer_reference,
+    scalar,
+    buffer_reference_align = 16
+) readonly buffer VertexBufferRef
+{
+    VertexData vertices[];
+};
+
+
+layout(
+    buffer_reference,
+    scalar,
+    buffer_reference_align = 8
+) readonly buffer DisplacedQuadRefBufferRef
+{
+    DisplacedQuadRefData refs[];
+};
+
+
+layout(
+    set = 0,
+    binding = 2,
+    std140
+) uniform CameraUBO
+{
+    mat4 viewInverse;
+    mat4 projInverse;
+
+    uint vertexBufferAddrLo;
+    uint vertexBufferAddrHi;
+    uint frameCount;
+    uint padding;
+
+    float cameraNear;
+    float cameraFar;
+    float cameraFov;
+    float cameraParamsPadding;
+
+    uint historyReadIndex;
+    uint historyValid;
+    uint historyPadding0;
+    uint historyPadding1;
+
+    mat4 prevViewInverse;
+    mat4 prevProjInverse;
+
+    float historyPrevJitterX;
+    float historyPrevJitterY;
+    float historyParamsPadding0;
+    float historyParamsPadding1;
+
+    uint displacedQuadRefAddrLo;
+    uint displacedQuadRefAddrHi;
+    uint displacedQuadRefPadding0;
+    uint displacedQuadRefPadding1;
+} camera;
+
+
+layout(
+    set = 0,
+    binding = 4
+) uniform sampler2D normalAtlas;
+
+
+// Procedural attributes:
+// x = quad-local S
+// y = quad-local T
+hitAttributeEXT vec2 attribs;
+
+
+const float DISPLACEMENT_DEPTH =
+    0.15;
+
+const float AABB_EPSILON =
+    0.001;
+
+
+// =====================================================
+// Device address
+// =====================================================
+
+uint64_t makeDeviceAddress(
+    uint lo,
+    uint hi
+)
+{
+    return
+        (
+            uint64_t(hi) << 32
+        ) |
+        uint64_t(lo);
+}
+
+
+// =====================================================
+// Quad UV:
+// p0=(0,0)
+// p1=(1,0)
+// p2=(1,1)
+// p3=(0,1)
+// =====================================================
+
+vec2 interpolateQuadUV(
+    vec2 uv0,
+    vec2 uv1,
+    vec2 uv2,
+    vec2 uv3,
+    vec2 st
+)
+{
+    vec2 bottom =
+        mix(
+            uv0,
+            uv1,
+            st.x
+        );
+
+    vec2 top =
+        mix(
+            uv3,
+            uv2,
+            st.x
+        );
+
+    return
+        mix(
+            bottom,
+            top,
+            st.y
+        );
+}
+
+
+// =====================================================
+// Ray / AABB slab helper
+// =====================================================
+
+bool clipLinearRange(
+    float value0,
+    float slope,
+    float minimumValue,
+    float maximumValue,
+    inout float rayTMin,
+    inout float rayTMax
+)
+{
+    if(abs(slope) < 1.0e-8)
+    {
+        return
+            value0 >= minimumValue &&
+            value0 <= maximumValue;
+    }
+
+    float t0 =
+        (minimumValue - value0) /
+        slope;
+
+    float t1 =
+        (maximumValue - value0) /
+        slope;
+
+    if(t0 > t1)
+    {
+        float temp = t0;
+        t0 = t1;
+        t1 = temp;
+    }
+
+    rayTMin =
+        max(
+            rayTMin,
+            t0
+        );
+
+    rayTMax =
+        min(
+            rayTMax,
+            t1
+        );
+
+    return
+        rayTMin <= rayTMax;
+}
+
+
+// =====================================================
+// Evaluate signed distance-like field:
+//
+// field < 0 : ray point is outside/front of height surface
+// field > 0 : ray point is behind/inside height surface
+//
+// Root == displaced surface.
+// =====================================================
+
+bool evaluateHeightFieldFast(
+    float rayT,
+
+    vec2 stOrigin,
+    vec2 stSlope,
+
+    float depthOrigin,
+    float depthSlope,
+
+    vec2 uv0,
+    vec2 uv1,
+    vec2 uv2,
+    vec2 uv3,
+
+    vec2 safeMin,
+    vec2 safeMax,
+
+    out vec2 outST,
+    out float outField
+)
+{
+    outST =
+        stOrigin +
+        stSlope *
+        rayT;
+
+
+    const float BORDER_EPS =
+        1.0e-4;
+
+
+    if(
+        outST.x < -BORDER_EPS ||
+        outST.x > 1.0 + BORDER_EPS ||
+        outST.y < -BORDER_EPS ||
+        outST.y > 1.0 + BORDER_EPS
+    )
+    {
+        return false;
+    }
+
+
+    vec2 st =
+        clamp(
+            outST,
+            vec2(0.0),
+            vec2(1.0)
+        );
+
+
+    // 与 B8C-1 rchit 的 Quad 三角划分保持一致。
+    vec2 atlasUV;
+
+
+    if(st.x >= st.y)
+    {
+        vec3 bary =
+            vec3(
+                1.0 - st.x,
+                st.x - st.y,
+                st.y
+            );
+
+
+        atlasUV =
+            uv0 * bary.x +
+            uv1 * bary.y +
+            uv2 * bary.z;
+    }
+    else
+    {
+        vec3 bary =
+            vec3(
+                1.0 - st.y,
+                st.x,
+                st.y - st.x
+            );
+
+
+        atlasUV =
+            uv0 * bary.x +
+            uv2 * bary.y +
+            uv3 * bary.z;
+    }
+
+
+    atlasUV =
+        clamp(
+            atlasUV,
+            safeMin,
+            safeMax
+        );
+
+
+    float height01 =
+        1.0 -
+        textureLod(
+            normalAtlas,
+            atlasUV,
+            0.0
+        ).a;
+
+
+    float surfaceDepth =
+        clamp(
+            height01,
+            0.0,
+            1.0
+        ) *
+        DISPLACEMENT_DEPTH;
+
+
+    float rayDepth =
+        depthOrigin +
+        depthSlope *
+        rayT;
+
+
+    outField =
+        rayDepth -
+        surfaceDepth;
+
+
+    return true;
+}
+// =====================================================
+// Main procedural intersection
+// =====================================================
+
+void main()
+{
+    uint64_t refAddress =
+        makeDeviceAddress(
+            camera.displacedQuadRefAddrLo,
+            camera.displacedQuadRefAddrHi
+        );
+
+
+    uint64_t vertexAddress =
+        makeDeviceAddress(
+            camera.vertexBufferAddrLo,
+            camera.vertexBufferAddrHi
+        );
+
+
+    if(
+        refAddress == uint64_t(0) ||
+        vertexAddress == uint64_t(0)
+    )
+    {
+        return;
+    }
+
+
+    DisplacedQuadRefBufferRef refBuffer =
+        DisplacedQuadRefBufferRef(
+            refAddress
+        );
+
+
+    VertexBufferRef vertexBuffer =
+        VertexBufferRef(
+            vertexAddress
+        );
+
+
+    DisplacedQuadRefData quadRef =
+        refBuffer.refs[
+            gl_PrimitiveID
+        ];
+
+
+    uint baseVertex =
+        quadRef.baseVertex;
+
+
+    VertexData v0 =
+        vertexBuffer.vertices[
+            baseVertex + 0u
+        ];
+
+    VertexData v1 =
+        vertexBuffer.vertices[
+            baseVertex + 1u
+        ];
+
+    VertexData v2 =
+        vertexBuffer.vertices[
+            baseVertex + 2u
+        ];
+
+    VertexData v3 =
+        vertexBuffer.vertices[
+            baseVertex + 5u
+        ];
+
+
+    vec3 p0 =
+        vec3(
+            v0.x,
+            v0.y,
+            v0.z
+        );
+
+    vec3 p1 =
+        vec3(
+            v1.x,
+            v1.y,
+            v1.z
+        );
+
+    vec3 p2 =
+        vec3(
+            v2.x,
+            v2.y,
+            v2.z
+        );
+
+    vec3 p3 =
+        vec3(
+            v3.x,
+            v3.y,
+            v3.z
+        );
+
+
+    vec2 uv0 =
+        vec2(
+            v0.u,
+            v0.v
+        );
+
+    vec2 uv1 =
+        vec2(
+            v1.u,
+            v1.v
+        );
+
+    vec2 uv2 =
+        vec2(
+            v2.u,
+            v2.v
+        );
+
+    vec2 uv3 =
+        vec2(
+            v3.u,
+            v3.v
+        );
+
+
+    // =================================================
+    // Quad basis
+    // =================================================
+
+    vec3 edgeS =
+        p1 -
+        p0;
+
+
+    vec3 edgeT =
+        p3 -
+        p0;
+
+
+    vec3 rawNormal =
+        cross(
+            p1 - p0,
+            p2 - p0
+        );
+
+
+    float normalLengthSquared =
+        dot(
+            rawNormal,
+            rawNormal
+        );
+
+
+    if(normalLengthSquared <= 1.0e-12)
+    {
+        return;
+    }
+
+
+    vec3 geometricNormal =
+        rawNormal *
+        inversesqrt(
+            normalLengthSquared
+        );
+
+
+    float gramA =
+        dot(
+            edgeS,
+            edgeS
+        );
+
+    float gramB =
+        dot(
+            edgeS,
+            edgeT
+        );
+
+    float gramC =
+        dot(
+            edgeT,
+            edgeT
+        );
+
+
+    float gramDet =
+        gramA *
+        gramC -
+        gramB *
+        gramB;
+
+
+    if(abs(gramDet) <= 1.0e-12)
+    {
+        return;
+    }
+    // =====================================================
+// B8C-P1
+// Ray expressed directly in local heightfield space:
+//
+// S(t)     = stOrigin.x + stSlope.x * t
+// T(t)     = stOrigin.y + stSlope.y * t
+// Depth(t) = depthOrigin + depthSlope * t
+//
+// All expensive world->quad transforms happen once.
+// =====================================================
+
+vec3 originRelative =
+    gl_WorldRayOriginEXT -
+    p0;
+
+
+float originDotS =
+    dot(
+        originRelative,
+        edgeS
+    );
+
+float originDotT =
+    dot(
+        originRelative,
+        edgeT
+    );
+
+
+vec2 stOrigin;
+
+stOrigin.x =
+    (
+        originDotS * gramC -
+        originDotT * gramB
+    ) /
+    gramDet;
+
+stOrigin.y =
+    (
+        originDotT * gramA -
+        originDotS * gramB
+    ) /
+    gramDet;
+
+
+float directionDotS =
+    dot(
+        gl_WorldRayDirectionEXT,
+        edgeS
+    );
+
+float directionDotT =
+    dot(
+        gl_WorldRayDirectionEXT,
+        edgeT
+    );
+
+
+vec2 stSlope;
+
+stSlope.x =
+    (
+        directionDotS * gramC -
+        directionDotT * gramB
+    ) /
+    gramDet;
+
+stSlope.y =
+    (
+        directionDotT * gramA -
+        directionDotS * gramB
+    ) /
+    gramDet;
+
+
+float depthOrigin =
+    -dot(
+        originRelative,
+        geometricNormal
+    );
+
+
+float depthSlope =
+    -dot(
+        gl_WorldRayDirectionEXT,
+        geometricNormal
+    );
+
+
+    // =================================================
+    // Atlas-safe bounds
+    // =================================================
+
+    vec2 spriteMin =
+        min(
+            min(uv0, uv1),
+            min(uv2, uv3)
+        );
+
+
+    vec2 spriteMax =
+        max(
+            max(uv0, uv1),
+            max(uv2, uv3)
+        );
+
+
+    vec2 atlasSize =
+        vec2(
+            textureSize(
+                normalAtlas,
+                0
+            )
+        );
+
+
+    vec2 atlasTexel =
+        1.0 /
+        max(
+            atlasSize,
+            vec2(1.0)
+        );
+
+
+    vec2 spriteCenter =
+        (
+            spriteMin +
+            spriteMax
+        ) *
+        0.5;
+
+
+    vec2 safeMin =
+        spriteMin +
+        atlasTexel *
+        0.5;
+
+
+    vec2 safeMax =
+        spriteMax -
+        atlasTexel *
+        0.5;
+
+
+    safeMin =
+        min(
+            safeMin,
+            spriteCenter
+        );
+
+
+    safeMax =
+        max(
+            safeMax,
+            spriteCenter
+        );
+
+
+    // =================================================
+    // Reconstruct same tight B5 AABB.
+    // =================================================
+
+    // =====================================================
+// Tight oriented heightfield prism clipping.
+// Hardware already intersected the AABB.
+// This further reduces the actual march interval.
+// =====================================================
+
+float tEnter =
+    gl_RayTminEXT;
+
+
+float tExit =
+    gl_RayTmaxEXT;
+
+
+if(
+    !clipLinearRange(
+        stOrigin.x,
+        stSlope.x,
+        0.0,
+        1.0,
+        tEnter,
+        tExit
+    ) ||
+
+    !clipLinearRange(
+        stOrigin.y,
+        stSlope.y,
+        0.0,
+        1.0,
+        tEnter,
+        tExit
+    ) ||
+
+    !clipLinearRange(
+        depthOrigin,
+        depthSlope,
+        0.0,
+        DISPLACEMENT_DEPTH,
+        tEnter,
+        tExit
+    )
+)
+{
+    return;
+}
+
+
+if(tExit <= tEnter)
+{
+    return;
+}
+
+
+    if(tExit < tEnter)
+    {
+        return;
+    }
+
+
+    // =================================================
+    // Adaptive coarse march:
+    //
+    // perpendicular = 32
+    // grazing       = 64
+    // =================================================
+
+float facing =
+    abs(
+        dot(
+            normalize(
+                gl_WorldRayDirectionEXT
+            ),
+            geometricNormal
+        )
+    );
+
+
+int coarseSteps =
+    int(
+        round(
+mix(
+    8.0,
+    4.0,
+                clamp(
+                    facing,
+                    0.0,
+                    1.0
+                )
+            )
+        )
+    );
+
+
+coarseSteps =
+    clamp(
+        coarseSteps,
+        4,
+        8
+    );
+
+
+    float tStep =
+        (
+            tExit -
+            tEnter
+        ) /
+        float(
+            coarseSteps
+        );
+
+
+    bool havePrevious =
+        false;
+
+
+    float previousT =
+        tEnter;
+
+
+    float previousField =
+        0.0;
+
+
+    vec2 previousST =
+        vec2(0.0);
+
+
+    // =================================================
+    // Find FIRST field sign crossing.
+    // =================================================
+
+for(
+    int i = 0;
+    i <= 8;
+    ++i
+)
+    {
+        if(i > coarseSteps)
+        {
+            break;
+        }
+
+
+        float currentT =
+            i == coarseSteps
+                ? tExit
+                : tEnter +
+                  tStep *
+                  float(i);
+
+
+        vec2 currentST;
+        float currentField;
+
+
+        bool currentValid =
+            evaluateHeightFieldFast(
+    currentT,
+
+    stOrigin,
+    stSlope,
+
+    depthOrigin,
+    depthSlope,
+
+    uv0,
+    uv1,
+    uv2,
+    uv3,
+
+    safeMin,
+    safeMax,
+
+    currentST,
+    currentField
+);
+
+        if(!currentValid)
+        {
+            havePrevious =
+                false;
+
+            continue;
+        }
+
+
+        // Exact / near-exact root.
+        if(abs(currentField) <= 1.0e-5)
+        {
+            attribs =
+                clamp(
+                    currentST,
+                    vec2(0.0),
+                    vec2(1.0)
+                );
+
+
+            reportIntersectionEXT(
+                currentT,
+                0u
+            );
+
+            return;
+        }
+
+
+        if(havePrevious)
+        {
+            bool crossed =
+                (
+                    previousField <= 0.0 &&
+                    currentField >= 0.0
+                ) ||
+                (
+                    previousField >= 0.0 &&
+                    currentField <= 0.0
+                );
+
+
+            if(crossed)
+            {
+                // =====================================
+                // Binary refinement
+                // =====================================
+
+                float lowT =
+                    previousT;
+
+                float highT =
+                    currentT;
+
+                float lowField =
+                    previousField;
+
+
+                vec2 finalST =
+                    currentST;
+
+
+                float highField =
+    currentField;
+
+
+for(
+    int refine = 0;
+    refine < 3;
+    ++refine
+)
+{
+    float denominator =
+        highField -
+        lowField;
+
+
+    float candidateT;
+
+
+    if(abs(denominator) > 1.0e-7)
+    {
+        // Secant / regula-falsi estimate.
+        candidateT =
+            (
+                lowT * highField -
+                highT * lowField
+            ) /
+            denominator;
+
+
+        // 防止高度图不连续时 secant 贴死某一端。
+        float guard =
+            (
+                highT -
+                lowT
+            ) *
+            0.15;
+
+
+        candidateT =
+            clamp(
+                candidateT,
+                lowT + guard,
+                highT - guard
+            );
+    }
+    else
+    {
+        candidateT =
+            (
+                lowT +
+                highT
+            ) *
+            0.5;
+    }
+
+
+    vec2 candidateST;
+    float candidateField;
+
+
+    if(
+        !evaluateHeightFieldFast(
+            candidateT,
+
+            stOrigin,
+            stSlope,
+
+            depthOrigin,
+            depthSlope,
+
+            uv0,
+            uv1,
+            uv2,
+            uv3,
+
+            safeMin,
+            safeMax,
+
+            candidateST,
+            candidateField
+        )
+    )
+    {
+        break;
+    }
+
+
+    bool lowToCandidateCross =
+        (
+            lowField <= 0.0 &&
+            candidateField >= 0.0
+        ) ||
+        (
+            lowField >= 0.0 &&
+            candidateField <= 0.0
+        );
+
+
+    if(lowToCandidateCross)
+    {
+        highT =
+            candidateT;
+
+        highField =
+            candidateField;
+    }
+    else
+    {
+        lowT =
+            candidateT;
+
+        lowField =
+            candidateField;
+    }
+}
+
+
+                float hitT =
+                    (
+                        lowT +
+                        highT
+                    ) *
+                    0.5;
+
+
+                vec2 hitST;
+                float ignoredField;
+
+
+                if(
+    !evaluateHeightFieldFast(
+        hitT,
+
+        stOrigin,
+        stSlope,
+
+        depthOrigin,
+        depthSlope,
+
+        uv0,
+        uv1,
+        uv2,
+        uv3,
+
+        safeMin,
+        safeMax,
+
+        hitST,
+        ignoredField
+    )
+)
+                {
+                    return;
+                }
+
+
+                attribs =
+                    clamp(
+                        hitST,
+                        vec2(0.0),
+                        vec2(1.0)
+                    );
+
+
+                reportIntersectionEXT(
+                    hitT,
+                    0u
+                );
+
+
+                return;
+            }
+        }
+
+
+        havePrevious =
+            true;
+
+
+        previousT =
+            currentT;
+
+
+        previousField =
+            currentField;
+
+
+        previousST =
+            currentST;
+    }
+}

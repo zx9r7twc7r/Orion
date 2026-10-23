@@ -1,0 +1,45 @@
+SHaRC (Spatially Hashed Radiance Cache) — vendor notice
+========================================================
+
+This software contains source code provided by NVIDIA Corporation.
+
+Source        : https://github.com/NVIDIAGameWorks/Spatial-Hash-Radiance-Cache
+Revision      : 4e21b58 (v1.8.3)
+Vendored files: SharcCommon.h, HashGridCommon.h, SharcTypes.h,
+                HashGridTypes.h, SharcGlslHelpers.h
+                (copied verbatim; no local modifications)
+
+License       : NVIDIA RTX SDKs License (see License.md in the upstream
+                repository, and the license section in the project's
+                THIRD_PARTY_NOTICES.md).
+
+Distribution requirements that apply to this project (NVIDIA RTX SDKs
+License, section 2):
+
+  (a) the application must have material additional functionality beyond
+      the SDK portions — the surrounding renderer is this project's own;
+  (b) the notice "This software contains source code provided by NVIDIA
+      Corporation." must be included in modifications and derivative works
+      of source code that are distributed — this file provides it, and the
+      same notice is recorded in THIRD_PARTY_NOTICES.md;
+  (c) distribution must be under terms at least as protective as the
+      license's terms;
+  (d) the SDK may not be distributed as a stand-alone product.
+
+Do not strip the NVIDIA copyright headers from the vendored files
+(license section 4.a forbids removing copyright or proprietary notices).
+
+Integration notes for this project
+----------------------------------
+* Compiled as GLSL via SharcGlslHelpers.h (define SHARC_ENABLE_GLSL before
+  including it). The helpers express "RWStructuredBuffer_*" as
+  GL_EXT_buffer_reference types, so any pass that includes these headers
+  must declare GL_EXT_buffer_reference (plus, per the helper header, the
+  explicit-arithmetic-types int64/float16, 16-bit storage and
+  control-flow-attributes extensions).
+* The three cache buffers are reached through 64-bit buffer device
+  addresses passed in the camera UBO; verify the device has
+  bufferDeviceAddress enabled (this renderer already uses it for the
+  Section BLAS scratch buffers).
+* Required shader compiler support was verified on this project's toolchain
+  (Vulkan SDK 1.4.309.0 glslangValidator, --target-env vulkan1.4).

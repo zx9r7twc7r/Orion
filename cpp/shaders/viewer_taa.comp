@@ -1,0 +1,106 @@
+#version 460
+
+// ===========================================================================
+// 预览器时域累积（TAA）
+//
+// 为什么需要它：云 pass 是单帧采样，ray 起点有个逐帧变化的 hash 抖动
+// （参考库 clouds_compute.wgsl:169 的 hashed_offset），单帧看就是颗粒/条纹；
+// 参考库之所以 12 步就能出干净画面，是因为它每帧累积（reprojection_strength 0.95）。
+// 没有累积时，细节尺度只能卡在步长附近，云缘永远是"喷绘"感。
+//
+// 做法：按世界位置重投影历史帧 → 深度校验 → 3x3 邻域夹紧 → 指数滑动平均。
+// ===========================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D curColor;
+layout(set = 0, binding = 1) uniform sampler2D curDepth;
+layout(set = 0, binding = 2) uniform sampler2D prvColor;
+layout(set = 0, binding = 3) uniform sampler2D prvDepth;
+layout(rgba16f, set = 0, binding = 4) uniform writeonly image2D outColor;
+layout(r32f, set = 0, binding = 5) uniform writeonly image2D outDepth;   // 深度也要存，下一帧才能校验
+
+layout(push_constant) uniform Push
+{
+    vec4 curFwd;    // xyz = 视线, w = tanHalfFov
+    vec4 curRight;  // xyz = 右,   w = aspect
+    vec4 curUp;     // xyz = 上,   w = 混合 alpha（新样本权重）
+    vec4 curPos;    // xyz = 相机位置, w > 0.5 = 丢弃历史（首帧 / 换尺寸）
+    vec4 prvFwd;
+    vec4 prvRight;
+    vec4 prvUp;
+    vec4 prvPos;
+} pc;
+
+const float FAR = 1.0e8;
+
+void main()
+{
+    ivec2 size = imageSize(outColor);
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(pixel, size))) return;
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+    vec4 cur = texture(curColor, uv);
+    float depth = texelFetch(curDepth, pixel, 0).r;
+
+    vec4 result = cur;
+    float alpha = clamp(pc.curUp.w, 0.02, 1.0);
+
+    if(pc.curPos.w < 0.5 && alpha < 0.999 && depth < FAR)
+    {
+        vec2 ndc = uv * 2.0 - 1.0;
+        ndc.y = -ndc.y;   // 与 cloud_bevy_preview.comp 的射线生成一致（那里也翻了 Y）
+        vec3 dir = normalize(pc.curFwd.xyz
+            + pc.curRight.xyz * (ndc.x * pc.curFwd.w * pc.curRight.w)
+            + pc.curUp.xyz * (ndc.y * pc.curFwd.w));
+
+        // 云图里的 depth 是沿视线的距离 ⇒ 渲染空间的世界点 = 方向 × 距离
+        vec3 world = dir * min(depth, 60000.0) + pc.curPos.xyz;
+        vec3 rel = world - pc.prvPos.xyz;
+        float z = dot(rel, pc.prvFwd.xyz);
+
+        if(z > 1.0)
+        {
+            // 反投影：注意 ndc.y = -ndc.y 的逆变换也要取负，否则 y 会镜像到
+            // 屏幕另一半，深度校验必然失败（这里吃过一次）。
+            vec2 puv;
+            puv.x = 0.5 + 0.5 * dot(rel, pc.prvRight.xyz) / z /
+                (pc.prvFwd.w * pc.prvRight.w);
+            puv.y = 0.5 - 0.5 * dot(rel, pc.prvUp.xyz) / z / pc.prvFwd.w;
+
+            if(all(greaterThanEqual(puv, vec2(0.0))) && all(lessThanEqual(puv, vec2(1.0))))
+            {
+                float prvZ = texture(prvDepth, puv).r;
+                // 首次命中距离被步长量化，逐帧抖动下会跳一两个步长 ⇒ 阈值要给够。
+                // **软权重**而不是 0/1 硬切：云缘那一圈像素的深度逐帧变化很大，
+                // 硬切会让它们永远拿不到历史、退化成单帧噪声（实测运动时差异全堆在
+                // 云缘一圈）。这里按深度差连续地降低历史权重。
+                float tol = max(30.0, depth * 0.15);
+                float depthDiff = abs(prvZ - depth) / tol;
+                float trust = (prvZ < FAR) ? smoothstep(1.0, 0.25, depthDiff) : 0.0;
+                if(trust > 0.001)
+                {
+                    // 3x3 邻域夹紧，范围再放宽 10%（给边缘留一点历史，不加 tap 数）
+                    vec3 mn = cur.rgb;
+                    vec3 mx = cur.rgb;
+                    for(int dy = -1; dy <= 1; ++dy)
+                    for(int dx = -1; dx <= 1; ++dx)
+                    {
+                        ivec2 q = clamp(pixel + ivec2(dx, dy), ivec2(0), size - 1);
+                        vec3 c = texelFetch(curColor, q, 0).rgb;
+                        mn = min(mn, c);
+                        mx = max(mx, c);
+                    }
+                    vec3 span = (mx - mn) * 0.10;
+                    vec4 hist = texture(prvColor, puv);
+                    hist.rgb = clamp(hist.rgb, mn - span, mx + span);
+                    result = mix(hist, cur, mix(1.0, alpha, trust));
+                }
+            }
+        }
+    }
+
+    imageStore(outColor, pixel, result);
+    imageStore(outDepth, pixel, vec4(depth, 0.0, 0.0, 0.0));
+}

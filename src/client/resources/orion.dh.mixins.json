@@ -1,0 +1,13 @@
+{
+	"required": false,
+	"package": "com.example.client.compat.dh.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"plugin": "com.example.client.compat.dh.mixin.DhMixinPlugin",
+	"client": [
+		"DhLodBufferHookMixin",
+		"DhRenderListHookMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}

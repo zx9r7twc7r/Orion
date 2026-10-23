@@ -1,0 +1,1026 @@
+#version 460
+// 2026-10-21：延迟材质已是唯一模式（见文档 §13）。
+#if !defined(RT_DEFERRED_MATERIAL) && !defined(RT_BUILD_PRODUCTION_MODE)
+#define RT_DEFERRED_MATERIAL 1
+#endif
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// The pane transmission filter is single-sourced in glass_tint_common.glsl so
+// this Any-Hit sheet model and the voxel DDA arm of the same stained-glass
+// model cannot drift apart again.  GLASS_TINT_NO_DDA keeps the voxel march out
+// of this translation unit: its callee vptReadSourceVoxel() is defined only by
+// the raygen-family shaders.
+#extension GL_GOOGLE_include_directive : require
+#define GLASS_TINT_NO_DDA 1
+#include "glass_tint_common.glsl"
+// LOD / 远场几何的角色表与每柱覆盖位图（binding 19/20）。
+#include "lod_coverage.glsl"
+
+// 2026-10-20: 结构体单源化，见 hit_payload.glsl（六个 shader 共用同一份布局）。
+#include "hit_payload.glsl"
+
+#ifdef RT_DEFERRED_MATERIAL
+layout(location = 0) rayPayloadInEXT HitIdentity payload;
+#else
+layout(location = 0) rayPayloadInEXT HitPayload payload;
+#endif
+
+const uint RT_STATE_PURPOSE_MASK       = 0x7u;
+const uint RT_PURPOSE_PASSTHROUGH      = 4u;
+const uint RT_PURPOSE_GLASS_VISIBILITY = 5u;
+
+uint getRayPurpose(uint state)
+{
+    return state & RT_STATE_PURPOSE_MASK;
+}
+
+hitAttributeEXT vec2 attribs;
+
+// === 核心事实对齐：严格匹配 48 字节 Vertex 结构体布局 ===
+struct Vertex {
+    float x, y, z;      // 12 bytes
+    float u, v;         // 8 bytes
+    float r, g, b, a;   // 16 bytes
+    float materialId;   // 4 bytes
+    float pad1;         // 4 bytes
+    float pad2;         // 4 bytes
+};                      // 总计: 48 bytes[cite: 4]
+
+layout(buffer_reference, scalar) buffer Vertices {
+    Vertex v[];
+};
+
+// =====================================================
+// 2026-10-21 地形 32B 顶点（与 C++ 的 SectionVertex 逐字节对应）
+//
+// 本 TU 自带 Vertex/Vertices 且不 include material_common.glsl ⇒ 这里单独持一份
+// 解包器；内容与 material_common.glsl:89-135 一致，改那边必须同步改这里。
+//
+// 判别方式：顶点地址表项（binding 21）的 .w = 该段顶点步长（32 或 48）。
+// 解包后仍返回老的 48B Vertex ⇒ 下游 materialId/pad1/pad2 使用点零改动。
+// 编译期开关必须与 C++ 的 SECTION_VERTEX_32B_ENABLED 一致。
+// =====================================================
+#if SECTION_VERTEX_32B
+struct SectionVertex32
+{
+    float x, y, z;
+    float u, v;
+    uint color;      // RGBA8: r | g<<8 | b<<16 | a<<24
+    float materialId;
+    float pad2;      // pad2 + (pad1 > 0 ? 64 : 0)
+};
+
+layout(buffer_reference, scalar) buffer SectionVertices32 {
+    SectionVertex32 v[];
+};
+
+Vertex loadSectionVertex(uint64_t addr, uint stride, uint index)
+{
+    if(stride == 32u)
+    {
+        const SectionVertex32 packed = SectionVertices32(addr).v[index];
+
+        Vertex unpacked;
+        unpacked.x = packed.x;
+        unpacked.y = packed.y;
+        unpacked.z = packed.z;
+        unpacked.u = packed.u;
+        unpacked.v = packed.v;
+        unpacked.r = float(packed.color & 0xFFu) / 255.0;
+        unpacked.g = float((packed.color >> 8) & 0xFFu) / 255.0;
+        unpacked.b = float((packed.color >> 16) & 0xFFu) / 255.0;
+        unpacked.a = float((packed.color >> 24) & 0xFFu) / 255.0;
+        unpacked.materialId = packed.materialId;
+
+        const bool rainPuddle = packed.pad2 >= 64.0;
+        unpacked.pad1 = rainPuddle ? 0.25 : 0.0;
+        unpacked.pad2 = rainPuddle ? (packed.pad2 - 64.0) : packed.pad2;
+
+        return unpacked;
+    }
+
+    return Vertices(addr).v[index];
+}
+#else
+Vertex loadSectionVertex(uint64_t addr, uint /*stride*/, uint index)
+{
+    return Vertices(addr).v[index];
+}
+#endif
+
+// Match closest-hit: one entry per TLAS Section instance.
+// Any-hit must use this table too; CameraProperties.vertexBufferAddr
+// is only the initialization fallback/test triangle address.
+// 2026-10-09：表项 8B → 16B（uvec4），与 C++ 侧及两个 rchit 一致。
+layout(std430, binding = 21, set = 0) readonly buffer SectionVertexAddressBuffer {
+    uvec4 vertexAddresses[];
+} sectionVertexAddressBuffer;
+
+layout(binding = 2, set = 0) uniform CameraProperties {
+    #include "camera_ubo.glsl"
+} cam;
+
+layout(binding = 3, set = 0) uniform sampler2D blockAtlas;
+// Existing global descriptor; Any-Hit reads it only for the exiting face of
+// a glass visibility segment.  No new descriptor or SPV stage is required.
+layout(binding = 4, set = 0) uniform sampler2D normalAtlas;
+layout(binding = 45, set = 0) uniform sampler2D voxyLodAtlas;
+
+// =====================================================
+// Voxy LOD silhouette (v11)
+//
+// Voxy alpha-class quads are routed here with FORCE_NO_OPAQUE,
+// so this stage decides the cutout silhouette.  Sampling the
+// atlas at the analytical density mip (instead of mip 0) makes
+// coverage fall off smoothly with distance rather than
+// sparkling texel by texel, and matches the mip the closest-hit
+// stage shades with.  Samples stay in gamma space: the glass
+// visibility path multiplies them by the vertex colour, exactly
+// like the near-field foliage path does.
+// =====================================================
+// v15: 256 -> 1024 (bridge tiles 16 -> 64 per axis, capacity 255 -> 4095).
+// VOXY_TILE_PIXELS stays 16 so texel density is unchanged; only the number of
+// addressable tiles grows.  Must track ATLAS_SIZE in the voxy bridge.
+const float VOXY_ATLAS_SIZE = 1024.0;
+const float VOXY_TILE_PIXELS = 16.0;
+
+// Disabled: see the colour-space note above.  Kept as a future interface
+// option for a linear-space pass.
+#if 0
+vec3 voxySrgbToLinear(vec3 srgb)
+{
+    vec3 high = pow((srgb + 0.055) * (1.0 / 1.055), vec3(2.4));
+    vec3 low = srgb * (1.0 / 12.92);
+    return mix(high, low, lessThanEqual(srgb, vec3(0.04045)));
+}
+#endif
+
+float voxyLodMip(vec3 pos0, vec3 pos1, vec3 geoNormal)
+{
+    // Both quad triangles expose the cell edge length: the first
+    // triangle's v0->v1 is a square side, the second's is the
+    // diagonal whose largest |component| equals the same side.
+    vec3 edge = abs(pos1 - pos0);
+    float cellW = max(edge.x, max(edge.y, edge.z));
+    float projScale = float(gl_LaunchSizeEXT.y)
+        / (2.0 * max(tan(cam.cameraParams.z * 0.5), 0.05));
+    float facing = abs(dot(geoNormal, gl_WorldRayDirectionEXT));
+    float cellPx = cellW * projScale * max(facing, 0.02)
+        / max(gl_HitTEXT, 1.0e-3);
+    return clamp(
+        log2(VOXY_TILE_PIXELS / max(cellPx, 1.0e-4)),
+        0.0,
+        4.0
+    );
+}
+
+vec2 voxyTileSafeUV(vec2 uv, vec2 uv0, vec2 uv1, vec2 uv2, float mip)
+{
+    // Encoded corner UVs are mip0 texel centres; recover the true
+    // tile origin, then inset by half a texel of the selected mip
+    // (ceil keeps the coarser trilinear level inside the tile).
+    vec2 tileOrigin = min(uv0, min(uv1, uv2)) - vec2(0.5 / VOXY_ATLAS_SIZE);
+    float inset = exp2(ceil(mip)) * (0.5 / VOXY_ATLAS_SIZE);
+    vec2 tileSpan = vec2(VOXY_TILE_PIXELS / VOXY_ATLAS_SIZE);
+    return clamp(uv, tileOrigin + inset, tileOrigin + tileSpan - inset);
+}
+
+// Leaves, glass and ice share the bridge's translucent bucket.  Only a fully
+// covered tile is a real glass sheet that filters light; anything with holes
+// is cutout foliage, which the closest-hit stage classifies as opaque and
+// which must therefore block visibility rays the same way.  The whole-tile
+// average (one texel at mip 4) keeps the decision constant across the quad.
+bool voxyTileIsFullyCovered(vec2 uv0, vec2 uv1, vec2 uv2)
+{
+    vec2 tileOrigin = min(uv0, min(uv1, uv2)) - vec2(0.5 / VOXY_ATLAS_SIZE);
+    vec2 tileCentre = tileOrigin
+        + vec2((VOXY_TILE_PIXELS * 0.5) / VOXY_ATLAS_SIZE);
+    return textureLod(voxyLodAtlas, tileCentre, 4.0).a >= 0.985;
+}
+
+
+int getTransparentProfileFromRawMaterialId(float materialId)
+{
+    return int(
+        round(
+            clamp(
+                fract(materialId) * 10.0,
+                0.0,
+                4.0
+            )
+        )
+    );
+}
+
+// Same per-profile dense-body scale as rt_test.rgen's
+// getTransparentProfileTransmission, so visibility (shadows, AO and local
+// lights) attenuates exactly as much as the surface path transmits.
+//   1 tinted glass / 2 ice / 3 slime / 4 honey, 0 = clear or stained glass.
+float getTransparentProfileTransmissionAnyHit(int transparentProfile)
+{
+    if(transparentProfile == 1)
+    {
+        return 0.06;
+    }
+    if(transparentProfile == 2)
+    {
+        return 0.55;
+    }
+    if(transparentProfile == 3)
+    {
+        return 0.45;
+    }
+    if(transparentProfile == 4)
+    {
+        return 0.32;
+    }
+    return 1.0;
+}
+
+vec3 computeGlassBlockTransmissionAnyHit(
+    vec3 glassTint,
+    float glassAlpha,
+    int transparentProfile
+)
+{
+    // Orion: transmission_color = base_color RGB, clamped.
+    return clamp(glassTint, vec3(0.0), vec3(1.0));
+}
+
+// =====================================================
+// Glass optical model (straight-through).
+// thinSheetFactors() and glassSheetTransmission() implement the thin-sheet
+// surface_bsdf model; the latter matches
+// surfaceShadowTransmission() for a straight connection.
+// =====================================================
+// Disabled (no call sites): kept as a future interface option.  The
+// scalar-F fast path below is arithmetically identical for the uniform
+// 0.04 glass F0 and skips the unused reflection term.
+#if 0
+vec3 fresnelSchlick(
+    float cosTheta,
+    vec3 F0
+)
+{
+    return
+        F0 +
+        (
+            vec3(1.0) - F0
+        ) *
+        pow(
+            1.0 - cosTheta,
+            5.0
+        );
+}
+
+void glassThinSheetFactors(
+    vec3 fresnel,
+    vec3 transmittance,
+    out vec3 reflection,
+    out vec3 transmission
+)
+{
+    vec3 f = clamp(fresnel, vec3(0.0), vec3(1.0));
+    vec3 a = clamp(transmittance, vec3(0.0), vec3(1.0));
+    vec3 oneMinusF = vec3(1.0) - f;
+    vec3 denominator = max(vec3(1.0) - f * f * a * a, vec3(1.0e-6));
+    reflection = f + oneMinusF * oneMinusF * f * a * a / denominator;
+    transmission = oneMinusF * oneMinusF * a / denominator;
+}
+
+vec3 glassSheetTransmission(
+    vec3 transmissionColor,
+    vec3 faceNormal,
+    vec3 directionToLight
+)
+{
+    float cosine = clamp(
+        abs(dot(normalize(faceNormal), normalize(directionToLight))),
+        0.0,
+        1.0
+    );
+    vec3 reflection;
+    vec3 transmission;
+    glassThinSheetFactors(
+        fresnelSchlick(cosine, vec3(0.04)),
+        transmissionColor,
+        reflection,
+        transmission
+    );
+    return transmission;
+}
+#endif
+
+// Scalar-F fast path.  The glass F0 (0.04) is uniform across RGB, so
+// Schlick Fresnel collapses to one scalar and the Orion thin-sheet
+// series becomes transmission = (1-F)^2 * T / (1 - F^2 * T^2).  The x^5
+// power expands into multiplies: exact, and off the SFU pipe.  Both
+// inputs below are unit length (geometricNormal is normalised at the call
+// site, gl_WorldRayDirectionEXT is unit by spec), so no renormalisation
+// is needed here.
+vec3 glassSheetTransmissionScalarF(
+    vec3 transmissionColor,
+    float cosTheta
+)
+{
+    float x = 1.0 - clamp(cosTheta, 0.0, 1.0);
+    float x2 = x * x;
+    float fresnel = 0.04 + 0.96 * (x2 * x2) * x;
+    float oneMinusF = 1.0 - fresnel;
+    vec3 a = clamp(transmissionColor, vec3(0.0), vec3(1.0));
+    vec3 denominator = max(
+        vec3(1.0) - (fresnel * fresnel) * (a * a),
+        vec3(1.0e-6)
+    );
+    return (oneMinusF * oneMinusF) * a / denominator;
+}
+
+// 2026-10-11 用户要求：**去掉"玻璃在太阳/本地光方块下的焦散"**这一功能。
+// 本项目里用户口径的"焦散" = 玻璃 POM 浮雕调制的彩色光斑（R14；见
+// deliverables/玻璃重构四合一-2026-10-05 交付说明 §2：用户澄清"焦散"是
+// 玻璃 POM 浮雕形成的光斑，不是穿过玻璃体积的折射位移投影）。它在玻璃
+// 可见性 any-hit 里对透射频线做 4 tap 高度场遮蔽 ⇒ 太阳/本地光透玻璃投在
+// 地面的投影带上带出浮雕花纹。整段（含 3 个 helper）屏蔽保留，**外层 #if 0
+// ⇒ -D 也打不开**。
+#if 0
+// =====================================================
+// R14 - exit-face-only POM attenuation for colored shadows
+//
+// A glass visibility ray travels receiver -> emitter.  The first glass face
+// it reaches is therefore the face from which real light exits toward the
+// receiver.  This helper is invoked only for that face.  It does not shift a
+// ray, bend a ray, or trace another ray: it is a fixed four-tap height-field
+// occlusion test multiplied into the existing half-face color filter.
+// =====================================================
+
+bool isExitGlassPOMUVInBounds(vec2 uv, vec2 safeMin, vec2 safeMax)
+{
+    return all(greaterThanEqual(uv, safeMin)) &&
+           all(lessThanEqual(uv, safeMax));
+}
+
+float sampleExitGlassPOMDepth(vec2 uv)
+{
+    ivec2 atlasSize = textureSize(normalAtlas, 0);
+    ivec2 texel = ivec2(floor(uv * vec2(atlasSize)));
+    texel = clamp(texel, ivec2(0), atlasSize - ivec2(1));
+    return 1.0 - clamp(texelFetch(normalAtlas, texel, 0).a, 0.0, 1.0);
+}
+
+float traceExitGlassPOMShadow(
+    vec2 hitUV,
+    vec2 uv0,
+    vec2 uv1,
+    vec2 uv2,
+    vec3 pos0,
+    vec3 pos1,
+    vec3 pos2,
+    vec3 worldLightDirection
+)
+{
+    float pomDepthScale = clamp(cam.historyParams.z, 0.0, 0.20);
+    if(pomDepthScale <= 1.0e-5)
+    {
+        return 1.0;
+    }
+
+    // =====================================================
+    // 2026-10-04 性能（A/B 走编译期宏，不占 UBO lane）：出射面 POM 自阴影的距离闸门。
+    //
+    // 这是玻璃可见性 any-hit 里最重的一段：4 次精确取样（texelFetch normalAtlas）
+    // + TBN + 高度场判据，而它服务的"彩色阴影接触暗化"在几百格外肉眼不可见
+    // （阴影本来就被太阳阴影图/雾/云的软边糊掉了）。玻璃越密（染色玻璃建筑、
+    // 冰原）这笔开销越叠：**每个被接受的出射面**都要跑一次。
+    //
+    //   0（出厂）= 旧档：不做距离裁剪 ⇒ 逐位不变。
+    //   >0       = 只对 gl_HitTEXT 小于该值的玻璃面做 POM（单位：格）。
+    // A/B 配方（改完必须同时覆盖 cpp/shaders 与 run/shaders）：
+    //   glslangValidator -V --target-env vulkan1.3 -S rahit -e main
+    //     -DGLASS_EXIT_POM_MAX_DISTANCE=128 -o rt_test_translucent.rahit.spv rt_test_translucent.rahit
+    // 注意：宏取**整数**（GLSL 预处理器的 #if 不吃浮点常量），比较时再转 float。
+    // =====================================================
+#ifndef GLASS_EXIT_POM_MAX_DISTANCE
+#define GLASS_EXIT_POM_MAX_DISTANCE 0
+#endif
+#if GLASS_EXIT_POM_MAX_DISTANCE > 0
+    if(gl_HitTEXT > float(GLASS_EXIT_POM_MAX_DISTANCE))
+    {
+        return 1.0;
+    }
+#endif
+
+    float hitDepth01 = sampleExitGlassPOMDepth(hitUV);
+    if(hitDepth01 <= 0.01)
+    {
+        return 1.0;
+    }
+
+    vec3 geoNormal = normalize(cross(pos1 - pos0, pos2 - pos0));
+    // The source mesh winding is not a reliable medium-side label.  Orient
+    // this local basis toward the actual outgoing light instead.
+    if(dot(geoNormal, worldLightDirection) < 0.0)
+    {
+        geoNormal = -geoNormal;
+    }
+
+    vec2 duv1 = uv1 - uv0;
+    vec2 duv2 = uv2 - uv0;
+    vec3 dp1 = pos1 - pos0;
+    vec3 dp2 = pos2 - pos0;
+    float determinant = duv1.x * duv2.y - duv1.y * duv2.x;
+    if(abs(determinant) <= 1.0e-6)
+    {
+        return 1.0;
+    }
+
+    vec3 tangent = (dp1 * duv2.y - dp2 * duv1.y) / determinant;
+    tangent -= geoNormal * dot(tangent, geoNormal);
+    if(dot(tangent, tangent) <= 1.0e-12)
+    {
+        return 1.0;
+    }
+    tangent = normalize(tangent);
+    float handedness = determinant < 0.0 ? -1.0 : 1.0;
+    vec3 bitangent = normalize(cross(geoNormal, tangent)) * handedness;
+    mat3 tbn = mat3(tangent, bitangent, geoNormal);
+
+    vec3 lightDirTS = normalize(transpose(tbn) * normalize(worldLightDirection));
+    if(lightDirTS.z <= 1.0e-3)
+    {
+        return 1.0;
+    }
+
+    vec2 spriteMin = min(uv0, min(uv1, uv2));
+    vec2 spriteMax = max(uv0, max(uv1, uv2));
+    vec2 atlasTexel = 1.0 / max(vec2(textureSize(blockAtlas, 0)), vec2(1.0));
+    vec2 spriteSpan = max(spriteMax - spriteMin, atlasTexel);
+    vec2 safeMin = spriteMin + atlasTexel * 0.5;
+    vec2 safeMax = spriteMax - atlasTexel * 0.5;
+    vec2 spriteCenter = (spriteMin + spriteMax) * 0.5;
+    safeMin = min(safeMin, spriteCenter);
+    safeMax = max(safeMax, spriteCenter);
+
+    float lightZ = max(lightDirTS.z, 0.05);
+    // 2026-10-05 #11 一致性：相机 POM march 的半影带已加宽到 0.03，玻璃出射
+    // 面的光斑 march 同步 —— 明显 POM 的玻璃（浮雕资源包）光斑边缘才有过渡，
+    // 否则彩色光斑边缘生硬。回退改回 0.009。
+    const float fullOcclusionDepth = 0.03;
+    float maxBlockDepthWorld = 0.0;
+
+    // Four exact-fetch samples are enough here: this path runs for every
+    // colored-shadow ray, while the full camera POM path remains unchanged.
+    for(int i = 1; i <= 4; ++i)
+    {
+        float progress = float(i) * 0.2;
+        float depthRise = hitDepth01 * progress;
+        vec2 sampleUV = hitUV +
+            (lightDirTS.xy / lightZ) * spriteSpan * pomDepthScale * depthRise;
+        if(!isExitGlassPOMUVInBounds(sampleUV, safeMin, safeMax))
+        {
+            break;
+        }
+
+        float blockerDepth = sampleExitGlassPOMDepth(sampleUV);
+        float blockDepthWorld = max(hitDepth01 - depthRise - blockerDepth - 0.012, 0.0) * pomDepthScale;
+        maxBlockDepthWorld = max(maxBlockDepthWorld, blockDepthWorld);
+        if(maxBlockDepthWorld >= fullOcclusionDepth)
+        {
+            return 0.0;
+        }
+    }
+
+    return 1.0 - smoothstep(0.0, fullOcclusionDepth, maxBlockDepthWorld);
+}
+#endif  // 2026-10-11 玻璃焦散（R14 出射面 POM 彩色光斑）退役
+
+void main() {
+
+    // 2026-10-09：表项 16B，地址取 .xy。
+    // 2026-10-21 地形 32B：.w = 该段顶点步长（32/48），取顶点按它分派。
+    const uvec4 sectionAddressEntry =
+        sectionVertexAddressBuffer.vertexAddresses[
+            gl_InstanceCustomIndexEXT
+        ];
+
+    uint64_t rawAddr =
+        packUint2x32(sectionAddressEntry.xy);
+    if (rawAddr == 0ul) return;
+
+    // 2026-10-22 索引化地形：.w 最低位 = "4 顶点/quad 索引布局"（图案 0,1,2 / 0,2,3，
+    // 见 VulkanCore.cpp:sectionQuadIndexAddress）。真实步长 = .w & ~1u —— 必须掩掉
+    // 低位，否则 33 会被 loadSectionVertex 当成"非 32B"而按 48B 读。
+    // 三角形 t（= gl_PrimitiveID）的三个角：
+    //   t 偶 ⇒ 4q+0, 4q+1, 4q+2；t 奇 ⇒ 4q+0, 4q+2, 4q+3（q = t>>1）。
+    // 与非索引展开 (v0,v1,v2) / (v0,v2,v3) 逐角对应 ⇒ 重心坐标语义不变。
+    const bool indexedQuads =
+        (sectionAddressEntry.w & 1u) != 0u;
+
+    const uint sectionStride =
+        sectionAddressEntry.w & ~1u;
+
+    const uint primitiveId =
+        uint(gl_PrimitiveID);
+
+    uint i0;
+    uint i1;
+    uint i2;
+
+    if(indexedQuads)
+    {
+        const uint quadBase =
+            (primitiveId >> 1u) * 4u;
+
+        if((primitiveId & 1u) == 0u)
+        {
+            i0 = quadBase;
+            i1 = quadBase + 1u;
+            i2 = quadBase + 2u;
+        }
+        else
+        {
+            i0 = quadBase;
+            i1 = quadBase + 2u;
+            i2 = quadBase + 3u;
+        }
+    }
+    else
+    {
+        i0 = primitiveId * 3u;
+        i1 = i0 + 1u;
+        i2 = i0 + 2u;
+    }
+
+    Vertex v0 = loadSectionVertex(rawAddr, sectionStride, i0);
+    Vertex v1 = loadSectionVertex(rawAddr, sectionStride, i1);
+    Vertex v2 = loadSectionVertex(rawAddr, sectionStride, i2);
+
+    vec3 barycentrics = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
+
+    // === 远场去重（Vista 模型）===
+    // 与 rt_test.rahit 同源：角色取自 binding 19 角色表，命中点世界柱查 binding 20
+    // 覆盖位图，近场已就绪的柱上丢弃远场命中。
+    const uint instanceRole = lodInstanceRole();
+    const vec3 hitWorldPosition =
+        vec3(v0.x, v0.y, v0.z) * barycentrics.x +
+        vec3(v1.x, v1.y, v1.z) * barycentrics.y +
+        vec3(v2.x, v2.y, v2.z) * barycentrics.z;
+
+    if(lodHitIsRedundant(instanceRole, hitWorldPosition))
+    {
+        ignoreIntersectionEXT;
+        return;
+    }
+
+    float interpU = v0.u * barycentrics.x + v1.u * barycentrics.y + v2.u * barycentrics.z;
+    float interpV = v0.v * barycentrics.x + v1.v * barycentrics.y + v2.v * barycentrics.z;
+    vec2 texCoord = vec2(interpU, interpV);
+
+    float materialId =
+        v0.materialId * barycentrics.x +
+        v1.materialId * barycentrics.y +
+        v2.materialId * barycentrics.z;
+
+    // =====================================================
+    // T1-2 Straight transparent continuation
+    //
+    // Only the dedicated continuation ray ignores generic
+    // translucent terrain (vertex materialId=2). Normal primary,
+    // AO, sun and Local-Light visibility behavior is unchanged.
+    // =====================================================
+    bool transparentPassthrough =
+        getRayPurpose(payload.state) == RT_PURPOSE_PASSTHROUGH;
+
+
+if(
+    transparentPassthrough &&
+    materialId >= 2.0 &&
+    materialId < 2.5
+)
+{
+    ignoreIntersectionEXT;
+    return;
+}
+
+    // 提取顶点颜色 / Alpha 与图集颜色 / Alpha。
+    // The alpha test defines the visible cutout silhouette.  It must
+    // use the same unfiltered base-atlas texel as closest-hit, otherwise
+    // linear filtering turns foliage and grass into semi-transparent blur.
+    float voxyAnyHitMarker =
+        v0.pad1 * barycentrics.x +
+        v1.pad1 * barycentrics.y +
+        v2.pad1 * barycentrics.z;
+    bool isVoxyAnyHit = voxyAnyHitMarker < -0.5;
+
+    // =====================================================
+    // DH 远场几何：**不做 alpha cutout**，直接接受命中
+    // =====================================================
+    // DH 顶点记录的 a 通道**不是 alpha**，而是打包光照 (skyLight<<4)|blockLight
+    // （见 VulkanCore.appendDhLodQuads 的字节契约与 DhLodMesher.packLight）⇒ 无光格
+    // a=0 ⇒ 下面 combinedAlpha=0 ⇒ 整片阴影区地形被 ignoreIntersectionEXT 剔掉。
+    // 2026-09-25 实机症状就是它：远场成片空洞 + 能看穿地形。
+    //
+    // 远场本来也没有 cutout 语义：LOD 树叶是实心壳（closest-hit 侧按实心 BSDF 着色），
+    // 拿贴图 alpha 打洞只会在几百格外留下针孔。DH 的三个桶都走 SBT_RECORD_ALPHA
+    // （见 VulkanCore 的 LOD_AS_CLASS_* 注释），所以这条必须在这里。
+    //
+    // ★ 判据由 pad1 < -2.5 改为角色表：pad1 现在只表示 DH 材质编号（值域 [-18,-3]，
+    //   由 closest-hit 还原成 0..15），不再兼任"是不是远场"的选址暗号。
+    if(instanceRole == LOD_ROLE_DH_FAR)
+    {
+        return;
+    }
+
+    // pad2 >= 0 marks a quad with a texture-table tile (bridge mip +
+    // shade/256); pad2 < 0 is a fallback quad whose colour is already
+    // resolved and which therefore keeps full coverage here.
+    float voxyMipShade =
+        v0.pad2 * barycentrics.x +
+        v1.pad2 * barycentrics.y +
+        v2.pad2 * barycentrics.z;
+
+    // =====================================================
+    // 2026-10-04 性能：玻璃在"不需要透射语义"的射线上直接接受命中（行为等价）
+    //
+    // 玻璃（materialId ∈ [2.0,2.5)）的覆盖率由几何决定，cutout 判据对它本就豁免
+    // （见下面 GI_GLASS_FULL_COVERAGE）。它真正需要本 any-hit 的只有两处：
+    //   · PASSTHROUGH(4)：穿透过续射线要**忽略**普通半透明地形（上面那段已处理）；
+    //   · GLASS_VISIBILITY(5)：可见性射线要累积彩色透射（下面那段）。
+    // 其它用途（主射线 / 反射 / GI / 折射…）下，本 any-hit 接下来要做的图集取样、
+    // 顶点色插值、cutout 判据、voxy 覆盖判定**全部无人消费** —— 它们最后都落到
+    // 函数末尾"不 ignore、接受命中"。所以这里直接 return：结果与原来逐位相同，
+    // 省掉一次图集取样（含 L1/L2 访问）与随后所有判据。
+    //
+    // 顺序安全：远场去重（lodHitIsRedundant）与 DH 远场分支都在上面，不受影响。
+    // =====================================================
+    const bool isGlassMaterial =
+        materialId >= 2.0 && materialId < 2.5;
+    const uint glassRayPurpose =
+        getRayPurpose(payload.state);
+    if(isGlassMaterial &&
+       glassRayPurpose != RT_PURPOSE_PASSTHROUGH &&
+       glassRayPurpose != RT_PURPOSE_GLASS_VISIBILITY)
+    {
+        return;
+    }
+
+    vec4 atlasSample;
+    if(isVoxyAnyHit)
+    {
+        if(voxyMipShade >= 0.0)
+        {
+            vec3 voxyPos0 = vec3(v0.x, v0.y, v0.z);
+            vec3 voxyPos1 = vec3(v1.x, v1.y, v1.z);
+            vec3 voxyPos2 = vec3(v2.x, v2.y, v2.z);
+            vec3 voxyNormal = normalize(
+                cross(voxyPos1 - voxyPos0, voxyPos2 - voxyPos0));
+            float voxyMip = voxyLodMip(voxyPos0, voxyPos1, voxyNormal);
+            vec2 voxyUV = voxyTileSafeUV(
+                texCoord,
+                vec2(v0.u, v0.v),
+                vec2(v1.u, v1.v),
+                vec2(v2.u, v2.v),
+                voxyMip);
+            // No sRGB decode: the glass-visibility filter below multiplies
+            // this by the vertex colour, and both live in the same gamma
+            // space as every other material in the pipeline (near terrain is
+            // texelFetch(blockAtlas) * interpColor, and rr_sdr_post applies
+            // the only pow(1/2.2)).  Decoding here alone would make distant
+            // foliage transmit light differently from nearby foliage.
+            atlasSample = textureLod(voxyLodAtlas, voxyUV, voxyMip);
+        }
+        else
+        {
+            // Fallback quads carry their resolved colour and alpha in the
+            // vertex colour; their (u, v) are atlas-mip coordinates, not
+            // Minecraft atlas UVs.
+            atlasSample = vec4(1.0);
+        }
+    }
+    else
+    {
+        ivec2 atlasSize =
+            textureSize(
+                blockAtlas,
+                0
+            );
+
+        ivec2 atlasTexel =
+            ivec2(
+                clamp(
+                    floor(
+                        texCoord *
+                        vec2(atlasSize)
+                    ),
+                    vec2(0.0),
+                    vec2(atlasSize) -
+                    vec2(1.0)
+                )
+            );
+
+        atlasSample =
+            texelFetch(
+                blockAtlas,
+                atlasTexel,
+                0
+            );
+    }
+
+
+    vec4 vertexColor =
+        vec4(
+            v0.r,
+            v0.g,
+            v0.b,
+            v0.a
+        ) *
+        barycentrics.x +
+        vec4(
+            v1.r,
+            v1.g,
+            v1.b,
+            v1.a
+        ) *
+        barycentrics.y +
+        vec4(
+            v2.r,
+            v2.g,
+            v2.b,
+            v2.a
+        ) *
+        barycentrics.z;
+
+
+    float combinedAlpha =
+        atlasSample.a *
+        vertexColor.a;
+
+
+    // =====================================================
+    // LOD 水跳过 alpha cutout（2026-09-25 实机取证）
+    // =====================================================
+    // 症状：离远了 LOD 水面整片消失，近处（近场水走另一条路）正常。
+    //
+    // 机制：下面的 combinedAlpha = 图集 alpha × 顶点 alpha。顶点 alpha 由桥写死
+    // 是 0xFF（桥类 `0xFF000000 | rgb`）⇒ 实际只有一个乘数，即
+    // **图集那一格的 alpha**。而图集采样用的是 voxyLodMip() —— **随距离变粗的
+    // mip**。桥的 mip 生成对 alpha 做平均（mipColours:795），而 solidify 只复制
+    // RGB、**保留原 alpha**（solidify:848 `& 0xFF000000 | ... & 0xFFFFFF`），
+    // 于是含全透明像素的贴图其 mip 链 alpha 会随 mip 变粗而衰减；到某个距离
+    // atlasSample.a 掉到 0.1 以下 ⇒ 整个 quad 被 ignoreIntersectionEXT 剔掉。
+    //
+    // 为什么应该豁免：LOD 水是**实心代理面**，没有 cutout/树冠语义；这里走 ALPHA 桶
+    // 只是为了避开真正的地形
+    // WATER hit group（见 VulkanCore.cpp:29899 附近），不该因此被 foliage 的
+    // alpha 打洞规则误伤。
+    //
+    // 只绕过 cutout，不改可见性光线（GLASS_VISIBILITY）等后续分支的行为。
+    bool lodWaterNoCutout =
+        isVoxyAnyHit &&
+        materialId > 2.5 &&
+        materialId < 3.5;
+
+    // ⭐ 2026-09-25 实测取证：远场树只剩树干、树冠整片消失，而且把树叶的材质标记
+    // 从"玻璃"2.0 改成独立树叶标记 4.0 之后**画面毫无变化**。如果树叶走到了
+    // closest-hit，玻璃片(0.72 透射)变成实心不透明面会是肉眼可见的巨大差别 ⇒
+    // 结论只能是：它根本没走到 closest-hit，是在这条 cutout 上被丢掉的。
+    // 同一桶的水能画出来（下面那条豁免）、树干能画出来，所以几何确实在 TLAS 里，
+    // 能整片丢掉它的只剩这一条。
+    //
+    // 为什么应当豁免：远场 LOD 是实心代理壳，本来就没有 cutout 语义（同文件
+    // 502-505 的 DH 分支已经论证过同一件事），拿距离相关的粗 mip 图集 alpha 打洞
+    // 只会让几百格外的树冠整片消失。近场树叶的洞由近场 ALPHA 类（mip0 texelFetch）
+    // 负责，两者不是同一套几何。
+    bool lodLeavesNoCutout =
+        isVoxyAnyHit &&
+        materialId > 3.5 &&
+        materialId < 4.5;
+
+    // =====================================================
+    // 2026-10-01：玻璃"全覆盖"语义（GI_GLASS_FULL_COVERAGE）
+    //
+    // 玻璃在追踪器里是**几何边界**：覆盖率由几何决定，透明度由材质（染料/透射
+    // 权重）表达，不由纹理 alpha 决定。原话
+    // （docs/GLASS_COVERAGE_20260914.md）：
+    //   "Glass blocks and panes use opaque coverage ... Base texture alpha neither
+    //    removes surface samples nor scales transmission."
+    //
+    // 之前这条 cutout 会按 combinedAlpha < 0.1 把玻璃命中整片剔掉：栅格层是
+    // cutout，追踪器就跟着挖洞，于是玻璃上出现针孔/缺角。现在玻璃材质
+    // （本文件里玻璃片用的就是 [2.0, 2.5) 这一档，见下面 GLASS_VISIBILITY 分支）
+    // 直接豁免 cutout；alpha 仍参与染料与透射权重，只是不再参与覆盖率。
+    //
+    // 只绕过 cutout，不改后面的可见性分支行为。性能：零额外代价（少做一次判据）。
+    // A/B：-DGI_GLASS_FULL_COVERAGE=0
+    // =====================================================
+#ifndef GI_GLASS_FULL_COVERAGE
+#define GI_GLASS_FULL_COVERAGE 1
+#endif
+
+    bool glassFullCoverage =
+        GI_GLASS_FULL_COVERAGE != 0 &&
+        materialId >= 2.0 &&
+        materialId < 2.5;
+
+    // Cutout remains unchanged for everything else; glass keeps full coverage.
+    if(!lodWaterNoCutout && !lodLeavesNoCutout && !glassFullCoverage &&
+        combinedAlpha < 0.1)
+    {
+        ignoreIntersectionEXT;
+        return;
+    }
+
+
+    // =====================================================
+    // T1/T9/T3 COMBINED - colored visibility through glass
+    //
+    // -3 visibility rays are used by Sun / Local Light / AO.
+    // Glass must NOT terminate them.
+    //
+    // We accumulate RGB transmittance in payload.albedo.
+    // Opaque geometry is still accepted and terminates normally.
+    // =====================================================
+
+    bool glassVisibilityOnly =
+        getRayPurpose(payload.state) == RT_PURPOSE_GLASS_VISIBILITY;
+
+
+if(
+    glassVisibilityOnly &&
+    materialId >= 2.0 &&
+    materialId < 2.5
+)
+    {
+        // Voxy cutout foliage is opaque to the closest-hit stage, so it must
+        // also terminate this visibility ray instead of filtering it like a
+        // glass sheet.  Voxy lava shares the bucket (official material 6,
+        // transparent) and is an emissive solid with no atlas tile, so the
+        // emissive marker has to veto the filtering on its own.  Returning
+        // without ignoreIntersectionEXT keeps the hit.
+        if(isVoxyAnyHit &&
+            (voxyAnyHitMarker < -1.5 ||
+                (voxyMipShade >= 0.0 &&
+                    !voxyTileIsFullyCovered(
+                        vec2(v0.u, v0.v),
+                        vec2(v1.u, v1.v),
+                        vec2(v2.u, v2.v)))))
+        {
+            return;
+        }
+
+        // Keep the same roof-coverage bit as the opaque Any-Hit path.
+        // Clear glass remains a rain blocker even when it transmits white.
+        payload.glassAlpha = 1.0;
+
+        // The visibility ray is receiver -> emitter.  For each traversed
+        // glass block its first accepted face is the real light-exit face;
+        // only that face receives the Orion boundary sheet and the
+        // height-field attenuation.  The paired entry face contributes
+        // nothing, so one block adds exactly one filter.
+        uint glassFaceOrdinal =
+            uint(
+                max(
+                    floor(payload.parallaxRayTravel + 0.5),
+                    0.0
+                )
+            );
+
+        bool isLightExitFace =
+            (glassFaceOrdinal & 1u) == 0u;
+
+        payload.parallaxRayTravel =
+            float(glassFaceOrdinal + 1u);
+
+
+        vec3 surfaceTransmission =
+            vec3(1.0);
+
+
+        if(isLightExitFace)
+        {
+            vec3 pos0 = vec3(v0.x, v0.y, v0.z);
+            vec3 pos1 = vec3(v1.x, v1.y, v1.z);
+            vec3 pos2 = vec3(v2.x, v2.y, v2.z);
+
+            vec3 geometricNormal =
+                normalize(
+                    cross(pos1 - pos0, pos2 - pos0)
+                );
+
+            vec3 glassTint =
+                glassPaneTransmissionColor(
+                    atlasSample.rgb,
+                    vertexColor.rgb
+                );
+
+#ifndef GI_SUN_POOL_SATURATION
+// 2026-10-05 G8 太阳彩色透射光斑：太阳路径的玻璃染色对齐本地光路径的
+// 峰值保饱和处理（vptSaturateGlassTransmission，×3 峰值保持）。此前太阳
+// 路径用原始染色 ⇒ 彩玻光斑比本地光路径的褪灰、不鲜艳。峰值保持 =
+// 主通道能量不变、只去灰 ⇒ 不加能量不压暗；白色/灰色玻璃恒等 ⇒ 逐位旧档。
+// （原注释"deliberately local-light only"的Scope差异就此对齐。）
+#define GI_SUN_POOL_SATURATION 1
+#endif
+#if GI_SUN_POOL_SATURATION
+            glassTint =
+                vptSaturateGlassTransmission(
+                    clamp(glassTint, vec3(0.0), vec3(1.0))
+                );
+#endif
+            float glassCosTheta =
+                clamp(
+                    abs(dot(geometricNormal, gl_WorldRayDirectionEXT)),
+                    0.0,
+                    1.0
+                );
+
+            surfaceTransmission =
+                glassSheetTransmissionScalarF(
+                    glassTint,
+                    glassCosTheta
+                ) *
+                getTransparentProfileTransmissionAnyHit(
+                    getTransparentProfileFromRawMaterialId(materialId)
+                );
+
+            // 2026-10-11 用户要求：去掉"玻璃在太阳/本地光方块下的焦散"（= R14
+            // 出射面 POM 彩色光斑，见上方函数处的说明）。屏蔽保留，-D 打不开。
+#if 0
+            float exitFacePOMShadow =
+                traceExitGlassPOMShadow(
+                    texCoord,
+                    vec2(v0.u, v0.v),
+                    vec2(v1.u, v1.v),
+                    vec2(v2.u, v2.v),
+                    pos0,
+                    pos1,
+                    pos2,
+                    -gl_WorldRayDirectionEXT
+                );
+
+            surfaceTransmission *=
+                clamp(
+                    vec3(exitFacePOMShadow),
+                    vec3(0.0),
+                    vec3(1.0)
+                );
+#endif
+        }
+
+
+        payload.albedo *=
+            surfaceTransmission;
+
+
+        // =====================================================
+        // 2026-10-17：玻璃穿层预算（可见性射线）
+        //
+        // 这条 any-hit 的语义是"玻璃不终止可见性射线，只累乘透射色"，此前
+        // **没有任何上限**：一条太阳 / AO / 本地光可见性射线穿过 N 层玻璃，就要
+        // 付 N 次 TLAS 遍历 + N 次 any-hit（每次还要取图集纹素、插值顶点色、
+        // 算薄片透射）。半透明体一多，这个 N 乘上"每像素 4~8 条可见性射线"，
+        // 就是最主要的乘法级开销 —— 也正是"玻璃一多就掉帧"的形状。
+        //
+        // 同一族射线里的太阳 march（rt_test.rgen 的
+        // traceSunTransmittanceThroughWater，W2）早就有"累计透射 < 1% 就停"的
+        // 早退口径，这条可见性路径漏了同一件事。这里补齐，并且复用**同一个
+        // 阈值**，不引入新口径：
+        //   · 剩余透射 < 1% ⇒ 后面的层已不可能贡献可见光 ⇒ 把本次命中当遮挡
+        //     收尾（return 而不 ignore）⇒ 射线在这里终止；
+        //   · 再给一个面数上限（与 GI 走查的 MAX_GLASS_INTERFACE_STEPS 同哲学），
+        //     防止清玻璃（每层 ≈0.92）堆到几十层时 1% 阈值迟迟不触发。
+        // 观感：只有"穿过 8 层以上玻璃"才会被截断；原版世界正常堆叠 ≤4 面
+        // （见 rt_test.rgen 的 MAX_GLASS_INTERFACE_STEPS 注释）。
+        // A/B：-DGI_GLASS_VISIBILITY_BUDGET=0 ⇒ 逐位回到旧档。
+        // =====================================================
+#ifndef GI_GLASS_VISIBILITY_BUDGET
+#define GI_GLASS_VISIBILITY_BUDGET 1
+#endif
+#ifndef GI_GLASS_VISIBILITY_MIN_TRANSMITTANCE
+// 与 traceSunTransmittanceThroughWater 的 W2 同值。
+#define GI_GLASS_VISIBILITY_MIN_TRANSMITTANCE 0.01
+#endif
+#ifndef GI_GLASS_VISIBILITY_MAX_FACES
+// 面数（进/出各算一面）上限：16 面 = 8 层玻璃。
+#define GI_GLASS_VISIBILITY_MAX_FACES 16
+#endif
+#if GI_GLASS_VISIBILITY_BUDGET
+        if(
+            max(
+                payload.albedo.r,
+                max(payload.albedo.g, payload.albedo.b)
+            ) < GI_GLASS_VISIBILITY_MIN_TRANSMITTANCE ||
+            glassFaceOrdinal + 1u >= uint(GI_GLASS_VISIBILITY_MAX_FACES)
+        )
+        {
+            return;
+        }
+#endif
+
+
+        ignoreIntersectionEXT;
+        return;
+    }
+}

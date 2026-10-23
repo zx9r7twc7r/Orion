@@ -1,0 +1,140 @@
+#version 460
+// =====================================================
+// 本地光 DI 项：链首准备（YCoCg 解码 → 线性项 + 亮度方差图）
+//
+// 方差部分移植自 
+//   src/shader/world/svgf/direct_moments.comp
+//     · 3x3 亮度矩 m1 = mean(L), m2 = mean(L^2)
+//     · varRaw = max(m2 - m1*m1, 0)
+//     · 邻域方差 3x3 平均，与 varRaw 各占 0.5
+//（原注释：Variance Smoothing (The key to stop boiling)）
+//     · 存储下限 max(variance, 0.0001)
+//
+// 为什么需要方差图： direct_atrous_step*.comp 里 phiL 由方差驱动
+//     phiL = max(phiColor * sqrt(variance), 1.0)
+// 即空间滤波的亮度边缘停止强度由方差图决定，且方差图在 5 级之间传递。
+// 我们此前是在 à-trous 内部 3x3 现算（方差没经时域累积、不跨 pass），
+// phiL 逐帧抖动、半径跟着抖。
+//
+// 为什么在这里解码：本项目喂给 NRD 的输入图是 REBLUR 的 YCoCg 打包
+//（.xyz = YCoCg，.w = 归一化命中距离，见 rt_restir_final.rgen），而 
+// 整条链都工作在线性 radiance 上（luminance() 直接取 Rec.709 权重）。若直接
+// 在打包域上算亮度，phiL 与边缘停止都会错。故链首做一次逆变换，链尾（最后
+// 一级 à-trous）再编回 YCoCg —— 逆正变换均照抄 rt_nrd_composite.comp，保证
+// 与合成端同一套约定。
+//
+// 未搬部分（下一步）：对 (m1,m2) 做时域累积 alpha = clamp(1/h, 0.02, 0.2)，
+// 且邻域方差取自上一帧的矩。现在用当帧矩，方差的时间稳定性弱于原版。
+// =====================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// binding 0：NRD 输入图（YCoCg 打包 + 命中距离；raygen 每帧写）
+layout(binding = 0, rgba16f) uniform readonly image2D diPackedTermImage;
+// binding 1：解码后的线性项，交给 à-trous 的第一级
+layout(binding = 1, rgba16f) uniform writeonly image2D diLinearTermImage;
+// binding 2：亮度方差，交给 à-trous 的第一级
+layout(binding = 2, r16f) uniform writeonly image2D diVarianceImage;
+
+layout(push_constant) uniform DiPreparePushConstants
+{
+    uint width;
+    uint height;
+} preparePush;
+
+// 照抄 rt_nrd_composite.comp 的 _NRD_YCoCgToLinear（同一套约定）
+vec3 nrdYCoCgToLinear(vec3 color)
+{
+    float t = color.x - color.z;
+
+    vec3 r;
+    r.y = color.x + color.z;
+    r.x = t + color.y;
+    r.z = t - color.y;
+
+    return max(r, vec3(0.0));
+}
+
+float luminance(vec3 c)
+{
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 linearAt(ivec2 q)
+{
+    return nrdYCoCgToLinear(imageLoad(diPackedTermImage, q).rgb);
+}
+
+// direct_moments.comp 的 3x3 矩
+vec2 momentsAt(ivec2 pixel, ivec2 size)
+{
+    float sumL = 0.0;
+    float sumL2 = 0.0;
+    float count = 0.0;
+
+    for(int dy = -1; dy <= 1; ++dy)
+    {
+        for(int dx = -1; dx <= 1; ++dx)
+        {
+            ivec2 q = pixel + ivec2(dx, dy);
+            if(q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y)
+            {
+                continue;
+            }
+
+            float L = luminance(linearAt(q));
+            sumL += L;
+            sumL2 += L * L;
+            count += 1.0;
+        }
+    }
+
+    return vec2(
+        sumL / max(count, 1.0),
+        sumL2 / max(count, 1.0)
+    );
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(diPackedTermImage);
+
+    if(pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    vec3 linearTerm = linearAt(pixel);
+
+    vec2 moments = momentsAt(pixel, size);
+    float varRaw = max(moments.y - moments.x * moments.x, 0.0);
+
+    float sumVar = 0.0;
+    float sumW = 0.0;
+
+    for(int dy = -1; dy <= 1; ++dy)
+    {
+        for(int dx = -1; dx <= 1; ++dx)
+        {
+            ivec2 q = pixel + ivec2(dx, dy);
+            if(q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y)
+            {
+                continue;
+            }
+
+            vec2 mq = momentsAt(q, size);
+            sumVar += max(mq.y - mq.x * mq.x, 0.0);
+            sumW += 1.0;
+        }
+    }
+
+    float variance = mix(varRaw, sumVar / max(sumW, 1.0), 0.5);
+
+    imageStore(diLinearTermImage, pixel, vec4(linearTerm, 1.0));
+    imageStore(
+        diVarianceImage,
+        pixel,
+        vec4(max(variance, 0.0001), 0.0, 0.0, 0.0)
+    );
+}

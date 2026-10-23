@@ -1,0 +1,405 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// ===========================================================================
+// 体积云 v4 —— evroon/bevy-volumetric-clouds（MIT）移植的引擎接口层
+//
+// 模型本体在 cloud_bevy_core.glsl（与 tools/cloudpreview 共用）。
+// 本文件只做：CameraUBO / 描述符、镜头射线、场景深度裁剪、光照颜色链、
+// 以及雾 / 平面云 / 空气透视尾段（与 v2/v3 完全一致，保证合成 pass 不用改）。
+// ===========================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+// 名字必须叫 cloudShapeNoise / cloudCurlNoise：tyndall_cloud_field.glsl 与
+// volumetric_fog.glsl 会引用它们（v4 自己不用，但布局里保留这两个 binding）。
+layout(set = 0, binding = 1) uniform sampler3D cloudShapeNoise;
+layout(set = 0, binding = 2) uniform sampler3D cloudCurlNoise;
+layout(rgba16f, set = 0, binding = 3) uniform writeonly image2D cloudOutput;
+layout(rg32f, set = 0, binding = 4) uniform writeonly image2D cloudDepthOutput;
+layout(set = 0, binding = 5) uniform sampler2D sceneDepth;
+layout(set = 0, binding = 6) uniform sampler2D sunShadowMap;
+layout(set = 0, binding = 7) uniform sampler2D terrainHeightMap;
+layout(set = 0, binding = 8) uniform sampler2D sunShadowMapFar;
+layout(set = 0, binding = 9) uniform sampler3D baseTex;         // 3D base 体积（替代 2D 图集）
+layout(set = 0, binding = 10) uniform sampler3D cloudWorley;     // 32³ worley
+layout(set = 0, binding = 11) uniform sampler2D cloudAtlas;       // 2D 图集（覆盖度，混合底图方案）
+
+// 2026-10-22：接入预览器的 UE 风格实现。
+// 两个 core 都 include —— bevy 那份仍被 tyndall_cloud_field / volumetric_fog 间接依赖
+// （它们用 bevyRemap / bevyHG 等工具函数），删掉会编译失败。UE 模型只调用 ueRaymarch。
+// 代价只是编译期多一份代码，未被调用的函数会被裁掉，运行期无成本。
+#include "cloud_bevy_core.glsl"
+#include "cloud_ue_core.glsl"
+
+const float V4_EMPTY = 1000000.0;
+const float V4_PI = 3.14159265;
+
+// volumetric_fog.glsl 需要这个符号（v1/v2/v3 都在 include 之前定义）
+float hgPhase(float cosine, float g)
+{
+    float g2 = g * g;
+    float d = max(1.0e-4, 1.0 + g2 - 2.0 * g * cosine);
+    return (1.0 - g2) / (4.0 * V4_PI * d * sqrt(d));
+}
+
+#include "sky_model_common.glsl"
+#include "sky_sun_common.glsl"
+#include "clear_sky_aerial.glsl"
+#include "tyndall_cloud_field.glsl"
+#include "high_cloud_field.glsl"
+
+#define TERRAIN_HEIGHT_CONSUMER 1
+#include "terrain_height.glsl"
+
+#define SUN_SHADOW_FAR_MAP 1
+#define SUN_SHADOW_CONSUMER 1
+#define SUN_SHADOW_PCF_TAPS_4 1
+// 2026-10-21：体积雾的近图 ∪ 远图合并可见性（治"背光面照常出光柱"），
+// 原因见 sun_shadow.glsl 的 sunShadowFogVisibility。
+#define SUN_SHADOW_FOG_UNION 1
+#include "sun_shadow.glsl"
+
+#include "volumetric_fog.glsl"
+
+float v4HG(float cosine, float g)
+{
+    float g2 = g * g;
+    float d = max(1.0e-4, 1.0 + g2 - 2.0 * g * cosine);
+    return (1.0 - g2) / (4.0 * V4_PI * d * sqrt(d));
+}
+
+void storeEmpty(ivec2 pixel)
+{
+    imageStore(cloudOutput, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+    imageStore(cloudDepthOutput, pixel, vec4(V4_EMPTY, V4_EMPTY, 0.0, 0.0));
+}
+
+float sceneDistanceForDepth(vec2 ndc, float depthValue)
+{
+    if(depthValue <= 1.0e-5) return 1.0e30;
+    vec4 p = cam.projInverse * vec4(ndc, depthValue, 1.0);
+    if(abs(p.w) <= 1.0e-6) return 1.0e30;
+    return length(p.xyz / p.w);
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(cloudOutput);
+    if(any(greaterThanEqual(pixel, size))) return;
+
+    bool cloudDeckEnabled = cam.cloudParams1.w >= 0.5;
+    bool highCloudEnabled = cam.highCloudParams0.x >= 0.5;
+    // 2026-10-23 雾与云 / 维度解耦（与 v1/v2 逐字同义）。
+    const bool overworldDimension = abs(cam.weatherParams.z - 1.0) < 0.25;
+    cloudDeckEnabled = cloudDeckEnabled && overworldDimension;
+    highCloudEnabled = highCloudEnabled && overworldDimension;
+    const bool fogWanted = cam.cloudParams7.x >= 0.5;
+    if(!cloudDeckEnabled && !highCloudEnabled && !fogWanted)
+    {
+        storeEmpty(pixel);
+        return;
+    }
+
+    vec2 ndc = (vec2(pixel) + 0.5) / vec2(size) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    vec4 viewPosition = cam.projInverse * vec4(ndc, 1.0, 1.0);
+    vec3 viewTarget = abs(viewPosition.w) > 1.0e-6
+        ? viewPosition.xyz / viewPosition.w : viewPosition.xyz;
+    vec3 worldDirection = normalize((cam.viewInverse * vec4(normalize(viewTarget), 0.0)).xyz);
+    vec3 cameraPosition = cam.viewInverse[3].xyz;
+
+    float rawSceneDepth = texelFetch(sceneDepth, pixel, 0).r;
+    if(textureSize(sceneDepth, 0) != size)
+    {
+        const vec2 sceneSize = vec2(textureSize(sceneDepth, 0));
+        const vec2 sceneTexel = (vec2(pixel) + 0.5) / vec2(size) * sceneSize;
+        const ivec2 base = ivec2(floor(sceneTexel - 0.5));
+        const ivec2 limit = ivec2(sceneSize) - ivec2(1, 1);
+        // 2026-10-18 修虚边：原来取 **max**（2×2 里最远的深度）——
+        // 深度值越大越远，取最远等于让云的终止距离往后推，云会画到物体**前面**，
+        // 物体与云交界处于是渗色/发虚（就是用户看到的那种"空白轮廓"）。
+        // 正确做法是取 **min**（最近的遮挡面）：云在最近的物体之前就停，
+        // 宁可多遮一点也不留半透明缝。
+        float nearest = 1.0;
+        for(int oy = 0; oy < 2; ++oy)
+        for(int ox = 0; ox < 2; ++ox)
+        {
+            nearest = min(nearest, texelFetch(sceneDepth,
+                clamp(base + ivec2(ox, oy), ivec2(0, 0), limit), 0).r);
+        }
+        rawSceneDepth = nearest;
+    }
+    float sceneDistance = sceneDistanceForDepth(ndc, rawSceneDepth);
+
+    // ---- 光照颜色（与 v3 同一套链）----
+    vec3 lightDir0 = sunDirection();
+    float sunElevation = lightDir0.y;
+    vec3 lightDirection = sunElevation >= 0.0 ? lightDir0 : -lightDir0;
+    float dayAmount = smoothstep(-0.03, 0.03, sunElevation);
+    float elevationMagnitude = abs(sunElevation) / 0.81915204429;
+    float rain = clamp(cam.weatherParams.x, 0.0, 1.0);
+
+    vec3 directLightColor = mix(vec3(0.46, 0.56, 1.00),
+        skyModelSunColor(lightDirection, 0.5), dayAmount);
+    // 2026-10-18 对齐预览：预览的 sunColor = warmColor * 3.0 * 0.5 = 1.5。
+    // 游戏原来是 6.0，等于预览的 4 倍 ⇒ 云的散射在头几十格就饱和，
+    // 形状和明暗全被压平，只剩边缘噪声（"粗糙"的直接原因）。
+    float directLightEnergy = mix(1.5 * (0.05 / 1.22077458876) * elevationMagnitude,
+        1.5, dayAmount) * clamp(cam.cloudParams5.z, 0.0, 3.0);
+    float moonStrength = cam.cloudMoonParams.x >= 0.0 ? cam.cloudMoonParams.x : 1.0;
+    float moonPhase = cam.cloudMoonParams.y >= 0.0 ? cam.cloudMoonParams.y : 1.0;
+    vec3 sunColor = directLightColor * directLightEnergy *
+        mix(1.0, moonStrength * clamp(moonPhase, 0.0, 1.0), 1.0 - dayAmount);
+
+    float daylight = mix(0.08, 1.0, smoothstep(-0.10, 0.25, sunElevation));
+    float skyScale = daylight * clamp(elevationMagnitude, 0.0, 1.0);
+    vec3 sunSideDir = normalize(vec3(lightDirection.x, 0.20, lightDirection.z));
+    vec3 antiSunDir = normalize(vec3(-lightDirection.x, 0.20, -lightDirection.z));
+    vec3 radianceZenith = clearSkyInscatter(vec3(0.0, 1.0, 0.0), sunElevation, lightDirection,
+        directLightColor, skyScale, mix(1.0, 0.20, rain), vec3(1.0));
+    vec3 radianceSunSide = clearSkyInscatter(sunSideDir, sunElevation, lightDirection,
+        directLightColor, skyScale, mix(1.0, 0.20, rain), vec3(1.0));
+    vec3 radianceAntiSun = clearSkyInscatter(antiSunDir, sunElevation, lightDirection,
+        directLightColor, skyScale, mix(1.0, 0.20, rain), vec3(1.0));
+    float wZ = v4HG(dot(worldDirection, vec3(0.0, 1.0, 0.0)), 0.25);
+    float wS = v4HG(dot(worldDirection, sunSideDir), 0.25);
+    float wA = v4HG(dot(worldDirection, antiSunDir), 0.25);
+    vec3 skyColor = (radianceZenith * wZ + radianceSunSide * wS + radianceAntiSun * wA) /
+        max(wZ + wS + wA, 1.0e-4);
+    skyColor *= clamp(cam.cloudParams5.w, 0.0, 3.0);
+
+    // ---- bevy 参数映射 ----
+    BevyCloudConfig cfg;
+    cfg.baseScale = max(cam.cloudParams3.z, 0.05) * 1.0;
+    // 2026-10-19：步数默认走质量档；若「光线步进」滑条 > 0（cloudParams6.y）则覆盖。
+    // 0 表示"跟随质量档"，这样老存档不受影响。
+    // 阈值用 0.9 而不是 0.5：旧存档这两个 lane 存的是 0.5（高度梯度/银边强度的旧值），
+    // 用 0.5 会把它们误判成"覆盖"，等于强制 8 步（云会糙得离谱）。
+    float stepsOverride = cam.cloudParams6.y;
+    cfg.raymarchSteps = stepsOverride > 0.9
+        ? int(clamp(stepsOverride, 8.0, 256.0))
+        : int(clamp(cam.cloudParams2.x, 8.0, 256.0));
+    cfg.bottomHeight = max(cam.cloudParams0.x, 1.0);
+    cfg.topHeight = cfg.bottomHeight + max(cam.cloudParams0.y, 1.0);
+    // 2026-10-18：bevyGetDensity 里加了覆盖度归一化（实测图集 m 分布只有 ±0.1，
+    // 覆盖度滑条原来只有 0.42..0.62 一小段有效）。归一化后 coverage ≈ 被遮挡的天空比例，
+    // 所以这里直接用滑条值，不再做 0.2+0.8x 的偏移（否则会和预览对不上）。
+    // 2026-10-19 **雨天布满天空**：rain（cam.weatherParams.x）拉满时
+    // 覆盖率被推到接近 1，云层铺满整个天空。
+    // 这是天气驱动的自然结果，不需要单独滑条 —— 下雨天本来就该是阴天。
+    float rainAmount = clamp(cam.weatherParams.x, 0.0, 1.0);
+    cfg.coverage = clamp(mix(cam.cloudParams0.z, 0.98, rainAmount * 0.9), 0.0, 1.0);
+    // 2026-10-18 对齐预览标定：预览是 density*0.006（滑条 5 -> 0.03），
+    // 这里原来又除了个 5，导致游戏里只有预览的 1/5，云几乎透明。
+    // 2026-10-19 Hillaire 重构：这里现在是**消光系数 σtBase（每格）**，
+    // 不再乘进密度。密度是 0~1 的物理量，σt = 密度 × σtBase。
+    // 0.002/格 ⇒ 500 格光程给出 τ=1，1800 格层厚在满密度时 τ≈3.6（不透明但不死白）。
+    cfg.density = 0.002 * clamp(cam.cloudParams0.w, 0.05, 10.0);
+ // 2026-10-18 **重构**：这四项只作用于 core 里 `#if 0` 的段，
+    // 当前生效的 2D FBM 模型不读。保留初始化只为结构体完整（无功能影响）。
+    // 2026-10-19 **修货不对板**：这两行原来被我写死成 1.0 / 0.0（误以为"2D 模型不读"），
+    // 但当前 2D 密度实现恰恰全靠它们：
+    //   detailScale  → detailA 的周期 = 0.15 * (10/detailScale) × 云团尺度
+    //                  游戏写死 1.0 ⇒ 周期 1800 格（几乎没有细节）
+    //                  预览是 80     ⇒ 周期 23 格（细碎絮状）
+    //   detailStrength → 两层噪声的高频占比（wB），写死 0.0 等于只用低频
+    // 这就是"游戏和预览完全货不对板"的根因。按预览的映射接上：
+    cfg.detailScale = clamp(cam.cloudParams6.w, 0.1, 12.0) * 8.0;          // 云缘细节尺度
+    cfg.detailStrength = clamp(cam.cloudParams1.x / 0.15, 0.0, 2.0) * 0.5; // 云团对比
+    cfg.baseEdgeSoftness = 0.65;   // 2D 模型的「云量阈值」基准
+    // 4.x = 「云层上下分布」：fade 从线性(1-h)到二次(1-h²)之间插值。
+ // 0 = 云上下均匀，0.33 = 云集中在层中部
+    cfg.bottomSoftness = clamp(cam.cloudParams4.x, 0.0, 0.33);
+    // 「阴影步进」滑条（cloudParams6.z）> 0 时覆盖质量档
+    float shadowOverride = cam.cloudParams6.z;
+    cfg.shadowSteps = shadowOverride > 0.9
+        ? int(clamp(shadowOverride, 1.0, 32.0))
+        : int(clamp(cam.cloudParams2.y, 1.0, 32.0));
+    // 2026-10-18 与预览对齐：固定 10 格步长 + 1.3 倍增（= 参考库原值）。
+    // 原来按 层厚/64 取（厚 1296 时 20 格），自遮挡被糊成全局 AO，菜花沟壑全平。
+    // 2026-10-19 **阴影步长按云的水平尺度定，不是层厚**。
+    // 旧公式 层厚/64 = 28 格，8 步射程 ~500 格，而云半径约 770 格
+    // （baseScale × 1400）⇒ 太阳光穿不到云心 ⇒ 云内所有点受光相同 ⇒ **没有体积感**。
+    // 新公式：云尺度/12 ≈ 64 格，配 12 步射程 ~770 格，正好覆盖一个云块。
+    cfg.shadowStepSize = clamp(cfg.baseScale * 1400.0 / 12.0, 20.0, 120.0);
+    cfg.shadowStepMultiply = 1.3;
+    // 环境光压低到预览标定值，否则会把太阳项盖掉、整片发白。
+    // 2026-10-18：core 里 ambient 现在会乘 (0.12+0.88*shadow)（暗部压下去），
+    // 基数上调约 25% 补回平均亮度。
+    // 与 preview comp 的 ambTopDay/ambBotDay 同量级（0.11 / 0.083）
+    cfg.ambientTop = skyColor * 0.11;
+    cfg.ambientBottom = skyColor * 0.08;
+    // 2D 模型不用 3D shape 调制 / 3D 天气图（保留初始化避免未定义值）
+    cfg.shapeAmount = 0.0;
+    cfg.shapeScale = 0.15;
+    cfg.shapeWorldScale = 1200.0;
+    cfg.weatherPeriod = 18000.0;
+    cfg.minTransmittance = 0.02;
+    cfg.planetRadius = TYNDALL_RADIUS;
+    cfg.forwardG = 0.6;
+    cfg.backwardG = -0.2;
+    cfg.scatteringLerp = 0.5;
+    cfg.sunDir = lightDirection;
+    cfg.sunColor = sunColor;
+    cfg.time = max(uintBitsToFloat(cam.padding), 0.0);
+    // 2026-10-18：外形旋钮（设置面板「云型」「云缘侵蚀」）
+    // 外形旋钮（2026-10-18 重构后的 2D FBM 语义）
+    cfg.cloudType = clamp(cam.cloudParams5.x, 0.0, 1.0);        // 云型：stratus ↔ cumulus
+    cfg.erosionScale = clamp(cam.cloudParams5.y, 0.0, 2.0);     // 云缘侵蚀幅度
+    // 2026-10-19 两个外形入口（原「云团对比 / 云层上下分布」，Hillaire 下已退役）
+    cfg.detailStrength = clamp(cam.cloudParams1.x, 0.0, 1.0);   // 竖向拉伸 0→1.0 倍 / 1→5.0 倍
+    cfg.bottomSoftness = clamp(cam.cloudParams4.x, 0.0, 0.33);  // 边缘卷曲 0~0.40
+    // 云距（2D 模型的视距；「天气图尺度」对 2D 模型无效，lane 保留但不读）
+    cfg.viewDistance = clamp(cam.cloudParams1.z, 2000.0, 200000.0);   // 出厂 120000
+    // 2026-10-19：cloudParams1.y 复用为**远处淡出起点**（0~1 比例）
+    cfg.fadeStart = clamp(cam.cloudParams1.y, 0.0, 0.99);
+    // 逆光银边强度（cloudParams2.z 原为硬编码 0.008，从未被读取）
+    cfg.silver = clamp(cam.cloudParams2.z, 0.0, 1.0);
+    // 凝聚度（cloudParams4.x 原为「边缘卷曲」，现改为凝聚度）
+    cfg.cohesion = clamp(cam.cloudParams4.x, 0.0, 1.0);
+    // 2026-10-19：cloudParams6.x 复用为「逆光银边强度」
+    cfg.sunGlow = clamp(cam.cloudParams6.x, 0.0, 1.0);   // 出厂 0.10
+
+    // 相机需要在"行星坐标系"里：bevy 以球心为原点
+    vec3 planetOrigin = vec3(cameraPosition.x, cam.cloudParams0.x, cameraPosition.z);
+    vec3 rayOriginWorld = cameraPosition - planetOrigin + vec3(0.0, cfg.planetRadius, 0.0);
+
+    vec4 march = vec4(0.0, 0.0, 0.0, 1.0);
+    float cloudDistance = V4_EMPTY;
+    if(cloudDeckEnabled)
+    {
+        // 球心在 (anchor.x, 云底 - R, anchor.z) ⇒ 射线原点平移到以球心为原点：
+        //   x/z 取相对 anchor 的偏移，y = 相机高度 - 云底 + R
+        vec2 anchorXZ = cam.cloudParams3.xy;
+        vec3 origin = vec3(cameraPosition.x - anchorXZ.x,
+            cameraPosition.y + cfg.planetRadius,
+            cameraPosition.z - anchorXZ.y);
+        // TODO(2026-10-18)：base map 已从 2D 图集改成 3D 体积（预览端是 mode 4 烘的
+        // 64³ baseVolume）。游戏端还缺这张体积的烘焙，这里先拿实景 noise（binding 1）
+        // 顶上：结构确实是 3D 的、不会再出竖条，但覆盖度分布与预览不同，
+        // **接入前必须补 base 体积烘焙并重新标定 coverage**。
+ // 最后一个参数是 shapeSampler。
+        // 2026-10-18：改传 baseTex（binding 9，v4 专用，烘的是 bevyShapeVolume），
+        // 不用 binding 1 —— 那个是全局共享的，换掉会毁掉平面云与丁达尔云影。
+        // 2026-10-18：视距从 60000 提到 120000。预览是"无限远"，
+        // 60000 会在中途把云截断 —— 远处云消失、地平线出现一条硬边界。
+        // ---- UE 模型（2026-10-22）----
+        // 形状源 = binding 1 cloudShapeNoise：烘焙阶段它已被替换成 128³ Perlin-Worley
+        // （VulkanCore.cpp:34577-34590 的 useV4Shape 分支），不是 v3 的程序化噪声。
+        // 侵蚀源 = binding 10 cloudWorley；weather = binding 11 cloudAtlas（2D 图集）。
+        UeCloudConfig ue;
+        ue.bottomHeight = cfg.bottomHeight;
+        ue.topHeight = cfg.topHeight;
+        ue.planetRadius = cfg.planetRadius;
+        ue.coverage = cfg.coverage;
+        ue.density = cfg.density;
+        // 8000 格周期，与预览器 --model ue 同口径（128³ ⇒ 62.5 格/体素）。
+ // 注意别沿用 cfg.shapeWorldScale。
+        ue.shapeWorldScale = cfg.baseScale * 8000.0;
+        ue.weatherScale = 0.00035 * cfg.baseScale *
+            (cam.ueCloudB.w > 0.01 ? cam.ueCloudB.w : 1.0);
+        // detailScale 直接用 cfg.detailScale（= clamp(cloudParams6.w,0.1,12)×8）。
+        // 注意 cloudParams6.w 那个 Atomic 的变量名叫 g_cloudDetileStrength（历史遗留），
+        // 但它**确实**是云缘细节尺度，出厂 10 → 80，对应侵蚀周期 ≈ 250 格。
+        // 2026-10-22 我曾误判它读错 lane 并改成固定 48（更粗），已撤回。
+        ue.detailScale = cfg.baseScale * cfg.detailScale;
+        ue.detailStrength = clamp(cfg.erosionScale, 0.0, 2.0);
+        ue.viewSteps = cfg.raymarchSteps;
+        ue.shadowSteps = cfg.shadowSteps;
+        // 八项从 CameraUBO 尾块读（偏移 1536 / 1552，相机 UBO 声明见 camera_ubo.glsl）。
+        // 哨兵语义：< 0 表示"宿主未写入"，回落预览器的出厂档 ——
+        // 这样旧 DLL 配新 SPV（或反之）都不会把 0 误当成用户设定值。
+        ue.msOctaves = cam.ueCloudA.x >= 0.0 ? int(clamp(cam.ueCloudA.x, 1.0, 3.0)) : 1;
+        ue.msContribution = cam.ueCloudA.y >= 0.0 ? clamp(cam.ueCloudA.y, 0.0, 1.0) : 0.5;
+        ue.msOcclusion = cam.ueCloudA.z >= 0.0 ? clamp(cam.ueCloudA.z, 0.05, 1.0) : 0.5;
+        ue.luminanceScale = cam.ueCloudA.w >= 0.0 ? cam.ueCloudA.w : 1.0;
+        ue.groundAlbedo = vec3(0.32, 0.30, 0.24);   // [DOC] Ground Albedo 暂不单开滑条
+        ue.groundContribution = cam.ueCloudB.x >= 0.0 ? cam.ueCloudB.x : 0.15;
+        ue.cloudAO = cam.ueCloudB.y >= 0.0 ? cam.ueCloudB.y : 1.0;
+        ue.atmosphereDensity = cam.ueCloudB.z >= 0.0 ? cam.ueCloudB.z : 0.35;
+        ue.sunDir = cfg.sunDir;
+        ue.sunColor = cfg.sunColor;
+        ue.ambientTop = cfg.ambientTop;
+        ue.ambientBottom = cfg.ambientBottom;
+        ue.forwardG = cfg.forwardG;
+        ue.backwardG = cfg.backwardG;
+        ue.viewDistance = cfg.viewDistance;
+        ue.fadeStart = cfg.fadeStart;
+        ue.minTransmittance = cfg.minTransmittance;
+        ue.time = cfg.time;
+        ue.shadowStepSize = cfg.shadowStepSize;
+
+        // 场景深度求交：maxDist = min(场景距离, 视距)。
+        // 这是 UE 的 Reactive 语义在游戏端的落地 —— 地形背后的云不会再被算，
+        // 也不会画到物体前面。预览器没有场景几何，那边固定传 1e9。
+        march = ueRaymarch(origin, worldDirection, min(sceneDistance, cfg.viewDistance),
+            ue, cloudAtlas, cloudShapeNoise, cloudWorley, cloudDistance);
+    }
+
+    float opacity = clamp(1.0 - march.a, 0.0, 1.0);
+    vec3 scattering = march.rgb;
+    float transmittance = march.a;
+
+    // ---- 平面云 / 雾 / 空气透视（同 v2/v3）----
+    float highPixelAngle = 2.0 * abs(cam.projInverse[1][1]) / float(size.y);
+    float highDistance = V4_EMPTY;
+    vec4 highCloud = vec4(0.0, 0.0, 0.0, 1.0);
+    // 2026-10-23：高层云只主世界、只在自己开关打开时采样（本 pass 现在为雾继续运行）。
+    if(highCloudEnabled)
+    {
+        highCloud = sampleHighCloud(cameraPosition, worldDirection, lightDirection,
+            highPixelAngle, highDistance);
+        if(highDistance > sceneDistance)
+        {
+            highCloud = vec4(0.0, 0.0, 0.0, 1.0);
+            highDistance = V4_EMPTY;
+        }
+    }
+    if(highDistance < cloudDistance) scattering = highCloud.rgb + highCloud.a * scattering;
+    else scattering += transmittance * highCloud.rgb;
+    transmittance *= highCloud.a;
+    cloudDistance = min(cloudDistance, highDistance);
+
+    // 2026-10-23：环境项接沿视线的真实晴空辐亮度（与上面天光三方向同一个函数、
+    // 同一套标度），按 fogExtrasParams.z 混入 ⇒ 0 逐位旧档。
+    const vec3 fogAmbientLegacy =
+        mix(vec3(0.055, 0.070, 0.125), vec3(0.62, 0.72, 0.92), dayAmount);
+    const vec3 fogAmbientSky = clearSkyInscatter(worldDirection, sunElevation,
+        lightDirection, directLightColor, skyScale, mix(1.0, 0.20, rain), vec3(1.0));
+    const vec3 fogAmbient = mix(fogAmbientLegacy, fogAmbientSky,
+        clamp(cam.fogExtrasParams.z, 0.0, 1.0));
+
+    FogResult fog = evaluateAnalyticFog(cameraPosition, worldDirection, sceneDistance,
+        directLightColor * directLightEnergy, lightDirection,
+        fogAmbient, rain,
+        cam.cloudParams7.x, cam.cloudParams7.y, cam.cloudParams7.z, cam.cloudParams7.w,
+        cam.cloudParams8.x, cam.cloudParams8.y, cam.cloudParams8.z, cam.cloudParams8.w,
+        cam.cloudParams9.x, cam.cloudParams9.y, cam.cloudParams9.z,
+        cam.fogExtrasParams.y, cam.fogExtrasParams.w, cam.fogExtrasParams.x,
+        // 2026-10-23 雨天地面雾浪（两个死 lane 复用，见 v1 同名段）。
+        cam.cloudParams4.y, cam.cloudParams4.z, cam.cloudParams4.w, cam.cloudParams9.w);
+
+    if(fog.transmittance < 1.0)
+    {
+        if(fog.firstDistance <= cloudDistance) scattering = scattering * fog.transmittance + fog.scattering;
+        else scattering += transmittance * fog.scattering;
+        transmittance *= fog.transmittance;
+    }
+
+    float combinedFirst = min(cloudDistance, fog.firstDistance);
+    float reprojectDistance = cam.cloudMarchParams.w > 0.5 ? cloudDistance : combinedFirst;
+    if(reprojectDistance <= 0.0 || reprojectDistance >= V4_EMPTY) reprojectDistance = combinedFirst;
+    // 2026-10-23：雾的贡献过半 ⇒ 重投影用雾自己的平均距离（理由见 v1 同名段）。
+    if(1.0 - fog.transmittance > 0.5) reprojectDistance = fog.meanDistance;
+
+    imageStore(cloudDepthOutput, pixel, vec4(combinedFirst, reprojectDistance, 0.0, 0.0));
+
+    imageStore(cloudOutput, pixel, vec4(scattering, transmittance));
+}

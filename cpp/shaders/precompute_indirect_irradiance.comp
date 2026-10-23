@@ -1,0 +1,46 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// 2026-09-30 大气重写（方案 A）：takram precompute pass 的 Vulkan compute 适配。
+// 原文件：packages/atmosphere/src/shaders/precompute/indirectIrradiance.frag（MIT）。
+// 适配点：gl_FragCoord → gl_GlobalInvocationID+0.5；MRT/混合 → push constant
+// 选择输出变体 + 累加走 imageLoad/add；luminanceFromRadiance = 单位阵
+// （散射 LUT 全程存光谱辐亮度，显示端才乘光度系数）。
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+#include "bruneton/definitions.glsl"
+#include "bruneton/atmosphere.glsl"
+#include "bruneton/common.glsl"
+#include "bruneton/precompute.glsl"
+layout(push_constant) uniform PC {
+    int pcLayer;            // 兼容保留（3D 派发时由 gid.z 取层）
+    int pcAdditive;         // 0 = 覆写，1 = 累加
+    int pcScatteringOrder;  // 散射阶（2..4）
+    int pcOutput;           // 输出变体选择
+} pc;
+
+// pc.pcOutput: 0 = 写 deltaIrradiance，1 = 累加进 irradiance
+layout(set = 0, binding = 15) uniform sampler3D deltaRayleighTexture;
+layout(set = 0, binding = 16) uniform sampler3D deltaMieTexture;
+layout(set = 0, binding = 17) uniform sampler3D deltaMultipleScatteringTexture;
+layout(rgba32f, set = 0, binding = 10) uniform image2D outDeltaIrradiance;
+layout(rgba32f, set = 0, binding = 20) uniform image2D outIrradiance;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= IRRADIANCE_TEXTURE_WIDTH ||
+        pix.y >= IRRADIANCE_TEXTURE_HEIGHT) return;
+    vec2 frag = vec2(pix) + 0.5;
+    vec3 deltaIrradiance;
+    vec3 irradiance;
+    deltaIrradiance = ComputeIndirectIrradianceTexture(
+        ATMOSPHERE, deltaRayleighTexture, deltaMieTexture,
+        deltaMultipleScatteringTexture, frag, pc.pcScatteringOrder);
+    irradiance = deltaIrradiance;
+    // pcOutput 0 = 写 deltaIrradiance；1 = 累加进 irradiance（迭代阶）
+    if (pc.pcOutput == 0) {
+        imageStore(outDeltaIrradiance, pix, vec4(deltaIrradiance, 1.0));
+    } else {
+        vec4 value = vec4(irradiance, 1.0);
+        if (pc.pcAdditive == 1) value += imageLoad(outIrradiance, pix);
+        imageStore(outIrradiance, pix, value);
+    }
+}

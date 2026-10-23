@@ -1,0 +1,72 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_ray_query : require
+
+// 远场太阳阴影图的生产者（2026-10-01）。
+//
+// 与 rt_sun_shadow.comp（近场 256² / ±96 格，体积光与体积雾用）同构，只是尺度
+// 完全不同：1024² / extent 由 CameraUBO 的 sunShadowFarParams 下发。近场那张图
+// 的 extent 是围着 march 采样点调过的（见 sun_shadow.glsl 顶部说明），放大它会让
+// 光柱纹素变粗；而 rgen 的远场分支要的是"几百格开外、山体投下的影"，两者尺度差
+// 两个数量级，共用一张图谁都满足不了，所以新开一张。
+//
+// 分辨率 1024、extent XY 384 ⇒ 0.75 格/纹素（与近场同密度），1.05M 条射线/帧。
+// 2026-10-21：extentZ 单独放宽到 768（XY 不变）—— 它决定"沿太阳方向能看见
+// 多远的遮挡体"，体积雾的 672 格行程需要它；XY 只决定存在哪些柱子。
+// 一条射线就是一次 ray query 的"路上有没有东西"，没有 closest-hit 着色。
+//
+// 设备要求：VK_KHR_ray_query（计算着色器用不了 traceRayEXT，见 sun_shadow.glsl）。
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// ⚠ 这个块必须**完整**声明到 sunShadowFarParams 为止。std140 允许"少声明尾部"，
+//   但不允许"跳过某个成员再继续"——sunShadowFarParams 在 CameraUBO 的最末尾
+//   （偏移 928），要读到它就必须把前面每一个成员按序声明。刻意与 rt_test.rgen
+//   的 CameraProperties 块逐字对齐，任何一处漏声明都会让整条读取链整体错位。
+layout(set = 0, binding = 0) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+layout(set = 0, binding = 1) uniform accelerationStructureEXT sceneTlas;
+
+// 首遮挡体距离，沿太阳方向、从盒的上风侧边界量起。没打到东西就是 2×extentZ。
+layout(set = 0, binding = 2, r32f) uniform image2D sunShadowFarImage;
+
+// 选择 sun_shadow.glsl 里的"生产者"半边（射线追踪函数）。消费者半边
+// （sunShadowVisibility*）依赖 sampler2D，这个 pass 没有，不选。
+#define SUN_SHADOW_PRODUCER 1
+#include "sun_shadow.glsl"
+
+// 远场图分辨率。与 C++ 侧 g_sunShadowFarResolution 必须一致。
+const int SUN_SHADOW_FAR_RESOLUTION = 1024;
+
+void main()
+{
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if(texel.x >= SUN_SHADOW_FAR_RESOLUTION ||
+        texel.y >= SUN_SHADOW_FAR_RESOLUTION)
+    {
+        return;
+    }
+
+    // extent / texel 全部来自 UBO —— 与消费者（rgen 的 sunShadowFarVisibility）
+    // 走同一份 CameraUBO 车道，结构上不可能对不上。见 sun_shadow.glsl 顶部契约。
+    float extentXY = cam.sunShadowFarParams.x;
+    float extentZ = cam.sunShadowFarParams.y;
+    float texelSize = cam.sunShadowFarParams.z;
+
+    vec3 sunDirection = sunShadowLightDirection();
+    vec2 uv = (vec2(texel) + 0.5) / float(SUN_SHADOW_FAR_RESOLUTION);
+    vec3 center = sunShadowCenterFor(extentXY, texelSize);
+    // 起点在**朝太阳**那一端（sunShadowRayOriginFar 内部取 +sunDirection*extentZ，
+    // 2026-10-10 修正），所以射线朝场景打 = 沿 -sunDirection 向下。
+    vec3 origin = sunShadowRayOriginFar(uv, sunDirection, center,
+        extentXY, extentZ);
+
+    imageStore(
+        sunShadowFarImage,
+        texel,
+        vec4(sunShadowTraceDepth(origin, -sunDirection, 2.0 * extentZ),
+            0.0, 0.0, 0.0));
+}

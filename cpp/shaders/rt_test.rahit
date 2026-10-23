@@ -1,0 +1,802 @@
+#version 460
+// 2026-10-21：延迟材质已是唯一模式（见文档 §13）。
+#if !defined(RT_DEFERRED_MATERIAL) && !defined(RT_BUILD_PRODUCTION_MODE)
+#define RT_DEFERRED_MATERIAL 1
+#endif
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// The pane transmission filter is single-sourced in glass_tint_common.glsl so
+// this Any-Hit sheet model and the voxel DDA arm of the same stained-glass
+// model cannot drift apart again.  GLASS_TINT_NO_DDA keeps the voxel march out
+// of this translation unit: its callee vptReadSourceVoxel() is defined only by
+// the raygen-family shaders.
+#extension GL_GOOGLE_include_directive : require
+#define GLASS_TINT_NO_DDA 1
+#include "glass_tint_common.glsl"
+// LOD / 远场几何的角色表与每柱覆盖位图（binding 19/20）。
+#include "lod_coverage.glsl"
+
+// 2026-10-20: 结构体单源化，见 hit_payload.glsl（六个 shader 共用同一份布局）。
+#include "hit_payload.glsl"
+
+#ifdef RT_DEFERRED_MATERIAL
+layout(location = 0) rayPayloadInEXT HitIdentity payload;
+#else
+layout(location = 0) rayPayloadInEXT HitPayload payload;
+#endif
+
+const uint RT_STATE_PURPOSE_MASK       = 0x7u;
+const uint RT_PURPOSE_CLASSIFY          = 1u;
+const uint RT_PURPOSE_PASSTHROUGH      = 4u;
+const uint RT_PURPOSE_GLASS_VISIBILITY = 5u;
+const uint RT_PURPOSE_PRIMARY_SKY       = 7u;
+
+uint getRayPurpose(uint state)
+{
+    return state & RT_STATE_PURPOSE_MASK;
+}
+
+hitAttributeEXT vec2 attribs;
+
+// === Core ABI: exactly matches the global 48-byte Vertex structure ===
+struct Vertex {
+    float x, y, z;      // 12 bytes
+    float u, v;         // 8 bytes
+    float r, g, b, a;   // 16 bytes
+    float materialId;   // 4 bytes
+    float pad1;         // 4 bytes
+    float pad2;         // 4 bytes: 0 terrain, 1..16 entity Sampler0
+};                      // total: 48 bytes
+
+layout(buffer_reference, scalar) buffer Vertices {
+    Vertex v[];
+};
+
+// =====================================================
+// 2026-10-21 地形 32B 顶点（与 C++ 的 SectionVertex 逐字节对应）
+//
+// 本 TU 自带 Vertex/Vertices 且不 include material_common.glsl ⇒ 这里单独持一份
+// 解包器；内容与 material_common.glsl:89-135 一致，改那边必须同步改这里。
+//
+// 判别方式：顶点地址表项（binding 21）的 .w = 该段顶点步长（32 或 48）。
+// 解包后仍返回老的 48B Vertex ⇒ 下游 materialId/pad1/pad2 使用点零改动。
+// 编译期开关必须与 C++ 的 SECTION_VERTEX_32B_ENABLED 一致。
+// =====================================================
+#if SECTION_VERTEX_32B
+struct SectionVertex32
+{
+    float x, y, z;
+    float u, v;
+    uint color;      // RGBA8: r | g<<8 | b<<16 | a<<24
+    float materialId;
+    float pad2;      // pad2 + (pad1 > 0 ? 64 : 0)
+};
+
+layout(buffer_reference, scalar) buffer SectionVertices32 {
+    SectionVertex32 v[];
+};
+
+Vertex loadSectionVertex(uint64_t addr, uint stride, uint index)
+{
+    if(stride == 32u)
+    {
+        const SectionVertex32 packed = SectionVertices32(addr).v[index];
+
+        Vertex unpacked;
+        unpacked.x = packed.x;
+        unpacked.y = packed.y;
+        unpacked.z = packed.z;
+        unpacked.u = packed.u;
+        unpacked.v = packed.v;
+        unpacked.r = float(packed.color & 0xFFu) / 255.0;
+        unpacked.g = float((packed.color >> 8) & 0xFFu) / 255.0;
+        unpacked.b = float((packed.color >> 16) & 0xFFu) / 255.0;
+        unpacked.a = float((packed.color >> 24) & 0xFFu) / 255.0;
+        unpacked.materialId = packed.materialId;
+
+        const bool rainPuddle = packed.pad2 >= 64.0;
+        unpacked.pad1 = rainPuddle ? 0.25 : 0.0;
+        unpacked.pad2 = rainPuddle ? (packed.pad2 - 64.0) : packed.pad2;
+
+        return unpacked;
+    }
+
+    return Vertices(addr).v[index];
+}
+#else
+Vertex loadSectionVertex(uint64_t addr, uint /*stride*/, uint index)
+{
+    return Vertices(addr).v[index];
+}
+#endif
+
+// Match closest-hit: one entry per TLAS Section instance.
+// Any-hit must use this table too; CameraProperties.vertexBufferAddr
+// is only the initialization fallback/test triangle address.
+// 2026-10-09：表项 8B → 16B（uvec4），必须与 closest-hit 和 C++ 侧
+// GPUSectionVertexAddress 一致；.xz 用法见 rt_test.rchit 的说明。
+layout(std430, binding = 21, set = 0) readonly buffer SectionVertexAddressBuffer {
+    uvec4 vertexAddresses[];
+} sectionVertexAddressBuffer;
+
+layout(binding = 2, set = 0) uniform CameraProperties {
+    #include "camera_ubo.glsl"
+} cam;
+
+layout(binding = 3, set = 0) uniform sampler2D blockAtlas;
+// 2026-10-06：实体纹理槽 16 → 32（与 rt_test.rchit / VulkanCore 的
+// ENTITY_RT_TEXTURE_SLOT_COUNT 必须一致）。any-hit 的 alpha 测试也要能看到
+// 全部槽，否则新槽位上的实体几何会被当成"全不透明"。
+// 2026-10-13：32 → 64。三处（本文件、rt_test.rchit、VulkanCore.cpp 的
+// ENTITY_RT_TEXTURE_SLOT_COUNT / 描述符池）必须同步，下面的 switch 也要补满。
+layout(binding = 36, set = 0) uniform sampler2D entityAtlases[64];
+layout(binding = 37, set = 0) uniform sampler2D particleAtlases[3];
+layout(binding = 40, set = 0) uniform sampler2D rainStreakAtlas;
+
+vec4 sampleEntityAlphaAtlas(uint textureSlot, vec2 uv)
+{
+    switch(textureSlot)
+    {
+        case 1u: return textureLod(entityAtlases[0], uv, 0.0);
+        case 2u: return textureLod(entityAtlases[1], uv, 0.0);
+        case 3u: return textureLod(entityAtlases[2], uv, 0.0);
+        case 4u: return textureLod(entityAtlases[3], uv, 0.0);
+        case 5u: return textureLod(entityAtlases[4], uv, 0.0);
+        case 6u: return textureLod(entityAtlases[5], uv, 0.0);
+        case 7u: return textureLod(entityAtlases[6], uv, 0.0);
+        case 8u: return textureLod(entityAtlases[7], uv, 0.0);
+        case 9u: return textureLod(entityAtlases[8], uv, 0.0);
+        case 10u: return textureLod(entityAtlases[9], uv, 0.0);
+        case 11u: return textureLod(entityAtlases[10], uv, 0.0);
+        case 12u: return textureLod(entityAtlases[11], uv, 0.0);
+        case 13u: return textureLod(entityAtlases[12], uv, 0.0);
+        case 14u: return textureLod(entityAtlases[13], uv, 0.0);
+        case 15u: return textureLod(entityAtlases[14], uv, 0.0);
+        case 16u: return textureLod(entityAtlases[15], uv, 0.0);
+        case 17u: return textureLod(entityAtlases[16], uv, 0.0);
+        case 18u: return textureLod(entityAtlases[17], uv, 0.0);
+        case 19u: return textureLod(entityAtlases[18], uv, 0.0);
+        case 20u: return textureLod(entityAtlases[19], uv, 0.0);
+        case 21u: return textureLod(entityAtlases[20], uv, 0.0);
+        case 22u: return textureLod(entityAtlases[21], uv, 0.0);
+        case 23u: return textureLod(entityAtlases[22], uv, 0.0);
+        case 24u: return textureLod(entityAtlases[23], uv, 0.0);
+        case 25u: return textureLod(entityAtlases[24], uv, 0.0);
+        case 26u: return textureLod(entityAtlases[25], uv, 0.0);
+        case 27u: return textureLod(entityAtlases[26], uv, 0.0);
+        case 28u: return textureLod(entityAtlases[27], uv, 0.0);
+        case 29u: return textureLod(entityAtlases[28], uv, 0.0);
+        case 30u: return textureLod(entityAtlases[29], uv, 0.0);
+        case 31u: return textureLod(entityAtlases[30], uv, 0.0);
+        case 32u: return textureLod(entityAtlases[31], uv, 0.0);
+        case 33u: return textureLod(entityAtlases[32], uv, 0.0);
+        case 34u: return textureLod(entityAtlases[33], uv, 0.0);
+        case 35u: return textureLod(entityAtlases[34], uv, 0.0);
+        case 36u: return textureLod(entityAtlases[35], uv, 0.0);
+        case 37u: return textureLod(entityAtlases[36], uv, 0.0);
+        case 38u: return textureLod(entityAtlases[37], uv, 0.0);
+        case 39u: return textureLod(entityAtlases[38], uv, 0.0);
+        case 40u: return textureLod(entityAtlases[39], uv, 0.0);
+        case 41u: return textureLod(entityAtlases[40], uv, 0.0);
+        case 42u: return textureLod(entityAtlases[41], uv, 0.0);
+        case 43u: return textureLod(entityAtlases[42], uv, 0.0);
+        case 44u: return textureLod(entityAtlases[43], uv, 0.0);
+        case 45u: return textureLod(entityAtlases[44], uv, 0.0);
+        case 46u: return textureLod(entityAtlases[45], uv, 0.0);
+        case 47u: return textureLod(entityAtlases[46], uv, 0.0);
+        case 48u: return textureLod(entityAtlases[47], uv, 0.0);
+        case 49u: return textureLod(entityAtlases[48], uv, 0.0);
+        case 50u: return textureLod(entityAtlases[49], uv, 0.0);
+        case 51u: return textureLod(entityAtlases[50], uv, 0.0);
+        case 52u: return textureLod(entityAtlases[51], uv, 0.0);
+        case 53u: return textureLod(entityAtlases[52], uv, 0.0);
+        case 54u: return textureLod(entityAtlases[53], uv, 0.0);
+        case 55u: return textureLod(entityAtlases[54], uv, 0.0);
+        case 56u: return textureLod(entityAtlases[55], uv, 0.0);
+        case 57u: return textureLod(entityAtlases[56], uv, 0.0);
+        case 58u: return textureLod(entityAtlases[57], uv, 0.0);
+        case 59u: return textureLod(entityAtlases[58], uv, 0.0);
+        case 60u: return textureLod(entityAtlases[59], uv, 0.0);
+        case 61u: return textureLod(entityAtlases[60], uv, 0.0);
+        case 62u: return textureLod(entityAtlases[61], uv, 0.0);
+        case 63u: return textureLod(entityAtlases[62], uv, 0.0);
+        case 64u: return textureLod(entityAtlases[63], uv, 0.0);
+        default: return vec4(1.0);
+    }
+}
+
+vec4 sampleParticleAlphaAtlas(uint textureSlot, vec2 uv)
+{
+    switch(textureSlot)
+    {
+        case 1u: return textureLod(particleAtlases[0], uv, 0.0);
+        case 2u: return textureLod(particleAtlases[1], uv, 0.0);
+        case 3u: return textureLod(particleAtlases[2], uv, 0.0);
+        default: return vec4(0.0);
+    }
+}
+
+
+int getTransparentProfileFromRawMaterialId(float materialId)
+{
+    return int(
+        round(
+            clamp(
+                fract(materialId) * 10.0,
+                0.0,
+                4.0
+            )
+        )
+    );
+}
+
+// Same per-profile dense-body scale as rt_test.rgen's
+// getTransparentProfileTransmission, so visibility (shadows, AO and local
+// lights) attenuates exactly as much as the surface path transmits.
+//   1 tinted glass / 2 ice / 3 slime / 4 honey, 0 = clear or stained glass.
+float getTransparentProfileTransmissionAnyHit(int transparentProfile)
+{
+    if(transparentProfile == 1)
+    {
+        return 0.06;
+    }
+    if(transparentProfile == 2)
+    {
+        return 0.55;
+    }
+    if(transparentProfile == 3)
+    {
+        return 0.45;
+    }
+    if(transparentProfile == 4)
+    {
+        return 0.32;
+    }
+    return 1.0;
+}
+
+vec3 computeGlassBlockTransmissionAnyHit(
+    vec3 glassTint,
+    float glassAlpha,
+    int transparentProfile
+)
+{
+    // Orion: transmission_color = base_color RGB, clamped.
+    return clamp(glassTint, vec3(0.0), vec3(1.0));
+}
+
+// =====================================================
+// Glass optical model (straight-through).
+// thinSheetFactors() and glassSheetTransmission() implement the thin-sheet
+// surface_bsdf model; the latter matches
+// surfaceShadowTransmission() for a straight connection.
+// =====================================================
+// Disabled (no call sites): kept as a future interface option.  The
+// scalar-F fast path below is arithmetically identical for the uniform
+// 0.04 glass F0 and skips the unused reflection term.
+#if 0
+vec3 fresnelSchlick(
+    float cosTheta,
+    vec3 F0
+)
+{
+    return
+        F0 +
+        (
+            vec3(1.0) - F0
+        ) *
+        pow(
+            1.0 - cosTheta,
+            5.0
+        );
+}
+
+void glassThinSheetFactors(
+    vec3 fresnel,
+    vec3 transmittance,
+    out vec3 reflection,
+    out vec3 transmission
+)
+{
+    vec3 f = clamp(fresnel, vec3(0.0), vec3(1.0));
+    vec3 a = clamp(transmittance, vec3(0.0), vec3(1.0));
+    vec3 oneMinusF = vec3(1.0) - f;
+    vec3 denominator = max(vec3(1.0) - f * f * a * a, vec3(1.0e-6));
+    reflection = f + oneMinusF * oneMinusF * f * a * a / denominator;
+    transmission = oneMinusF * oneMinusF * a / denominator;
+}
+
+vec3 glassSheetTransmission(
+    vec3 transmissionColor,
+    vec3 faceNormal,
+    vec3 directionToLight
+)
+{
+    float cosine = clamp(
+        abs(dot(normalize(faceNormal), normalize(directionToLight))),
+        0.0,
+        1.0
+    );
+    vec3 reflection;
+    vec3 transmission;
+    glassThinSheetFactors(
+        fresnelSchlick(cosine, vec3(0.04)),
+        transmissionColor,
+        reflection,
+        transmission
+    );
+    return transmission;
+}
+#endif
+
+// Scalar-F fast path.  The glass F0 (0.04) is uniform across RGB, so
+// Schlick Fresnel collapses to one scalar and the Orion thin-sheet
+// series becomes transmission = (1-F)^2 * T / (1 - F^2 * T^2).  The x^5
+// power expands into multiplies: exact, and off the SFU pipe.  Both
+// inputs below are unit length (geometricNormal is normalised at the call
+// site, gl_WorldRayDirectionEXT is unit by spec), so no renormalisation
+// is needed here.
+vec3 glassSheetTransmissionScalarF(
+    vec3 transmissionColor,
+    float cosTheta
+)
+{
+    float x = 1.0 - clamp(cosTheta, 0.0, 1.0);
+    float x2 = x * x;
+    float fresnel = 0.04 + 0.96 * (x2 * x2) * x;
+    float oneMinusF = 1.0 - fresnel;
+    vec3 a = clamp(transmissionColor, vec3(0.0), vec3(1.0));
+    vec3 denominator = max(
+        vec3(1.0) - (fresnel * fresnel) * (a * a),
+        vec3(1.0e-6)
+    );
+    return (oneMinusF * oneMinusF) * a / denominator;
+}
+
+void main() {
+
+    // 2026-10-09：表项是 16B，地址在两个低 lane（any-hit 不需要位移段）。
+    // 2026-10-21 地形 32B：.w = 该段顶点步长（32/48），取顶点按它分派。
+    const uvec4 sectionAddressEntry =
+        sectionVertexAddressBuffer.vertexAddresses[
+            gl_InstanceCustomIndexEXT
+        ];
+
+    uint64_t rawAddr =
+        packUint2x32(sectionAddressEntry.xy);
+    if (rawAddr == 0ul) return;
+
+    // 2026-10-22 索引化地形：.w 最低位 = "4 顶点/quad 索引布局"（图案 0,1,2 / 0,2,3，
+    // 见 VulkanCore.cpp:sectionQuadIndexAddress）。真实步长 = .w & ~1u —— 必须掩掉
+    // 低位，否则 33 会被 loadSectionVertex 当成"非 32B"而按 48B 读。
+    // 三角形 t（= gl_PrimitiveID）的三个角：
+    //   t 偶 ⇒ 4q+0, 4q+1, 4q+2；t 奇 ⇒ 4q+0, 4q+2, 4q+3（q = t>>1）。
+    // 与非索引展开 (v0,v1,v2) / (v0,v2,v3) 逐角对应 ⇒ 重心坐标语义不变。
+    const bool indexedQuads =
+        (sectionAddressEntry.w & 1u) != 0u;
+
+    const uint sectionStride =
+        sectionAddressEntry.w & ~1u;
+
+    const uint primitiveId =
+        uint(gl_PrimitiveID);
+
+    uint i0;
+    uint i1;
+    uint i2;
+
+    if(indexedQuads)
+    {
+        const uint quadBase =
+            (primitiveId >> 1u) * 4u;
+
+        if((primitiveId & 1u) == 0u)
+        {
+            i0 = quadBase;
+            i1 = quadBase + 1u;
+            i2 = quadBase + 2u;
+        }
+        else
+        {
+            i0 = quadBase;
+            i1 = quadBase + 2u;
+            i2 = quadBase + 3u;
+        }
+    }
+    else
+    {
+        i0 = primitiveId * 3u;
+        i1 = i0 + 1u;
+        i2 = i0 + 2u;
+    }
+
+    Vertex v0 = loadSectionVertex(rawAddr, sectionStride, i0);
+    Vertex v1 = loadSectionVertex(rawAddr, sectionStride, i1);
+    Vertex v2 = loadSectionVertex(rawAddr, sectionStride, i2);
+
+    vec3 barycentrics = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
+
+    // === 远场去重（Vista 模型）===
+    // 几何角色来自 binding 19 的角色表，不再是顶点里的 pad1 暗号。
+    // 命中点落在近场已就绪的 chunk 柱上时，远场命中只是同一片几何的粗表示，直接丢弃。
+    const uint instanceRole = lodInstanceRole();
+    const vec3 hitWorldPosition =
+        vec3(v0.x, v0.y, v0.z) * barycentrics.x +
+        vec3(v1.x, v1.y, v1.z) * barycentrics.y +
+        vec3(v2.x, v2.y, v2.z) * barycentrics.z;
+
+    if(lodHitIsRedundant(instanceRole, hitWorldPosition))
+    {
+        ignoreIntersectionEXT;
+        return;
+    }
+
+    float interpU = v0.u * barycentrics.x + v1.u * barycentrics.y + v2.u * barycentrics.z;
+    float interpV = v0.v * barycentrics.x + v1.v * barycentrics.y + v2.v * barycentrics.z;
+    vec2 texCoord = vec2(interpU, interpV);
+
+    float materialId =
+        v0.materialId * barycentrics.x +
+        v1.materialId * barycentrics.y +
+        v2.materialId * barycentrics.z;
+
+    float voxyAnyHitMarker =
+        v0.pad1 * barycentrics.x +
+        v1.pad1 * barycentrics.y +
+        v2.pad1 * barycentrics.z;
+    // 2026-10-03：与 rt_test.rchit 同源修复 —— pad1 数值暗号会撞车（雨条 marker
+    // = -2 与 voxy 的岩浆/光源标记 -2 完全相同），改为**认角色表**：只有
+    // LOD_ROLE_VOXY_LOD 的实例才走 voxy 分支，雨/粒子/实体保持自己的路径。
+    // 2026-10-03 决定性与 rchit 同名块一致：**voxy 分类默认关闭**（VOXY_LOD_ENABLE），
+    // 否则实体/粒子/雨滴的负 pad1 标记会被误判成 voxy，整条动态几何被 alpha 剪裁吞掉。
+#ifndef VOXY_LOD_ENABLE
+#define VOXY_LOD_ENABLE 0
+#endif
+    bool isVoxyAnyHit =
+        VOXY_LOD_ENABLE != 0 && voxyAnyHitMarker < -0.5 && materialId > 0.5;
+
+    // DH 远场几何不做 alpha cutout：
+    // 它的顶点 a 是打包光照 (skyLight<<4)|blockLight，不是 alpha ⇒ 无光格 a=0 会被
+    // 下面的 combinedAlpha 判据整片剔掉（空洞 / 看穿地形）。DH 目前走的是
+    // SBT_RECORD_ALPHA（translucent 的 any-hit），这里是护栏：万一路由改了，
+    // 不要因为一个数据字节把几何静默吃掉。理由详见 rt_test_translucent.rahit 同名块。
+    //
+    // ★ 判据由 pad1 < -2.5 改为角色表：pad1 现在只表示 DH 材质编号，
+    //   不再兼任"是不是远场"的选址暗号（见 lod_coverage.glsl 顶部说明）。
+    if(instanceRole == LOD_ROLE_DH_FAR)
+    {
+        return;
+    }
+
+    float encodedTextureSlot =
+        isVoxyAnyHit ? 0.0 :
+        (v0.pad2 * barycentrics.x +
+         v1.pad2 * barycentrics.y +
+         v2.pad2 * barycentrics.z);
+    uint entityTextureSlot = encodedTextureSlot > 0.5
+        ? uint(round(encodedTextureSlot)) : 0u;
+    uint particleTextureSlot = encodedTextureSlot < -0.5
+        ? uint(round(-encodedTextureSlot)) : 0u;
+    float particleMarker =
+        v0.pad1 * barycentrics.x +
+        v1.pad1 * barycentrics.y +
+        v2.pad1 * barycentrics.z;
+    bool isRtWeatherRain =
+        particleTextureSlot != 0u &&
+        particleMarker < -1.5;
+
+    // Rain should be visible only to the primary camera.  It must never
+    // shadow, occlude AO/GI/reflections, or participate in water/interface
+    // classification.
+    //
+    // 2026-09-20: extended from weather rain to EVERY captured particle.
+    // A particle quad is a camera-facing billboard, not world geometry, so
+    // any secondary ray hit turns into a hard parallelogram artefact: an
+    // invisible caster dropped a solid dark footprint onto the water floor
+    // (sun visibility) and the underwater view was silhouetted by sprites
+    // (water transmission).  Particles stay visible to the primary camera
+    // ray exactly as before; they simply stop being occluders.
+    if(particleTextureSlot != 0u && getRayPurpose(payload.state) != RT_PURPOSE_PRIMARY_SKY)
+    {
+        ignoreIntersectionEXT;
+        return;
+    }
+
+    // =====================================================
+    // T1-2 Straight transparent continuation
+    //
+    // Only the dedicated continuation ray ignores generic
+    // translucent terrain (vertex materialId=2). Normal primary,
+    // AO, sun and Local-Light visibility behavior is unchanged.
+    // =====================================================
+    bool transparentPassthrough =
+        getRayPurpose(payload.state) == RT_PURPOSE_PASSTHROUGH;
+
+
+    // 提取顶点颜色 / Alpha 与图集颜色 / Alpha。
+    // The alpha test defines the visible cutout silhouette.  It must
+    // use the same unfiltered base-atlas texel as closest-hit, otherwise
+    // linear filtering turns foliage and grass into semi-transparent blur.
+    vec4 atlasSample;
+    if(isVoxyAnyHit)
+    {
+        // Voxy LOD quads carry their resolved alpha in the vertex colour;
+        // their (u, v) are atlas-mip coordinates, not Minecraft atlas UVs.
+        atlasSample = vec4(1.0);
+    }
+    else if(isRtWeatherRain)
+    {
+        // Each weather quad selects one tile from the dedicated RGBA streak
+        // atlas.  The authored alpha replaces the analytic rectangle mask.
+        atlasSample = textureLod(rainStreakAtlas, texCoord, 0.0);
+    }
+    else if(particleTextureSlot != 0u)
+    {
+        atlasSample = sampleParticleAlphaAtlas(particleTextureSlot, texCoord);
+    }
+    else if(entityTextureSlot != 0u)
+    {
+        atlasSample = sampleEntityAlphaAtlas(entityTextureSlot, texCoord);
+    }
+    else
+    {
+        ivec2 atlasSize = textureSize(blockAtlas, 0);
+        ivec2 atlasTexel = ivec2(
+            clamp(
+                floor(texCoord * vec2(atlasSize)),
+                vec2(0.0),
+                vec2(atlasSize) - vec2(1.0)
+            )
+        );
+        atlasSample = texelFetch(blockAtlas, atlasTexel, 0);
+    }
+
+
+    // =====================================================
+    // CLASSIFY ray fast path
+    //
+    // Water sun-transmittance/classification rays must never
+    // be discarded by foliage alpha or transparent traversal.
+    // The closest-hit shader owns the final material state.
+    // =====================================================
+    if(getRayPurpose(payload.state) == RT_PURPOSE_CLASSIFY)
+    {
+        return;
+    }
+
+
+    vec4 vertexColor =
+        vec4(
+            v0.r,
+            v0.g,
+            v0.b,
+            v0.a
+        ) *
+        barycentrics.x +
+        vec4(
+            v1.r,
+            v1.g,
+            v1.b,
+            v1.a
+        ) *
+        barycentrics.y +
+        vec4(
+            v2.r,
+            v2.g,
+            v2.b,
+            v2.a
+        ) *
+        barycentrics.z;
+
+
+    float combinedAlpha =
+        atlasSample.a *
+        vertexColor.a;
+
+
+    // The authored rain atlas carries anti-aliased low-alpha edges.  Keep
+    // those edges instead of applying the foliage/particle cutout threshold;
+    // all other material routes retain their established 0.1 cutoff.
+    float alphaCutoff = isRtWeatherRain ? 0.025 : 0.1;
+
+    // =====================================================
+    // 2026-10-01：玻璃"全覆盖"（GI_GLASS_FULL_COVERAGE），与
+    // rt_test_translucent.rahit 的同名块一致：玻璃在追踪器里是几何边界，覆盖率
+    // 由几何决定，透明度由材质（染料/透射权重）表达。口径见
+    // docs/GLASS_COVERAGE_20260914.md：
+    //   "Glass blocks and panes use opaque coverage ... Base texture alpha neither
+    //    removes surface samples nor scales transmission."
+    // 之前这条会把 alpha < 0.1 的玻璃命中整片剔掉 ⇒ 玻璃上出现针孔/缺角。
+    // 只绕过 cutout，后面的可见性（GLASS_VISIBILITY）分支行为不变。
+    // A/B：-DGI_GLASS_FULL_COVERAGE=0
+    // =====================================================
+#ifndef GI_GLASS_FULL_COVERAGE
+#define GI_GLASS_FULL_COVERAGE 1
+#endif
+
+    bool glassFullCoverage =
+        GI_GLASS_FULL_COVERAGE != 0 &&
+        materialId >= 2.0 &&
+        materialId < 2.5;
+
+    // 2026-10-06 末地传送门：类 7 = **不裁切**（见 EntityRtCapture.MATERIAL_CLASS_UNCUTOUT）。
+    // end_portal.png 是**大片透明的星幕**，走下面的 cutout 会被整片剔掉 ⇒ 观感就是
+    // "门没渲染"。实测日志已证明捕获链路全对（geometry captured / 贴图正确 / 槽位 28 /
+    // 无 slot table full）⇒ 只剩裁切这一环。只对类 7 放行，其余实体/粒子/雨照旧。
+    // 类号编码在纹理槽的**小数位**（Java: textureSlot + class/32 ⇒ rchit 用
+    // floor(fract(slot)*32 + 0.5) 解），这里用同一个约定。
+    bool uncutoutEntity = false;
+    if(entityTextureSlot != 0u)
+    {
+        float entityClass = floor(fract(encodedTextureSlot) * 32.0 + 0.5);
+        uncutoutEntity = entityClass > 6.5 && entityClass < 7.5;
+    }
+    if(!uncutoutEntity && !glassFullCoverage && combinedAlpha < alphaCutoff)
+    {
+        ignoreIntersectionEXT;
+        return;
+    }
+    if(isRtWeatherRain)
+    {
+        // Ray tracing has no fixed-function alpha blending here.  Use stable
+        // per-pixel coverage so the streak atlas alpha reveals the background
+        // instead of turning every surviving texel into an opaque card.
+        uint coverageSeed =
+            gl_LaunchIDEXT.x * 0x9E3779B9u ^
+            gl_LaunchIDEXT.y * 0x85EBCA6Bu ^
+            uint(gl_PrimitiveID) * 0xC2B2AE35u;
+        coverageSeed ^= coverageSeed >> 16u;
+        coverageSeed *= 0x7FEB352Du;
+        coverageSeed ^= coverageSeed >> 15u;
+        coverageSeed *= 0x846CA68Bu;
+        coverageSeed ^= coverageSeed >> 16u;
+        float coverageNoise = float(coverageSeed & 0x00FFFFFFu) *
+            (1.0 / 16777216.0);
+        if(coverageNoise >= combinedAlpha)
+        {
+            ignoreIntersectionEXT;
+            return;
+        }
+    }
+    if(
+    transparentPassthrough &&
+    materialId >= 2.0 &&
+    materialId < 2.5
+)
+{
+    ignoreIntersectionEXT;
+    return;
+}
+
+
+    // =====================================================
+    // T1/T9/T3 COMBINED - colored visibility through glass
+    //
+    // -3 visibility rays are used by Sun / Local Light / AO.
+    // Glass must NOT terminate them.
+    //
+    // We accumulate RGB transmittance in payload.albedo.
+    // Opaque geometry is still accepted and terminates normally.
+    // =====================================================
+
+    bool glassVisibilityOnly =
+        getRayPurpose(payload.state) == RT_PURPOSE_GLASS_VISIBILITY;
+
+
+if(
+    glassVisibilityOnly &&
+    materialId >= 2.0 &&
+    materialId < 2.5
+)
+    {
+        // The rain-puddle path reuses this visibility ray.  Preserve a
+        // coverage bit even for clear glass, whose RGB transmission can be
+        // exactly white and therefore cannot identify a roof by colour.
+        payload.glassAlpha = 1.0;
+
+        // The visibility ray is receiver -> emitter.  For each traversed
+        // glass block its first accepted face is the real light-exit face;
+        // only that face receives the Orion boundary sheet, so one
+        // block contributes exactly one filter.
+        uint glassFaceOrdinal =
+            uint(
+                max(
+                    floor(payload.parallaxRayTravel + 0.5),
+                    0.0
+                )
+            );
+
+        bool isLightExitFace =
+            (glassFaceOrdinal & 1u) == 0u;
+
+        payload.parallaxRayTravel =
+            float(glassFaceOrdinal + 1u);
+
+
+        if(isLightExitFace)
+        {
+            vec3 pos0 = vec3(v0.x, v0.y, v0.z);
+            vec3 pos1 = vec3(v1.x, v1.y, v1.z);
+            vec3 pos2 = vec3(v2.x, v2.y, v2.z);
+
+            vec3 geometricNormal =
+                normalize(
+                    cross(pos1 - pos0, pos2 - pos0)
+                );
+
+            vec3 glassTint =
+                glassPaneTransmissionColor(
+                    atlasSample.rgb,
+                    vertexColor.rgb
+                );
+
+#ifndef GI_SUN_POOL_SATURATION
+// 2026-10-05 G8 太阳彩色透射光斑：太阳路径的玻璃染色对齐本地光路径的
+// 峰值保饱和处理（vptSaturateGlassTransmission，×3 峰值保持）。此前太阳
+// 路径用原始染色 ⇒ 彩玻光斑比本地光路径的褪灰、不鲜艳。峰值保持 =
+// 主通道能量不变、只去灰 ⇒ 不加能量不压暗；白色/灰色玻璃恒等 ⇒ 逐位旧档。
+// （原注释"deliberately local-light only"的Scope差异就此对齐。）
+#define GI_SUN_POOL_SATURATION 1
+#endif
+#if GI_SUN_POOL_SATURATION
+            glassTint =
+                vptSaturateGlassTransmission(
+                    clamp(glassTint, vec3(0.0), vec3(1.0))
+                );
+#endif
+            float glassCosTheta =
+                clamp(
+                    abs(dot(geometricNormal, gl_WorldRayDirectionEXT)),
+                    0.0,
+                    1.0
+                );
+
+            payload.albedo *=
+                glassSheetTransmissionScalarF(
+                    glassTint,
+                    glassCosTheta
+                ) *
+                getTransparentProfileTransmissionAnyHit(
+                    getTransparentProfileFromRawMaterialId(materialId)
+                );
+        }
+
+
+        // =====================================================
+        // 2026-10-17：玻璃穿层预算（可见性射线）—— 与
+        // rt_test_translucent.rahit 的同名块逐字同源（那份有完整推导）。
+        // 玻璃不终止可见性射线，只累乘透射色，此前没有上限 ⇒ 太阳/AO/本地光
+        // 的层数成本无界。这里补齐"累计透射 < 1%（= 太阳 march 的 W2 阈值）
+        // 或面数超限 ⇒ 当遮挡收尾"的口径。
+        // A/B：-DGI_GLASS_VISIBILITY_BUDGET=0 ⇒ 逐位回到旧档。
+        // =====================================================
+#ifndef GI_GLASS_VISIBILITY_BUDGET
+#define GI_GLASS_VISIBILITY_BUDGET 1
+#endif
+#ifndef GI_GLASS_VISIBILITY_MIN_TRANSMITTANCE
+#define GI_GLASS_VISIBILITY_MIN_TRANSMITTANCE 0.01
+#endif
+#ifndef GI_GLASS_VISIBILITY_MAX_FACES
+#define GI_GLASS_VISIBILITY_MAX_FACES 16
+#endif
+#if GI_GLASS_VISIBILITY_BUDGET
+        if(
+            max(
+                payload.albedo.r,
+                max(payload.albedo.g, payload.albedo.b)
+            ) < GI_GLASS_VISIBILITY_MIN_TRANSMITTANCE ||
+            glassFaceOrdinal + 1u >= uint(GI_GLASS_VISIBILITY_MAX_FACES)
+        )
+        {
+            return;
+        }
+#endif
+
+
+        ignoreIntersectionEXT;
+        return;
+    }
+}

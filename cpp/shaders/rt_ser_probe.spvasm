@@ -1,0 +1,35 @@
+; SPIR-V
+; Version: 1.5
+; Generator: Khronos Slang Compiler; 0
+; Bound: 13
+; Schema: 0
+OpCapability ShaderInvocationReorderEXT
+OpCapability RayTracingKHR
+OpCapability Shader
+OpExtension "SPV_EXT_shader_invocation_reorder"
+OpExtension "SPV_KHR_ray_tracing"
+OpMemoryModel Logical GLSL450
+OpEntryPoint RayGenerationKHR %main "main"
+
+; Debug Information
+OpSource Slang 1
+OpName %hit "hit"                                   ; id %7
+OpName %hit "hit"                                   ; id %7
+OpName %main "main"                                 ; id %2
+
+; Types, variables and constants
+%void = OpTypeVoid
+%3 = OpTypeFunction %void
+%5 = OpTypeHitObjectEXT
+%_ptr_Function_5 = OpTypePointer Function %5
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+
+; Function main
+%main = OpFunction %void None %3
+%4 = OpLabel
+%hit = OpVariable %_ptr_Function_5 Function
+OpHitObjectRecordEmptyEXT %hit
+OpReorderThreadWithHitObjectEXT %hit %uint_0 %uint_0
+OpReturn
+OpFunctionEnd

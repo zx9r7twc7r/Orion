@@ -1,0 +1,278 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// Resolve the raw half-resolution volume against its own history.  Keeping
+// this separate from the march permits neighborhood clipping before history
+// is accumulated, which is essential at cloud edges and during camera turns.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+layout(set = 0, binding = 1) uniform sampler2D cloudCurrent;
+layout(set = 0, binding = 2) uniform sampler2D cloudHistory;
+layout(set = 0, binding = 3) uniform sampler2D cloudCurrentDepth;
+layout(set = 0, binding = 4) uniform sampler2D cloudHistoryDepth;
+layout(rgba16f, set = 0, binding = 5) uniform writeonly image2D cloudResolved;
+
+const float CLOUD_DEPTH_EMPTY = 1000000.0;
+
+// 时域上限（CLOUD_HISTORY_WEIGHT_MAX）。这是本 pass 的硬上限，主控值来自
+// cloudParams2.w（C++ populateCloudParams 按档位/模式填）：
+//   · 云进 RR 时 = 0.38~0.55（≈2 帧，短 history 防云缘拖影，见 C++ 注释）；
+//   · 云脱离 RR 时 = 0.90（≈10 帧）——RR 的长期 history 已不在，本 pass 是云
+//     唯一的时域源，短 history 会让 march 的逐帧抖动不收敛（实测闪烁能量集中在
+//     低频 ⇒ 空间滤波压不掉，只能靠时域）。
+// 上限抬到 0.95 以免钳住 0.90；低于 0.5 会开始闪，别再把主控值往下压。
+#ifndef CLOUD_HISTORY_WEIGHT_MAX
+#define CLOUD_HISTORY_WEIGHT_MAX 0.95
+#endif
+
+// ── #4 2026-10-10：按相机速度的连续时域抑制 ────────────────────
+// 参考 C3_UpscaleClouds.comp 的
+//     mix(currentSample, texture(cloudTexFeedback, coord), exp(-0.002*cameraVelocity))
+// 用一条连续指数衰减取代本工程下面那个 `speed > 8 ? 0.58 : 0.95` 的**硬台阶**。
+// 台阶的问题：相机速度在 8 格/s 附近抖动时 history 权重会在 0.95 与 0.58 之间
+// 跳变，云在那一档速度下会"忽明忽暗/忽糊忽利"。指数衰减是连续的，速度越高越
+// 平滑地降低历史依赖，正好对应"转视角/飞得快时不要留拖影"。
+// 强度（cam.cloudTemporalParams.z）为 0 ⇒ 不动旧档那一行 ⇒ 逐位不变。
+//
+// 系数按本工程的单位标定：playerVelocityAndSpeed.w 是格/秒 ⇒ 20 格/s 时保留
+// exp(-0.4)=0.67、60 格/s 时 exp(-1.2)=0.30、100 格/s 时 exp(-2.0)=0.135。
+#ifndef CLOUD_VELOCITY_DAMP
+#define CLOUD_VELOCITY_DAMP 0.02
+#endif
+
+bool reprojectCloudHistory(vec3 worldPosition, out vec2 historyUV)
+{
+    if(cam.historyValid == 0u || cam.playerVelocityAndSpeed.w > 32.0)
+    {
+        return false;
+    }
+    vec3 previousCamera = cam.prevViewInverse[3].xyz;
+    mat3 previousViewRotation = transpose(mat3(cam.prevViewInverse));
+    vec3 previousViewPosition = previousViewRotation * (worldPosition - previousCamera);
+    float depth = max(abs(previousViewPosition.z), 1.0e-4);
+    vec2 projectionScale = max(abs(vec2(cam.prevProjInverse[0][0],
+        cam.prevProjInverse[1][1])), vec2(1.0e-4));
+    vec2 previousNdc = previousViewPosition.xy / (depth * projectionScale);
+    historyUV = vec2(previousNdc.x, -previousNdc.y) * 0.5 + 0.5;
+    return all(greaterThan(historyUV, vec2(0.002))) &&
+        all(lessThan(historyUV, vec2(0.998)));
+}
+
+vec3 worldDirectionForPixel(ivec2 pixel, ivec2 size)
+{
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+    vec2 ndc = uv * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    vec4 viewPosition = cam.projInverse * vec4(ndc, 1.0, 1.0);
+    vec3 viewDirection = normalize(abs(viewPosition.w) > 1.0e-6
+        ? viewPosition.xyz / viewPosition.w : viewPosition.xyz);
+    return normalize((cam.viewInverse * vec4(viewDirection, 0.0)).xyz);
+}
+
+// ── 2026-10-06 空间降噪（深度感知双边）—— 实测无效，默认关闭保留 ──────────────
+// 曾试图用它补回 RR 剥离后的降噪，但抽帧实测：云区闪烁能量 5×5 模糊只削 25%、
+// 25×25 仍保留 54% ⇒ 闪烁主要在低频、且非整体位移（补偿位移只降 2-5%），是纯
+// 时域问题，空间滤波压不掉、只会把画面抹糊。真正的解法是长时域累积（见上方
+// CLOUD_HISTORY_WEIGHT_MAX）。此处保留实现供 A/B：CLOUD_SPATIAL_RADIUS = 2 开
+// （5×5），0 = 关（默认，逐位回旧档）。
+#ifndef CLOUD_SPATIAL_RADIUS
+#define CLOUD_SPATIAL_RADIUS 0
+#endif
+
+// ── 2026-10-08：长时域"为什么没救回来"的根因与修法 ──────────────────────────
+// 上面那条实测结论是对的（空间压不掉），但它把病因记成了"history 不够长"。真正的
+// 断点在下面混合处那一句 `historyWeight *= 1 - smoothstep(0.06, 0.30, |Δa|)`：
+// 云的**抖动**发生在轮廓边缘，而边缘处 currentCloud.a 与 historyCloud.a 必然差
+// 接近 1（一个是有云、一个是天空）⇒ 拒绝项恒为 0 ⇒ 0.90 的长 history 恰好在最
+// 需要它的那一圈像素上被整段关掉。于是"加长 history"对边缘零作用，而远端云因此
+// 永远停在 ≈2 帧的水平上闪 —— 完全解释了"低频、非位移、空间压不掉"。
+//
+// 修法：把"边缘"分成两类再决定要不要拒历史 ——
+//   · 真移动的轮廓（风/演化/转身）：当前帧本身干净 ⇒ 邻域透射率 σ_a 小 ⇒ 维持拒绝；
+//   · 噪声型边缘（march 逐帧抖动）：当前帧邻域本身就是云/天空混杂 ⇒ σ_a 大 ⇒
+//     把拒绝项抬到不低于 CLOUD_EDGE_REJECT_FLOOR，让长 history 仍然起作用。
+// 这正好与上面那条实测自洽：抖动能量是低频的、无法用空间核消掉，但它在**时域**
+// 上是可以被长 history 平均掉的 —— 前提是 history 别在这一圈被拒掉。
+//
+// 只对**真正脱离 RR**的长时域档生效（gate 乘上 smoothstep(0.84, 0.90, cloudParams2.w)）：
+//   旧档（云仍进 RR）w = 0.72~0.80 ⇒ gate = 0 ⇒ 数学上逐位不变；
+//   脱离 RR 档        w = 0.90    ⇒ gate = 1 ⇒ 启用。
+// ⚠ 初版我写的是 smoothstep(0.60, 0.80, w)，误以为旧档是 0.38~0.58（那是
+//   2026-10-06 之前的旧值）。结果门在旧档上有 65%~100% 开着，用户实测
+//   "远处的云太模糊"。这个窗口值就是那次事故的修正，别再改回去。
+#ifndef CLOUD_EDGE_NOISE_GATE
+#define CLOUD_EDGE_NOISE_GATE 1
+#endif
+// 抖动边缘处允许保留的 history 权重比例（相对未拒绝时）。0 = 旧档行为。
+#ifndef CLOUD_EDGE_REJECT_FLOOR
+#define CLOUD_EDGE_REJECT_FLOOR 0.45
+#endif
+
+vec4 spatialDenoise(ivec2 pixel, ivec2 size, vec4 center, float centerDistance)
+{
+#if CLOUD_SPATIAL_RADIUS > 0
+    ivec2 limit = size - ivec2(1, 1);
+    vec3 colorSum = center.rgb;
+    float alphaSum = center.a;
+    float weightSum = 1.0;
+    const float depthTolerance = max(32.0, centerDistance * 0.06);
+    for(int y = -CLOUD_SPATIAL_RADIUS; y <= CLOUD_SPATIAL_RADIUS; ++y)
+    for(int x = -CLOUD_SPATIAL_RADIUS; x <= CLOUD_SPATIAL_RADIUS; ++x)
+    {
+        if(x == 0 && y == 0)
+        {
+            continue;
+        }
+        ivec2 samplePixel = clamp(pixel + ivec2(x, y), ivec2(0), limit);
+        vec4 sampleCloud = texelFetch(cloudCurrent, samplePixel, 0);
+        float sampleDistance = texelFetch(cloudCurrentDepth, samplePixel, 0).r;
+        // 深度差 → 权重；天空邻居距离是空值(1e6)，差值极大 ⇒ 权重 0。
+        float depthWeight = exp(-abs(sampleDistance - centerDistance) / depthTolerance);
+        // 同深度内再按透射率接近度加权，保住云内密度梯度。
+        float alphaWeight = exp(-abs(sampleCloud.a - center.a) * 6.0);
+        float weight = depthWeight * alphaWeight;
+        colorSum += sampleCloud.rgb * weight;
+        alphaSum += sampleCloud.a * weight;
+        weightSum += weight;
+    }
+    center = vec4(colorSum / weightSum, alphaSum / weightSum);
+#endif
+    return center;
+}
+
+// sigmaAlpha = 当前帧 3×3 邻域透射率的标准差。它区分两类边缘（见文件头）：
+// 大 = 云/天空在本帧邻域里混杂 ⇒ 噪声型边缘（该放历史进来）；
+// 小 = 本帧轮廓干净 ⇒ 真移动的边缘（该继续拒历史）。
+vec4 clampHistoryToNeighborhood(
+    vec4 history, ivec2 pixel, ivec2 size, out float sigmaAlpha)
+{
+    vec3 minimumColor = vec3(1.0e20);
+    vec3 maximumColor = vec3(-1.0e20);
+    float minimumTransmittance = 1.0e20;
+    float maximumTransmittance = -1.0e20;
+    float transmittanceSum = 0.0;
+    float transmittanceSquareSum = 0.0;
+    for(int y = -1; y <= 1; ++y)
+    for(int x = -1; x <= 1; ++x)
+    {
+        ivec2 samplePixel = clamp(pixel + ivec2(x, y), ivec2(0), size - 1);
+        vec4 sampleCloud = texelFetch(cloudCurrent, samplePixel, 0);
+        minimumColor = min(minimumColor, sampleCloud.rgb);
+        maximumColor = max(maximumColor, sampleCloud.rgb);
+        minimumTransmittance = min(minimumTransmittance, sampleCloud.a);
+        maximumTransmittance = max(maximumTransmittance, sampleCloud.a);
+        transmittanceSum += sampleCloud.a;
+        transmittanceSquareSum += sampleCloud.a * sampleCloud.a;
+    }
+    float meanTransmittance = transmittanceSum / 9.0;
+    sigmaAlpha = sqrt(max(
+        transmittanceSquareSum / 9.0 - meanTransmittance * meanTransmittance, 0.0));
+    vec3 colorRange = max(maximumColor - minimumColor, vec3(0.025));
+    float transmittanceRange = max(maximumTransmittance - minimumTransmittance, 0.025);
+    history.rgb = clamp(history.rgb, minimumColor - colorRange * 0.25,
+        maximumColor + colorRange * 0.25);
+    history.a = clamp(history.a, minimumTransmittance - transmittanceRange * 0.25,
+        maximumTransmittance + transmittanceRange * 0.25);
+    return history;
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(cloudResolved);
+    if(any(greaterThanEqual(pixel, size)))
+    {
+        return;
+    }
+
+    vec4 currentCloud = texelFetch(cloudCurrent, pixel, 0);
+    // 批次2-T2c：.g 是重投影距离（透射率加权平均云深）。旧 r32f 帧或关闭档
+    // 下 .g 无效（0 或空），回落 .r 首命中 —— 混帧安全。
+    vec4 currentDepthTexel = texelFetch(cloudCurrentDepth, pixel, 0);
+    float currentDistance = currentDepthTexel.r;
+    float reprojectDistance = currentDepthTexel.g;
+    if(reprojectDistance <= 0.0 || reprojectDistance >= CLOUD_DEPTH_EMPTY)
+    {
+        reprojectDistance = currentDistance;
+    }
+    if(currentDistance >= CLOUD_DEPTH_EMPTY)
+    {
+        imageStore(cloudResolved, pixel, currentCloud);
+        return;
+    }
+
+    // 空间降噪只在有云的像素上跑（纯天空上面已提前返回）。放在时域混合之前：
+    // 进 history 的与最终写出的都已经是降噪后的信号。
+    currentCloud = spatialDenoise(pixel, size, currentCloud, currentDistance);
+
+    vec3 cameraPosition = (cam.viewInverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+    vec3 historyPoint = cameraPosition + worldDirectionForPixel(pixel, size) * reprojectDistance;
+    vec2 historyUV;
+    if(reprojectCloudHistory(historyPoint, historyUV))
+    {
+        ivec2 historyPixel = clamp(ivec2(historyUV * vec2(size)), ivec2(0), size - 1);
+        vec4 historyDepthTexel = texelFetch(cloudHistoryDepth, historyPixel, 0);
+        float previousDistance = historyDepthTexel.r;
+        float previousReproject = historyDepthTexel.g;
+        if(previousReproject <= 0.0 || previousReproject >= CLOUD_DEPTH_EMPTY)
+        {
+            previousReproject = previousDistance;
+        }
+        float expectedDistance = length(historyPoint - cam.prevViewInverse[3].xyz);
+        float depthTolerance = max(64.0, expectedDistance * 0.08);
+        if(previousDistance < CLOUD_DEPTH_EMPTY &&
+            previousReproject > 0.0 && previousReproject < CLOUD_DEPTH_EMPTY &&
+            abs(previousReproject - expectedDistance) <= depthTolerance)
+        {
+            float sigmaAlpha = 0.0;
+            vec4 historyCloud = clampHistoryToNeighborhood(
+                textureLod(cloudHistory, historyUV, 0.0), pixel, size, sigmaAlpha);
+            float historyWeight = min(cam.cloudParams2.w,
+                cam.playerVelocityAndSpeed.w > 8.0 ? 0.58 : CLOUD_HISTORY_WEIGHT_MAX);
+            // #4 连续速度抑制（见文件头宏说明）：只在强度 >0 时替换上面的硬台阶。
+            float temporalDampStrength = clamp(cam.cloudTemporalParams.z, 0.0, 1.0);
+            if(temporalDampStrength > 0.001)
+            {
+                float speedDamped = exp(
+                    -CLOUD_VELOCITY_DAMP * cam.playerVelocityAndSpeed.w);
+                historyWeight = min(cam.cloudParams2.w,
+                    mix(historyWeight, speedDamped, temporalDampStrength));
+            }
+            // Reject stale silhouettes instead of smearing them across the
+            // current edge when wind, evolution or a camera turn changes it.
+            float opacityDifference = abs(currentCloud.a - historyCloud.a);
+            float silhouetteReject = 1.0 - smoothstep(0.06, 0.30, opacityDifference);
+#if CLOUD_EDGE_NOISE_GATE
+            // 见文件头「长时域为什么没救回来」：抖动边缘的 |Δa| 恒接近 1 ⇒ 拒绝项
+            // 恒 0 ⇒ 长 history 恰好在最需要它的那一圈被关掉。这里按"边缘是噪声型
+            // 还是真移动"给拒绝项设下限 —— 两个门同时成立才放宽：
+            //   noiseGate       = 本帧邻域透射率 σ_a 大（混杂 ⇒ 抖动型边缘）
+            //   longHistoryGate = 本帧 history 权重说明在跑长时域（≥0.8 ⇒ 已脱离 RR）
+            // 云进 RR 的旧档 w ≤ 0.58 ⇒ longHistoryGate = 0 ⇒ 逐位不变。
+            // ⚠ 2026-10-08 修正（用户实测"远处的云太模糊"）：这个门必须**只对真正
+            // 脱离 RR 的长时域档**打开。初版我写的是 smoothstep(0.60, 0.80, w)，
+            // 前提是"云进 RR 的旧档只有 0.38~0.58"。那个前提是**错的** —— 2026-10-06
+            // 已把旧档抬到 0.72~0.80（见 VulkanCore.cpp 里 params[11] 的注释：
+            // 「抬到 0.68~0.80 …云缘的安全性由邻域裁剪 + 不透明度差抑制兜底」）。
+            // 于是这个门在**旧档上也有 65%~100% 开着**：本来该被拒掉的云缘旧历史
+            // 被强行加权 ⇒ 云缘被时域糊掉、远处云模糊。
+            // 现在窗口收到 0.84~0.90：旧档（≤0.80）恒为 0 ⇒ 逐位回到我改动之前；
+            // 只有脱离 RR 的 0.90 档才启用（那才是"需要长 history 救低频噪声"的场景）。
+            float noiseGate = smoothstep(0.02, 0.10, sigmaAlpha);
+            float longHistoryGate = smoothstep(0.84, 0.90, cam.cloudParams2.w);
+            silhouetteReject = mix(
+                silhouetteReject,
+                max(silhouetteReject, CLOUD_EDGE_REJECT_FLOOR),
+                noiseGate * longHistoryGate);
+#endif
+            historyWeight *= silhouetteReject;
+            currentCloud = mix(currentCloud, historyCloud, historyWeight);
+        }
+    }
+    imageStore(cloudResolved, pixel, currentCloud);
+}

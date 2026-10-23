@@ -1,0 +1,200 @@
+#version 460
+// =====================================================
+// 2026-09-28 P1 直接光（本地光 DI）专用 à-trous 降噪
+//
+// 移植自 MCVR（Minecraft-Radiance/MCVR，GPL-3.0）的
+//   src/shader/world/svgf/direct_atrous_step1.comp
+// 保留其三个决定性特征（这正是我们缺的东西）：
+//   1) 步长逐级翻倍（1/2/4/8/16）× 5x5 核 ⇒ 等效支持半径约 60px，
+//      而我们原来只有 13 tap（半径 2~3）；
+//   2) **边缘停止故意放松**（MCVR 自己的注释就叫 "EXTREME ... for maximum filtering"）：
+//      phiDepth 用深度梯度 × 步长 × 10，phiL 用 sqrt(方差) 并给下限；
+//   3) 显式的**萤火虫/离群点替换**：中心亮度 > 邻域均值×5 + 0.1 时用邻域均值顶替。
+//
+// 为什么这一项要这么狠：本地光这一项的估计量每帧是"一个样本的 f·W·V"，可见性 V 是
+// 二值量，时域平均后仍留一层细颗粒；MCVR 的做法不是去修估计量，而是在直接光这一项上
+// 放一个很大支持、且刻意不保边的空间滤波，把残余当噪声处理掉。
+//
+// 本文件是**链路里的一个中间 pass**，由 C++ 反复 dispatch，步长与 phiColor 走 push constant。
+// variance 在本 pass 内用 3x3 邻域现算（MCVR 用的是上一步传下来的方差图；第一版先不等它）。
+// =====================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// 复用与 rt_restir_reconstruct.comp 同一套描述符（同一个 RT descriptor set）：
+//   1  = 颜色图（本 pass 不用，但保持编号与其它 pass 一致）
+//   7  = 深度（HW depth，reverse-Z，与 dlssDepthImage 同源）
+//   15 = RR 的 normal-roughness guide（xyz = 法线）
+//   57/58 = 本 pass 的 ping-pong 输入/输出（C++ 需要新增这两个 binding）
+layout(binding = 1, set = 0, rgba16f) uniform image2D image;
+layout(binding = 7, set = 0, r32f) uniform readonly image2D depthImage;
+layout(binding = 15, set = 0, rgba16f) uniform readonly image2D normalRoughnessImage;
+layout(binding = 57, set = 0, rgba16f) uniform readonly image2D directDiInputImage;
+layout(binding = 58, set = 0, rgba16f) uniform writeonly image2D directDiOutputImage;
+
+layout(push_constant) uniform DirectAtrousPushConstants
+{
+    uint width;
+    uint height;
+    // 步长（1 / 2 / 4 / 8 / ...）。C++ 逐级递增。
+    uint stepSize;
+    // MCVR 的 kPhiColor（亮度边缘停止强度）。
+    float phiColor;
+    // 最后一步置 1：把滤波结果**加进颜色图**（与项目其它合成一致，带 6.0 亮度钳制），
+    // 而不是写进 ping-pong 输出。这样整条链只需要 5 次本 pass，不需要额外的合成 pass。
+    uint blendIntoColor;
+} atrousPush;
+
+const float ATROUS_PHI_NORMAL = 128.0;
+// 5x5 归一化核（1D: 1,2,3,2,1，和 = 9）
+const float ATROUS_KERNEL[5] = float[5](1.0, 2.0, 3.0, 2.0, 1.0);
+const float ATROUS_KERNEL_NORM = 9.0;
+// MCVR 对直接光把深度项乘 10（放松边缘停止）。这里保留同样的量级。
+const float ATROUS_DIRECT_PHI_DEPTH_SCALE = 10.0;
+
+float atrousLuminance(vec3 c)
+{
+    return dot(max(c, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 atrousNormalizeSafe(vec3 v)
+{
+    float len = length(v);
+    return (len > 1.0e-4) ? (v / len) : vec3(0.0, 0.0, 1.0);
+}
+
+void main()
+{
+    ivec2 size = ivec2(int(atrousPush.width), int(atrousPush.height));
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(pixel, size)))
+    {
+        return;
+    }
+
+    vec3 centerColor = max(imageLoad(directDiInputImage, pixel).rgb, vec3(0.0));
+    float centerDepth = imageLoad(depthImage, pixel).r;
+    vec3 centerNormal = atrousNormalizeSafe(imageLoad(normalRoughnessImage, pixel).xyz);
+
+    // ---- 3x3 邻域现算方差（第一版不做方差图沿链传递）----
+    vec3 neighborSum = vec3(0.0);
+    float neighborLumaSq = 0.0;
+    float neighborCount = 0.0;
+    for(int dy = -1; dy <= 1; ++dy)
+    {
+        for(int dx = -1; dx <= 1; ++dx)
+        {
+            ivec2 q = pixel + ivec2(dx, dy);
+            if(any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size)))
+            {
+                continue;
+            }
+            float l = atrousLuminance(imageLoad(directDiInputImage, q).rgb);
+            neighborSum += vec3(l);
+            neighborLumaSq += l * l;
+            neighborCount += 1.0;
+        }
+    }
+
+    vec3 varianceResult = vec3(0.0);
+    if(neighborCount > 0.0)
+    {
+        float mean = neighborSum.x / neighborCount;
+        float variance = max(neighborLumaSq / neighborCount - mean * mean, 0.0);
+        varianceResult = vec3(variance);
+
+        // ---- 萤火虫/离群点替换（照抄 MCVR 的判据：> 邻域均值*5 + 0.1）----
+        vec3 meanNeighbors = neighborSum / neighborCount;
+        if(atrousLuminance(centerColor) > atrousLuminance(meanNeighbors) * 5.0 + 0.1)
+        {
+            centerColor = meanNeighbors;
+            varianceResult.x = min(varianceResult.x, 0.1);
+        }
+    }
+
+    // ---- 边缘停止系数（MCVR 对直接光的"极端放松"版本）----
+    float centerLum = atrousLuminance(centerColor);
+
+    float depthDx = 0.0;
+    float depthDy = 0.0;
+    if(pixel.x + 1 < size.x)
+    {
+        depthDx = abs(centerDepth - imageLoad(depthImage, pixel + ivec2(1, 0)).r);
+    }
+    if(pixel.y + 1 < size.y)
+    {
+        depthDy = abs(centerDepth - imageLoad(depthImage, pixel + ivec2(0, 1)).r);
+    }
+    float depthFwidth = max(max(depthDx, depthDy), 1.0e-4);
+    float phiDepth =
+        depthFwidth * float(atrousPush.stepSize) * ATROUS_DIRECT_PHI_DEPTH_SCALE;
+    float phiL = max(atrousPush.phiColor * sqrt(max(varianceResult.x, 0.0)), 1.0);
+
+    float sumW = 1.0;
+    vec3 sumC = centerColor;
+
+    for(int dy = -2; dy <= 2; ++dy)
+    {
+        for(int dx = -2; dx <= 2; ++dx)
+        {
+            if(dx == 0 && dy == 0)
+            {
+                continue;
+            }
+
+            ivec2 q = pixel + ivec2(dx, dy) * int(atrousPush.stepSize);
+            if(any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size)))
+            {
+                continue;
+            }
+
+            vec3 c = max(imageLoad(directDiInputImage, q).rgb, vec3(0.0));
+            float d = imageLoad(depthImage, q).r;
+            vec3 n = atrousNormalizeSafe(imageLoad(normalRoughnessImage, q).xyz);
+            float lum = atrousLuminance(c);
+
+            float wNormal = 1.0;
+            if(atrousPush.phiColor > 0.0)
+            {
+                // 法线项：MCVR 的 computeWeight 里 wNormal 先置 1（本 pass 不用法线区分），
+                // 但下面的 φ 距离里仍保留法线一致性检查，避免跨面漏光。
+                wNormal = dot(centerNormal, n) > 0.0 ? 1.0 : 0.0;
+            }
+
+            float wZ = abs(centerDepth - d) / max(phiDepth * length(vec2(float(dx), float(dy))), 1.0e-4);
+            float wL = abs(centerLum - lum) / max(phiL, 1.0e-4);
+            float w = exp(-max(wL, 0.0) - max(wZ, 0.0)) * wNormal;
+
+            float wK = w * (ATROUS_KERNEL[abs(dx)] * ATROUS_KERNEL[abs(dy)] /
+                (ATROUS_KERNEL_NORM * ATROUS_KERNEL_NORM));
+            sumC += c * wK;
+            sumW += wK;
+        }
+    }
+
+    vec3 filtered = sumC / max(sumW, 1.0e-4);
+
+    if(atrousPush.blendIntoColor != 0u)
+    {
+        // 最后一步：加回颜色图，并套用与项目其它合成一致的 6.0 亮度钳制
+        //（reconstruct 走 TERM_OUTPUT 时不再自己钳制，钳制挪到这里，语义不变）。
+        vec4 base = imageLoad(image, pixel);
+        vec3 combined = base.rgb + filtered;
+        float combinedLuminance = atrousLuminance(combined);
+        if(combinedLuminance > 6.0)
+        {
+            combined *= 6.0 / combinedLuminance;
+        }
+        imageStore(image, pixel, vec4(combined, base.a));
+    }
+    else
+    {
+        // 输入图是 NRD 的 IN_DIFF_RADIANCE_HITDIST（rgb = 本地光辐照度，a = 光源距离）。
+        // 只滤波 rgb，**原样透传 a**：composite 那边按同一约定读它。
+        imageStore(
+            directDiOutputImage,
+            pixel,
+            vec4(filtered, imageLoad(directDiInputImage, pixel).a)
+        );
+    }
+}

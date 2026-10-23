@@ -1,0 +1,356 @@
+plugins {
+	id 'net.fabricmc.fabric-loom' version "${loom_version}"
+	id 'maven-publish'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+repositories {
+	// Add repositories to retrieve artifacts from in here.
+	// You should only use this when depending on other mods because
+	// Loom adds the essential maven repositories to download Minecraft and libraries from automatically.
+	// See https://docs.gradle.org/current/userguide/declaring_repositories.html
+	// for more information about repositories.
+}
+
+loom {
+	splitEnvironmentSourceSets()
+
+	mods {
+		"orion" {
+			sourceSet sourceSets.main
+			sourceSet sourceSets.client
+		}
+	}
+
+	runs {
+		client {
+			// 2026-10-11：把 NMT 放进 gradle 的运行配置，这样"从 IDE 点运行"和"走
+			// tools/perf_step0.py 起 gradle"两条路都会带上它。上一轮用
+			// JAVA_TOOL_OPTIONS 注入的做法在用户的实际启动方式下没生效 ——
+			// latest.log 里是 "Native memory tracking is not enabled"。
+			// 打开后 Java 侧会经 DiagnosticCommand 定时打 [RT MEM NMT] 摘要，用来把
+			// "进程私有提交 +40MB/s"在 JVM 内部逐类劈开（Arena/Internal/Thread/Code...）。
+			// 该参数已在目标 JDK 25 上验证可直接使用（不会导致启动失败）。
+			vmArg "-XX:NativeMemoryTracking=summary"
+			// 2026-10-21 Lithium 式 palette 优化开关（默认关，跑 A/B 时用
+			// `gradlew runClient -PrtxDiagPalette=true -PrtxSectionFastFill=true`
+			// 打开；IDE 里从 gradle 启动同样生效）。
+			//   rtxDiagPalette   → 每 256 段打一行 [SECTION PALETTE]（纯诊断）
+			//   rtxSectionFastFill → 全空气段跳过逐体素分类，直接发全 0
+			vmArg "-Drtx.diag.sectionPalette=${project.findProperty('rtxDiagPalette') ?: 'false'}"
+			vmArg "-Drtx.sectionFastFill=${project.findProperty('rtxSectionFastFill') ?: 'false'}"
+			// 2026-10-22 审查 ② 的 A/B 档位由**环境变量**控制（原生侧用 getenv 读，
+			// 不是系统属性；Loom 的 RunConfigSettings 也没有 environment() 方法）。
+			//   1（默认）→ 邻域查找走 g_vliPageDirect 指针表 + 脏键全量最近优先
+			//   0        → 回到 packSectionKey + unordered_map、脏键取满 16 个
+			// 命令行对照：
+			//   set ORION_GEOMETRY_THREAD_OPTS=0 && gradlew runClient
+			// IDE 对照：在运行配置的 Environment variables 里加同名变量。
+			// 当前取值会打在 [RT GEOMETRY] counters 行的 opts= 字段上。
+		}
+
+		// =====================================================================
+		// 2026-10-20 双工作区：延迟材质档（RT_DEFERRED_MATERIAL）独立 gameDir。
+		//
+		// 为什么需要独立 gameDir：rtx_backend.dll 用 GetRTXBackendDirectory() +
+		// "shaders\\rt_test.rgen.spv" 这种相对路径取 SPV，而 <gameDir>/shaders 每次
+		// 启动都会被 extractBundledShaders() 从 mod 根目录覆盖。两档共用 run/ 时，
+		// 后部署的一套会静默顶掉另一套 —— 所以两档必须各自有一个 shaders/ 目录，
+		// 也就必须各自有一个 gameDir。
+		//
+		// 生产档：runClient        -> run/           （shaders/ 来自随包的 shaders/）
+		// 延迟档：runClientDeferred -> run-deferred/  （shaders/ 来自 shaders_deferred/）
+		//
+		// 隔离的只有 SPV 与运行期缓存；存档/resourcepacks 用 junction 共享（见
+		// deliverables/延迟材质-2026-10-20.md 第 11 节），避免出现"换档就换存档"。
+		// =====================================================================
+		clientDeferred {
+			client()
+			runDir "run-deferred"
+			vmArg "-XX:NativeMemoryTracking=summary"
+			// 让 extractBundledShaders() 改从 <mod root>/shaders_deferred 取源。
+			vmArg "-Drtx.shaderSet=shaders_deferred"
+		}
+	}
+}
+
+dependencies {
+	// To change the versions see the gradle.properties file
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+
+	// Distant Horizons API 7.2.0（compileOnly）：
+	//   - 编译期可见，运行期绝不打包（LGPLv3，见 THIRD_PARTY_NOTICES.md）。
+	//   - 该 jar 的类签名不引用任何 MC 类型，因此不需要 remap，也不要用
+	//     modImplementation（那会试图 remap 并把它塞进运行时依赖）。
+	//   - 未安装 DH 时，所有 DH 访问点必须保持不可达；隔离层见
+	//     com.example.client.compat.dh.DhBridge（唯一 import DH API 的位置）。
+	compileOnly files("libs/DistantHorizonsApi-7.2.0.jar")
+
+	// Distant Horizons 核心 jar（compileOnly，仅编译期可见，绝不打包）：
+	//   - 我们自己的 Mixin 需要 DH <b>内部</b>类的编译期类型
+	//     （LodBufferContainer / IClientLevelWrapper），API jar 里没有这些类。
+	//   - 不能走 modImplementation：DH 核心类引用 MC 类型，remap 会失败；
+	//     用 files() 则原样进 classpath，不做 remap（DH 类名本身不需 remap）。
+	//   - 运行期由 run/mods 下的真实 mod 提供；未装 DH 时整套混入由
+	//     DhMixinPlugin 跳过（见 src/client/resources/orion.dh.mixins.json）。
+	//
+	//   ⚠ 编译期副本的位置必须与"运行期是否安装 DH"**解耦**。此前这里直接写
+	//     run/mods：玩家/开发者按"未安装 DH"的场景把 jar 移出 run/mods 后，
+	//     DhLodBufferHookMixin / DhRenderListHookMixin 引用的 DH core 内部类就
+	//     解析不到 ⇒ compileClientJava 15 个错误 ⇒ 客户端根本构建/启动不了。
+	//     现在：装有 DH 时优先用 run/mods 那份（升级 DH 无需同步副本），
+	//     缺席时回落到随源码提交的 cpp/shaders/DistantHorizons-*.jar，
+	//     保证"未装 DH"也能构建出含 DH 混入的完整 jar（运行期由插件跳过）。
+	def dhCoreJar = fileTree(dir: "run/mods", include: ["DistantHorizons-*.jar"]).files
+	if (dhCoreJar.isEmpty()) {
+		dhCoreJar = fileTree(dir: "cpp/shaders", include: ["DistantHorizons-*.jar"]).files
+	}
+	compileOnly files(dhCoreJar)
+}
+
+processResources {
+	def version = project.version
+	inputs.property "version", version
+
+	filesMatching("fabric.mod.json") {
+		expand "version": version
+	}
+
+	// 2026-10-04：natives 目录里的 *.bak_* 是开发期手留的旧 DLL 备份
+	// （含 74MB 的 nvngx_dlss 备份），只应留在工作区，不应随 jar 分发。
+	// verifyBundledNatives 的 **/*.dll 白名单本来就不匹配它们，
+	// 这里同步把打包也排除掉。
+	exclude "**/*.bak_*"
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 25
+}
+
+// =====================================================
+// 2026-10-14 本机命令行构建修（**不改变任何产物**）
+// =====================================================
+// 症状：命令行 `gradlew compileClientJava` 报
+//   Toolchain installation 'D:\GTX\daemon\9.6.0' does not provide the required
+//   capabilities: [JAVA_COMPILER]
+// 机制：Loom 为 MC 26.3 要求 Java 25 的工具链，而 Gradle 的**工具链匹配是版本严格
+// 相等**的 —— 本机只有 JDK 21（JAVA_HOME）与 JDK 26（D:\RTX，IDE 里的 openjdk-26），
+// 26 配不上"要 25"⇒ 自动下载又没配工具链仓库 ⇒ 失败。
+// 说明：IntelliJ 之所以能编，是因为它自己调 javac 26 + `--release 25`，不做工具链匹配。
+//
+// 这里做同一件事：**只用 JDK 26 当编译器，release 仍是 25**（上面那行没动）⇒
+// 输出字节码完全相同，只是"用哪台 javac"变了。
+// 守卫：仅当本机确实存在 D:/RTX 时才生效 ⇒ 其它机器/CI 行为不变。
+// 换机器：把 ORION_JDK26 指向该机的 JDK 25+ 根目录，或删掉这一段。
+// =====================================================
+def orionJdk26Home = System.getenv('ORION_JDK26') ?: 'D:/RTX'
+if (file(orionJdk26Home).isDirectory()) {
+	def orionToolchains = extensions.getByType(org.gradle.jvm.toolchain.JavaToolchainService)
+	tasks.withType(JavaCompile).configureEach {
+		javaCompiler = orionToolchains.compilerFor {
+			languageVersion = JavaLanguageVersion.of(26)
+		}
+	}
+} else {
+	logger.lifecycle("[ORION] 未发现 JDK 26（${orionJdk26Home}），沿用默认工具链解析")
+}
+
+java {
+	// Loom will automatically attach sourcesJar to a RemapSourcesJar task and to the "build" task
+	// if it is present.
+	// If you remove this line, sources will not be generated.
+	withSourcesJar()
+
+	sourceCompatibility = JavaVersion.VERSION_25
+	targetCompatibility = JavaVersion.VERSION_25
+}
+
+jar {
+	def projectName = project.name
+	inputs.property "projectName", projectName
+
+	from("LICENSE") {
+		rename { "${it}_$projectName"}
+	}
+
+	from("THIRD_PARTY_NOTICES.md")
+	// 2026-10-23 开源合规：NVIDIA RTX SDKs 等要求许可文本随机分发，
+	// 因此 licenses/ 必须进包（licenses/NVIDIA-RTX-SDKs-License.txt 等）。
+	from("licenses") {
+		into "licenses"
+	}
+}
+
+// =====================================================
+// Bundled RTX native runtime
+//
+// Put every Windows DLL under:
+//   src/main/resources/natives/windows/
+//
+// processResources packages them into the Fabric JAR.
+// NativeVulkan extracts them to FabricLoader.getGameDir()
+// before loading rtx_backend.dll.
+// =====================================================
+
+def bundledNativeDir =
+		layout.projectDirectory.dir("src/main/resources/natives/windows")
+
+tasks.register("verifyBundledNatives") {
+	inputs.dir(bundledNativeDir)
+
+	doLast {
+		def nativeDir = bundledNativeDir.asFile
+
+		if (!nativeDir.isDirectory()) {
+			throw new GradleException(
+					"Missing bundled native directory: ${nativeDir}"
+			)
+		}
+
+		def bundledDlls = fileTree(nativeDir) {
+			include "**/*.dll"
+		}.files
+
+		if (bundledDlls.isEmpty()) {
+			throw new GradleException(
+					"No DLL files found under: ${nativeDir}"
+			)
+		}
+
+		def backendDll = new File(nativeDir, "rtx_backend.dll")
+
+		if (!backendDll.isFile()) {
+			throw new GradleException(
+					"Missing required native: ${backendDll}"
+			)
+		}
+
+		println "[RTX natives] Bundling ${bundledDlls.size()} DLL(s) from ${nativeDir}"
+	}
+}
+
+tasks.named("processResources") {
+	dependsOn tasks.named("verifyBundledNatives")
+}
+
+def rtxRuntimeShaderFiles = [
+		"rt_test.rgen.spv",
+		"rt_test_ser.rgen.spv",
+		"rt_test.rchit.spv",
+		"rt_test_translucent.rchit.spv",
+		"rt_test_translucent.rahit.spv",
+		"rt_test.rmiss.spv",
+		"rt_test.rahit.spv",
+		"rt_vpt_irradiance.comp.spv",
+		// 跨 delta 的 RR guide 核半径定向放宽（2026-10-01）。漏打包会在接线后的
+		// 第一次 dispatch 处抛 "Failed shader:" 中断。
+		"rr_guide_relax.comp.spv",
+		"volumetric_clouds.comp.spv",
+		"volumetric_cloud_resolve.comp.spv",
+		"volumetric_cloud_composite.comp.spv",
+	// 2026-10-04：体积光合成 pass（1/2 分辨率 {散射,透射率} → 全分辨率深度感知
+	// 上采样并 scene*a+rgb）。漏打包 ⇒ createVolumetricCloudPipeline 里 loadSpv
+	// 抛 "Failed shader:"，整个体积云/雾/光初始化中断。
+	"god_ray_composite.comp.spv",
+		"volumetric_light.comp.spv",
+		// 太阳阴影图生产者（2026-09-25）。体积光与体积雾都要采样它，
+		// 漏打包会在体积云 pass 里抛 "Failed shader:" 直接中断。
+		"rt_sun_shadow.comp.spv",
+		// 地形高度场生产者（2026-09-30）。与太阳阴影图同构，漏打包同样会让
+		// 体积云 pass 抛 "Failed shader:" 中断。
+		"rt_terrain_height.comp.spv",
+		// 远场太阳阴影图生产者（2026-10-01）。1024²，rgen 的远场分支采样它；
+		// 漏打包会在 createSunShadowFarResources 的 loadSpv 处直接抛异常。
+		"rt_sun_shadow_far.comp.spv",
+		"rr_sdr_post.comp.spv",
+		"rr_hdr_encode.comp.spv",
+		"rr_ae_histogram.comp.spv",
+		"rr_ae_adapt.comp.spv",
+		"fg_ui_mask.comp.spv",
+		// v15 补齐:以下 3 个由 VulkanCore.cpp 的 loadSpv 引用,原先漏打包,
+		// 缺失会在对应特性路径抛 "Failed shader: ..." 直接中断。
+		//   天空大气 / 水面焦散 / 水面模拟
+		"sky_atmosphere.comp.spv",
+		"water_caustics.comp.spv",
+		"water_sim.comp.spv",
+		// v16 补齐（2026-10-04）：对"运行时 loadSpv 实参全表"做反向对账后补上的 13 个。
+		// 它们全都存在于 run/shaders/，此前只是没进这份白名单 ⇒ 开发机（整套 spv 齐全）
+		// 看不出任何异常，**只有玩家机器上才会暴露**。两类后果：
+		//   ① createBrunetonResources 里那 6 个 precompute_*：宿主函数没有 try/catch，
+		//      内部 check() 直通 ⇒ 缺任一即 "Failed shader:" 抛异常，
+		//      **天空大气 / Bruneton LUT 初始化直接失败**（启动即坏）。
+		//      ⚠ 它们按 ("shaders/" + passNames[i]) 动态拼接，不是字面量，
+		//        上一版按字面量对账时正好漏过去。
+		//   ② NRD/DI 链 6 个 + 水面 FFT：各自都有 try/catch ⇒ 只静默禁用对应特性；
+		//      但 water_fft 的总开关默认就是 true（g_waterFftEnabled{true}），
+		//      ⇒ 玩家会看到"FFT 海面无声失效"。一并补上，同时消掉将来把
+		//      kNrdLocalDiEnabled 翻回 true 时的地雷。
+		"precompute_transmittance.comp.spv",
+		"precompute_direct_irradiance.comp.spv",
+		"precompute_single_scattering.comp.spv",
+		"precompute_scattering_density.comp.spv",
+		"precompute_indirect_irradiance.comp.spv",
+		"precompute_multiple_scattering.comp.spv",
+		"rt_nrd_composite.comp.spv",
+		"rt_di_prepare.comp.spv",
+		"rt_di_reproject.comp.spv",
+		"rt_di_moments.comp.spv",
+		"rt_di_confidence.comp.spv",
+		"rt_direct_atrous.comp.spv",
+		"water_fft.comp.spv"
+]
+
+tasks.register("distZip", Zip) {
+	dependsOn tasks.named("jar")
+
+	archiveFileName = "${project.name}-${project.version}.zip"
+	destinationDirectory = layout.buildDirectory.dir("distributions")
+
+	from(tasks.named("jar").flatMap { it.archiveFile }) {
+		into "mods"
+	}
+
+	// rtx_backend.dll resolves SPIR-V relative to its own directory,
+	// so preserve the runtime shaders/ subdirectory in the distribution.
+	from("run/shaders") {
+		include rtxRuntimeShaderFiles
+		into "shaders"
+	}
+
+	doFirst {
+		def missingShaders = rtxRuntimeShaderFiles.findAll {
+			!file("run/shaders/${it}").exists()
+		}
+
+		if (!missingShaders.isEmpty()) {
+			throw new GradleException(
+					"Missing RTX shader files: " +
+							missingShaders.collect { "run/shaders/${it}" }.join(", ")
+			)
+		}
+	}
+}
+
+tasks.named("build") {
+	dependsOn tasks.named("distZip")
+}
+
+// configure the maven publication
+publishing {
+	publications {
+		create("mavenJava", MavenPublication) {
+			from components.java
+		}
+	}
+
+	// See https://docs.gradle.org/current/userguide/publishing_maven.html for information on how to set up publishing.
+	repositories {
+		// Add repositories to publish to here.
+		// Notice: This block does NOT have the same function as the block in the top level.
+		// The repositories here will be used for publishing your artifact, not for
+		// retrieving dependencies.
+	}
+}

@@ -1,0 +1,10 @@
+rt_test.rgen
+ERROR: ./material_common.glsl:98: 'base' : undeclared identifier 
+ERROR: rt_test.rgen:17958: '#' : preprocessor directive cannot be preceded by another token 
+ERROR: rt_test.rgen:17958: '' : compilation terminated 
+ERROR: 3 compilation errors.  No code generated.
+
+
+ERROR: Linking ray-generation stage: Missing entry point: Each stage requires one entry point
+
+SPIR-V is not generated for failed compile or link

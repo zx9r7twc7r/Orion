@@ -1,0 +1,10 @@
+rt_test.rgen
+ERROR: ./material_common.glsl:580: 'gl_WorldRayDirectionEXT' : undeclared identifier 
+ERROR: ./material_common.glsl:580: 'dot' : no matching overloaded function found 
+ERROR: ./material_resolve.glsl:37: '' :  syntax error, unexpected VOID, expecting RIGHT_PAREN or COMMA
+ERROR: 3 compilation errors.  No code generated.
+
+
+ERROR: Linking ray-generation stage: Missing entry point: Each stage requires one entry point
+
+SPIR-V is not generated for failed compile or link

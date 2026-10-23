@@ -1,0 +1,355 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// Local Evan-style wavefront-area caustic map.  This is deliberately a
+// light-space optical pass: it does not move water vertices, alter the BLAS,
+// or change the persistent ripple simulation.  Each texel estimates the
+// refracted-wavefront Jacobian around one flat-water source point.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2DArray waterStateInput;
+layout(rg16f, set = 0, binding = 1) uniform writeonly image2D waterCausticOutput;
+
+layout(set = 0, binding = 2) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+const ivec2 CAUSTIC_RESOLUTION = ivec2(256);
+const float WATER_SIM_WORLD_SIZE = 32.0;
+const float WATER_IOR = 1.33;
+const float REFERENCE_RECEIVER_DEPTH = 1.0;
+
+// Matches the time-driven solar direction used by the RayGen water path.
+// 2026-10-07 末地光源球开关（定义见 sky_model_common.glsl，本文件不 include
+// 它，提前兜底；重复定义同值合法）。
+#ifndef END_ORB_ENABLE
+#define END_ORB_ENABLE 1
+#endif
+
+vec3 getTimeDrivenSunDirection()
+{
+    const float TWO_PI = 6.28318530718;
+#if END_ORB_ENABLE
+    // 末地光源球：固定天顶（只自转、不公转）（endOrbDirection，见
+    // sky_model_common.glsl；本文件不 include 那个头，字面量内联），
+    // 焦散波前跟着这根向量投影。
+    // ⚠ 六个方向副本必须同一向量，否则可见球与直射光方向分家。
+    if(abs(cam.weatherParams.z - 3.0) < 0.25)
+    {
+        // 2026-10-18：光源球固定在末地天顶（只自转、不公转）。
+        return vec3(0.0, 1.0, 0.0);
+    }
+#endif
+    vec3 horizontalAzimuth = normalize(vec3(0.5, 0.0, 0.3));
+    float dayAngle = fract(cam.historyParams.w) * TWO_PI;
+    return normalize(
+        horizontalAzimuth * cos(dayAngle) +
+        vec3(0.0, sin(dayAngle), 0.0)
+    );
+}
+
+void accumulateFineGerstnerOpticalWave(
+    inout vec2 gradient,
+    vec2 warpedXZ,
+    vec2 direction,
+    float waveNumber,
+    float heightAmplitude,
+    float timePhase,
+    float distanceFade,
+    float crestSharpness,
+    vec2 warpAmplitude0,
+    vec2 warpAmplitude1,
+    vec2 warpPhaseGradient0,
+    vec2 warpPhaseGradient1,
+    float warpCos0,
+    float warpCos1
+)
+{
+    vec2 basePhaseGradient = direction * waveNumber;
+    vec2 phaseGradient =
+        basePhaseGradient +
+        warpPhaseGradient0 *
+            (dot(warpAmplitude0, basePhaseGradient) * warpCos0) +
+        warpPhaseGradient1 *
+            (dot(warpAmplitude1, basePhaseGradient) * warpCos1);
+
+    float wavePhase = dot(warpedXZ, basePhaseGradient) + timePhase;
+    float waveSin = sin(wavePhase);
+    float crestCompression = max(1.0 - crestSharpness * waveSin, 0.38);
+    gradient +=
+        phaseGradient *
+        (heightAmplitude * cos(wavePhase) * distanceFade /
+            crestCompression);
+}
+
+vec2 evaluateNaturalGradient(vec2 worldXZ)
+{
+    const float TAU = 6.28318530718;
+    const float WATER_WAVE_SPEED = 3.0;
+    // Match the closest-hit water normal exactly.  The native steady clock is
+    // stored bitwise in padding and remains monotonic across MC day wraps.
+    // This must retain the same bounded optical-time scale as rt_test.rchit;
+    // otherwise moving caustics would disagree with the visible water normal.
+    const float WATER_OPTICAL_TIME_SCALE = 0.025;
+    float waveTime = uintBitsToFloat(cam.padding) *
+        WATER_OPTICAL_TIME_SCALE * WATER_WAVE_SPEED;
+    vec3 cameraPosition =
+        (cam.viewInverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+    float cameraDistance = length(worldXZ - cameraPosition.xz);
+
+    float longFade = 1.0 - smoothstep(96.0, 192.0, cameraDistance);
+    float mediumFade = 1.0 - smoothstep(64.0, 144.0, cameraDistance);
+    float fineFade = 1.0 - smoothstep(36.0, 96.0, cameraDistance);
+    float detailFade = 1.0 - smoothstep(16.0, 54.0, cameraDistance);
+    float microFade = 1.0 - smoothstep(6.0, 28.0, cameraDistance);
+
+    const vec2 warpDirection0 = vec2(0.7399401, 0.6726728);
+    const vec2 warpDirection1 = vec2(-0.5144958, 0.8574929);
+    const float warpWaveNumber0 = 0.101;
+    const float warpWaveNumber1 = 0.157;
+    const vec2 warpAmplitude0 = vec2(0.36, -0.24);
+    const vec2 warpAmplitude1 = vec2(0.19, 0.31);
+
+    float warpPhase0 =
+        dot(worldXZ, warpDirection0) * warpWaveNumber0 + waveTime * 3.0;
+    float warpPhase1 =
+        dot(worldXZ, warpDirection1) * warpWaveNumber1 - waveTime * 5.0;
+    vec2 warpedXZ =
+        worldXZ +
+        warpAmplitude0 * sin(warpPhase0) +
+        warpAmplitude1 * sin(warpPhase1);
+    vec2 warpPhaseGradient0 = warpDirection0 * warpWaveNumber0;
+    vec2 warpPhaseGradient1 = warpDirection1 * warpWaveNumber1;
+    float warpCos0 = cos(warpPhase0);
+    float warpCos1 = cos(warpPhase1);
+
+    vec2 gradient = vec2(0.0);
+    accumulateFineGerstnerOpticalWave(gradient, warpedXZ, vec2(0.9701425, 0.2425356), 0.42, 0.075, waveTime * 7.0, longFade, 0.24, warpAmplitude0, warpAmplitude1, warpPhaseGradient0, warpPhaseGradient1, warpCos0, warpCos1);
+    accumulateFineGerstnerOpticalWave(gradient, warpedXZ, vec2(0.5547002, 0.8320503), 0.61, 0.0675, -waveTime * 11.0, longFade, 0.27, warpAmplitude0, warpAmplitude1, warpPhaseGradient0, warpPhaseGradient1, warpCos0, warpCos1);
+    accumulateFineGerstnerOpticalWave(gradient, warpedXZ, vec2(-0.1961161, 0.9805807), 0.86, 0.048, waveTime * 19.0, mediumFade, 0.30, warpAmplitude0, warpAmplitude1, warpPhaseGradient0, warpPhaseGradient1, warpCos0, warpCos1);
+    accumulateFineGerstnerOpticalWave(gradient, warpedXZ, vec2(-0.7682213, 0.6401844), 1.14, 0.0345, -waveTime * 29.0, mediumFade, 0.32, warpAmplitude0, warpAmplitude1, warpPhaseGradient0, warpPhaseGradient1, warpCos0, warpCos1);
+    accumulateFineGerstnerOpticalWave(gradient, warpedXZ, vec2(-0.9486833, -0.3162278), 1.53, 0.016, waveTime * 43.0, fineFade, 0.34, warpAmplitude0, warpAmplitude1, warpPhaseGradient0, warpPhaseGradient1, warpCos0, warpCos1);
+    accumulateFineGerstnerOpticalWave(gradient, warpedXZ, vec2(-0.3713907, -0.9284767), 2.02, 0.011, -waveTime * 61.0, fineFade, 0.36, warpAmplitude0, warpAmplitude1, warpPhaseGradient0, warpPhaseGradient1, warpCos0, warpCos1);
+    accumulateFineGerstnerOpticalWave(gradient, warpedXZ, vec2(0.7071068, -0.7071068), 2.68, 0.0077, waveTime * 83.0, detailFade, 0.38, warpAmplitude0, warpAmplitude1, warpPhaseGradient0, warpPhaseGradient1, warpCos0, warpCos1);
+    accumulateFineGerstnerOpticalWave(gradient, warpedXZ, vec2(0.8944272, -0.4472136), 3.54, 0.0030, -waveTime * 109.0, detailFade, 0.40, warpAmplitude0, warpAmplitude1, warpPhaseGradient0, warpPhaseGradient1, warpCos0, warpCos1);
+    accumulateFineGerstnerOpticalWave(gradient, warpedXZ, vec2(0.1414214, 0.9899495), 4.62, 0.0020, waveTime * 137.0, microFade, 0.42, warpAmplitude0, warpAmplitude1, warpPhaseGradient0, warpPhaseGradient1, warpCos0, warpCos1);
+    accumulateFineGerstnerOpticalWave(gradient, warpedXZ, vec2(-0.8574929, 0.5144958), 5.94, 0.0013, -waveTime * 167.0, microFade, 0.44, warpAmplitude0, warpAmplitude1, warpPhaseGradient0, warpPhaseGradient1, warpCos0, warpCos1);
+    // Water style wave dial: applied identically on the closest-hit normal
+    // paths, so the caustic pattern keeps tracking the visible surface.
+    return gradient * 1.22 * clamp(cam.waterStyleParams0.x, 0.0, 2.0);
+}
+
+vec2 evaluateInteractionGradient(vec2 worldXZ)
+{
+    float worldTexel = cam.waterSimSurfaceAndOrigin.w;
+    if(cam.waterSimState.y == 0u || worldTexel <= 0.0)
+    {
+        return vec2(0.0);
+    }
+
+    vec2 simulationUV =
+        (worldXZ - cam.waterSimSurfaceAndOrigin.yz) /
+        (worldTexel * 512.0);
+    vec2 border = smoothstep(vec2(0.0), vec2(0.025), simulationUV) *
+        (1.0 - smoothstep(vec2(0.975), vec2(1.0), simulationUV));
+    float valid = border.x * border.y;
+    if(valid <= 0.0)
+    {
+        return vec2(0.0);
+    }
+
+    float layer = float(cam.waterSimState.x);
+    vec2 uvStep = vec2(1.0 / 512.0);
+    float left = texture(waterStateInput, vec3(simulationUV - vec2(uvStep.x, 0.0), layer)).r;
+    float right = texture(waterStateInput, vec3(simulationUV + vec2(uvStep.x, 0.0), layer)).r;
+    float down = texture(waterStateInput, vec3(simulationUV - vec2(0.0, uvStep.y), layer)).r;
+    float up = texture(waterStateInput, vec3(simulationUV + vec2(0.0, uvStep.y), layer)).r;
+    return vec2(right - left, up - down) *
+        (0.19 / max(worldTexel, 1.0e-4)) * valid;
+}
+
+// W4: per-texel wave-field evaluations are replaced by one shared 18x18
+// gradient grid (16x16 domain plus a two-texel halo).  The inversion and
+// density stencils bilinearly sample this grid instead of re-evaluating
+// the ten Gerstner bands at every stencil point.
+shared vec2 sNaturalGradient[18][18];
+shared vec2 sInteractionGradient[18][18];
+ivec2 gGridBaseTexel;
+
+vec2 sampleOpticalGradient(vec2 worldXZ, bool includeInteraction)
+{
+    const float cell = WATER_SIM_WORLD_SIZE / 256.0;
+    vec2 gridCoord =
+        (worldXZ - cam.waterSimSurfaceAndOrigin.yz) / cell -
+        0.5 - vec2(gGridBaseTexel);
+    vec2 clamped = clamp(gridCoord, vec2(0.0), vec2(17.0));
+    ivec2 i0 = ivec2(floor(clamped));
+    ivec2 i1 = min(i0 + ivec2(1), ivec2(17));
+    vec2 t = clamped - vec2(i0);
+    vec2 g00 = sNaturalGradient[i0.y][i0.x];
+    vec2 g10 = sNaturalGradient[i0.y][i1.x];
+    vec2 g01 = sNaturalGradient[i1.y][i0.x];
+    vec2 g11 = sNaturalGradient[i1.y][i1.x];
+    vec2 gradient = mix(mix(g00, g10, t.x), mix(g01, g11, t.x), t.y);
+    if(includeInteraction)
+    {
+        vec2 h00 = sInteractionGradient[i0.y][i0.x];
+        vec2 h10 = sInteractionGradient[i0.y][i1.x];
+        vec2 h01 = sInteractionGradient[i1.y][i0.x];
+        vec2 h11 = sInteractionGradient[i1.y][i1.x];
+        gradient += mix(mix(h00, h10, t.x), mix(h01, h11, t.x), t.y);
+    }
+    return gradient;
+}
+
+// W4 legacy: direct per-stencil wave-field evaluation.  Shielded as the
+// fallback interface if the shared-grid sampling ever needs reversal.
+#if 0
+vec3 evaluateOpticalNormalDirect(vec2 worldXZ, bool includeInteraction)
+{
+    vec2 gradient = evaluateNaturalGradient(worldXZ);
+    if(includeInteraction)
+    {
+        gradient += evaluateInteractionGradient(worldXZ);
+    }
+    return normalize(vec3(-gradient.x, 1.0, -gradient.y));
+}
+#endif
+
+vec3 evaluateOpticalNormal(vec2 worldXZ, bool includeInteraction)
+{
+    vec2 gradient = sampleOpticalGradient(worldXZ, includeInteraction);
+    return normalize(vec3(-gradient.x, 1.0, -gradient.y));
+}
+
+// Evan's oldArea/newArea construction, evaluated through a finite-difference
+// Jacobian instead of a raster pass: q is the refracted position on a fixed
+// receiver plane one block below the flat water source.  The flat Jacobian is
+// exactly one, so density is 1 / |det(dq/dp)|.
+vec2 projectRefractedWavefront(vec2 sourceXZ, vec3 normal, vec3 sunDirection)
+{
+    vec3 incoming = refract(-sunDirection, normal, 1.0 / WATER_IOR);
+    if(incoming.y >= -1.0e-4)
+    {
+        return sourceXZ;
+    }
+    return sourceXZ + incoming.xz *
+        (-REFERENCE_RECEIVER_DEPTH / incoming.y);
+}
+
+float evaluateWavefrontDensity(vec2 sourceXZ, vec3 sunDirection, bool includeInteraction)
+{
+    const float cell = WATER_SIM_WORLD_SIZE / 256.0;
+    vec2 qXP = projectRefractedWavefront(
+        sourceXZ + vec2(cell, 0.0),
+        evaluateOpticalNormal(sourceXZ + vec2(cell, 0.0), includeInteraction),
+        sunDirection
+    );
+    vec2 qXM = projectRefractedWavefront(
+        sourceXZ - vec2(cell, 0.0),
+        evaluateOpticalNormal(sourceXZ - vec2(cell, 0.0), includeInteraction),
+        sunDirection
+    );
+    vec2 qZP = projectRefractedWavefront(
+        sourceXZ + vec2(0.0, cell),
+        evaluateOpticalNormal(sourceXZ + vec2(0.0, cell), includeInteraction),
+        sunDirection
+    );
+    vec2 qZM = projectRefractedWavefront(
+        sourceXZ - vec2(0.0, cell),
+        evaluateOpticalNormal(sourceXZ - vec2(0.0, cell), includeInteraction),
+        sunDirection
+    );
+
+    vec2 dqdx = (qXP - qXM) / (2.0 * cell);
+    vec2 dqdz = (qZP - qZM) / (2.0 * cell);
+    float newArea = abs(dqdx.x * dqdz.y - dqdx.y * dqdz.x);
+    return clamp(1.0 / max(newArea, 0.10), 0.20, 6.0);
+}
+
+// The output grid is the refracted receiver plane, not the original water
+// source plane.  Invert the one-block wavefront projection with three fixed
+// Newton-style corrections, then evaluate the local oldArea/newArea at the
+// recovered source.  This produces moving cellular caustic contours instead
+// of a source-locked brightness texture.
+vec2 invertWavefrontProjection(
+    vec2 receiverPlaneXZ,
+    vec3 sunDirection,
+    bool includeInteraction
+)
+{
+    vec2 sourceXZ = receiverPlaneXZ;
+    // W4: two corrections already recover the source within a fraction of
+    // a cell; the third iteration only refined sub-visible micro-bands.
+    for(int iteration = 0; iteration < 2; ++iteration)
+    {
+        vec2 projected = projectRefractedWavefront(
+            sourceXZ,
+            evaluateOpticalNormal(sourceXZ, includeInteraction),
+            sunDirection
+        );
+        sourceXZ -= 0.85 * (projected - receiverPlaneXZ);
+    }
+    return sourceXZ;
+}
+
+void main()
+{
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(texel, CAUSTIC_RESOLUTION)))
+    {
+        return;
+    }
+
+    // W4: fill the shared gradient grid (324 slots over 256 threads) from
+    // the analytic wave field before any stencil samples it.  This must
+    // complete before the sun-direction early-out below, otherwise the
+    // group barrier would deadlock.
+    gGridBaseTexel = ivec2(gl_WorkGroupID.xy) * 16 - 1;
+    const float cell = WATER_SIM_WORLD_SIZE / 256.0;
+    for(int slot = int(gl_LocalInvocationIndex); slot < 18 * 18; slot += 256)
+    {
+        ivec2 local = ivec2(slot % 18, slot / 18);
+        vec2 worldXZ = cam.waterSimSurfaceAndOrigin.yz +
+            (vec2(gGridBaseTexel + local) + 0.5) * cell;
+        sNaturalGradient[local.y][local.x] =
+            evaluateNaturalGradient(worldXZ);
+        sInteractionGradient[local.y][local.x] =
+            evaluateInteractionGradient(worldXZ);
+    }
+    barrier();
+
+    vec3 sunDirection = getTimeDrivenSunDirection();
+    if(sunDirection.y <= 0.02)
+    {
+        imageStore(waterCausticOutput, texel, vec4(1.0, 1.0, 0.0, 0.0));
+        return;
+    }
+
+    // Treat this texel as a point on the receiver reference plane.  Natural
+    // and interaction variants retain independent inverse maps so their
+    // density fields remain physically aligned with their own wave normals.
+    vec2 receiverPlaneXZ = cam.waterSimSurfaceAndOrigin.yz +
+        (vec2(texel) + 0.5) * (WATER_SIM_WORLD_SIZE / 256.0);
+    vec2 naturalSourceXZ = invertWavefrontProjection(
+        receiverPlaneXZ,
+        sunDirection,
+        false
+    );
+    vec2 interactionSourceXZ = invertWavefrontProjection(
+        receiverPlaneXZ,
+        sunDirection,
+        true
+    );
+    float naturalDensity =
+        evaluateWavefrontDensity(naturalSourceXZ, sunDirection, false);
+    float interactionDensity =
+        evaluateWavefrontDensity(interactionSourceXZ, sunDirection, true);
+    imageStore(
+        waterCausticOutput,
+        texel,
+        vec4(naturalDensity, interactionDensity, 0.0, 0.0)
+    );
+}

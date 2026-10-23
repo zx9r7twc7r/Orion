@@ -1,0 +1,12 @@
+rt_test.rgen
+ERROR: ./lod_coverage.glsl:30: 'LodRoles' : Cannot reuse block name within the same interface: buffer
+ERROR: ./water_wave_field.glsl:34: 'waterSimulationState' : redefinition 
+ERROR: ./material_common.glsl:217: 'gl_HitTEXT' : undeclared identifier 
+ERROR: ./material_resolve.glsl:37: 'void' : cannot construct this type 
+ERROR: ./material_resolve.glsl:37: '' : compilation terminated 
+ERROR: 5 compilation errors.  No code generated.
+
+
+ERROR: Linking ray-generation stage: Missing entry point: Each stage requires one entry point
+
+SPIR-V is not generated for failed compile or link

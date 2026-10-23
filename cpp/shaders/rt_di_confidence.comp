@@ -1,0 +1,253 @@
+#version 460
+// =====================================================
+// 2026-09-29 第二步：NRD history confidence（IN_DIFF_CONFIDENCE）
+//
+// 官方依据
+// --------
+// NRD README（v4.18.0）：
+//   * "IN_DIFF_CONFIDENCE - (optional, but highly recommended) confidence of the
+//      accumulated history represented in [0; 1] range"
+//   * REBLUR 的用法："historyLength *= lerp( confidence, 1, 1 / ( 1 + historyLength ) )"
+//   * 有了它，"history length can be bumped up to 60 frames relatively safely"。
+// RTXDI Doc/Confidence.md：
+//   * 时空降噪器对光照突变/相机运动反应迟钝 ⇒ 需要外部提示"哪里光照变了、历史该重置"；
+//   * 计算链：temporal gradient → **宽模糊**（4-pass à-trous）→ 归一化到 [0,1] →
+//     **短时域滤波**（避免稀疏梯度造成斑块式失效与"黑坑"）。
+// NRDDescs.h:52-59：
+//   * 单通道 R8+，[0,1]，1 = 稳定、0 = 历史已失效；
+//   * "must be computed for the previous frame in the current frame"。
+//
+// 本实现与官方的偏差（必须记住）
+// ----------------------------
+// 官方的 temporal gradient 是「**同一个光源样本**在前后两帧的表面重着色之差」
+// （需要上一帧的 reservoir 与上一帧 BVH）。本项目没有这两样，改用
+//   g = |L_cur − L_prev(重投影)| / max(L_cur, L_prev)
+// 即"上一帧 DI 信号经 MV 复投影后的亮度差"。它同样能抓光照突变，但会把 1spp 的
+// 逐帧噪声也当成变化 —— 官方的宽模糊 + 短时域滤波正是用来压掉这类误失效的，
+// 这两道我们**按官方做法保留**（宽模糊单 pass 近似 4-pass à-trous，覆盖 ±8px）。
+//
+// ★★ 2026-09-29 14:1x 官方复核（用户要求"改之前看官网"）——发现数值量程对不上
+// ----------------------------------------------------------------------------
+// 1) 官方对 confidence 的定义（NRD README "IN_DIFF/SPEC_CONFIDENCE" 与
+//    "HISTORY CONFIDENCE" 两节）：0 = 历史失效、1 = 完全采信；且明确要求
+//    "An application should not rely solely on the anti-lag"、梯度必须
+//    "isolate differences in lighting"，即**不允许把采样噪声当成变化**
+//    （"'traced' radiance must use *previous* frame's RNG seed to avoid
+//      sampling discrepancies and isolate differences in lighting"）。
+// 2) REBLUR 侧的唯一用法（官方 README 原文 + 源码 REBLUR_TemporalAccumulation.cs.hlsl
+//    :897-903 逐行核对）：
+//        diffHistoryConfidence = min( smbFootprintQuality, IN_DIFF_CONFIDENCE )
+//        diffAccumSpeed *= lerp( diffHistoryConfidence, 1, 1 / (1 + diffAccumSpeed) )
+//    ⇒ confidence 只能**压低**累积速度。取 c = 0 时，逐帧递推
+//        A ← A/(1+A) + 1   的不动点 = (1+√5)/2 ≈ 1.618 帧
+//    ⇒ **"移动时历史稳定停在 1-2 帧"这个读数，在 NRD 机制里只有 c≈0 这一条
+//      路径能产生**；纯遮挡拒绝会落到 historyFixFrameNum=3（橙）或直接重置
+//      （validation 视口 8 的棋盘红），不会是稳定的 1.6。
+// 3) 我们的公式的最大输出其实**远小于**死区，量程标定是错的：
+//        g = β·|L_raw − L_emaPrev| / max(L_ema, L_emaPrev),  β = 0.10
+//    静止时（重投影落在自己身上）L_emaPrev 就是本像素的均值，|Δ| 只有噪声量级
+//    ⇒ g ≈ β·相对偏离 ≈ 0.01~0.05 ≪ threshold 0.35 ⇒ c ≈ 1（正常累积，符合实测"静止白"）；
+//    一旦相机运动，重投影落到**别的像素**的 EMA 上，在"上一帧近黑、当帧亮"的
+//    像素上 max(L_ema, L_emaPrev) ≈ L_ema ≈ β·L_raw ⇒ g 直接饱和到 ~1
+//    ⇒ excess ≈ 0.65 ⇒ c ≈ exp(−2.6) ≈ 0.07 ⇒ 累积速度塌到不动点 1.6 帧。
+//    ⇒ 症状与公式形态完全吻合，且**与 IN_VIEWZ / MV 的口径无关**（这正是
+//      "改了 viewZ 符号仍然红"的解释）。
+// 4) 判决实验（本次部署）：NRD_DI_CONFIDENCE_FORCE_ONE=1 —— 把 confidence 钉成
+//    官方语义的"1 = full confidence / 不加速"。它不改变 NRD 的遮挡/历史修复判据，
+//    只把"我们这路输入"从方程里摘掉：
+//      移动时历史长度变白(≥32)  ⇒ 定罪 confidence（本文件的梯度），按官方重构或先摘掉；
+//      移动时仍 1-2 帧（暗红）  ⇒ confidence 无罪，塌陷在 NRD 自己的判据里，
+//                                 下一步开 NRD 自带 validation（NRD_LOCAL_DI_VALIDATION=1，
+//                                 需重编 DLL）看视口 3（MV vs 期望 MV）与视口 8（累积帧数）。
+//    回退：不加 -DNRD_DI_CONFIDENCE_FORCE_ONE 编译即恢复本文件原公式。
+// =====================================================
+#ifndef NRD_DI_CONFIDENCE_FORCE_ONE
+#define NRD_DI_CONFIDENCE_FORCE_ONE 0
+#endif
+//
+// ★★ 2026-09-29 第 3 项（方案 C）第 4 处同步点 —— 已随本项回退，宏改回 0。★★
+// 本 pass 的 binding 0 直接读 NRD 的 IN_DIFF_RADIANCE_HITDIST（宿主的
+// recordDiConfidence 绑的就是 g_nrdDiffRadianceHitDistImage），所以"亮度怎么从
+// 打包里取"必须跟降噪器族同步 —— REBLUR 的 .x 是 YCoCg 的 Y（真亮度），
+// RELAX 的 .x 只是线性 radiance 的 R 分量。只改宿主会静默错口径。
+#ifndef LOCAL_DI_DENOISER_RELAX
+#define LOCAL_DI_DENOISER_RELAX 0
+#endif
+//
+// 两个 dispatch（同一 pipeline，push.mode 选择）
+//   mode 0：算梯度 → 写 diGradientOut
+//   mode 1：读梯度 → 3x3(步长 4) 宽模糊 → 归一化 → 短时域滤波 → 写 confidence + 本帧亮度
+// =====================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// 0：IN_DIFF_RADIANCE_HITDIST（打包口径随降噪器族变化，见下方 LOCAL_DI_DENOISER_RELAX）
+layout(binding = 0, rgba16f) uniform readonly image2D diPackedTermImage;
+// 1：NRD 契约 MV（归一化 UV 增量）
+layout(binding = 1, rg16f) uniform readonly image2D diMotionImage;
+// 2：IN_VIEWZ（线性视深，与亮度图同尺寸）
+layout(binding = 2, r32f) uniform readonly image2D diViewZImage;
+// 3：上一帧的 DI 亮度
+layout(binding = 3, r16f) uniform readonly image2D diLumaPrev;
+// 4：上一帧的 confidence
+layout(binding = 4, r8) uniform readonly image2D diConfidencePrev;
+// 5：梯度写出（mode 0）
+layout(binding = 5, r16f) uniform writeonly image2D diGradientOut;
+// 6：梯度读入（mode 1）
+layout(binding = 6, r16f) uniform readonly image2D diGradientIn;
+// 7：confidence 写出（mode 1）
+layout(binding = 7, r8) uniform writeonly image2D diConfidenceOut;
+// 8：本帧亮度写出（mode 0）
+layout(binding = 8, r16f) uniform writeonly image2D diLumaOut;
+
+layout(push_constant) uniform DiConfidencePushConstants
+{
+    uint width;
+    uint height;
+    // 0 = 梯度 pass，1 = 模糊+时域 pass
+    uint mode;
+    // 死区之上的梯度 -> confidence 的陡度：c = exp(-sensitivity * max(g - threshold, 0))
+    float gradientSensitivity;
+    // 死区：本估计量的噪声底（见文件头"噪声鲁棒"一节），小于它的相对变化不视为光照变化
+    float gradientThreshold;
+    // 短时域滤波系数（0.2~0.35 是"几帧内平滑失效"的量级）
+    float temporalAlpha;
+    // 视深超过它即视为天空/无效接收面（收到 denoisingRange 同量级）
+    float maxViewZ;
+    // 亮度 EMA 系数：1/N 量级，用来把 1spp 噪点从"光照变化"里滤掉
+    float lumaEmaBeta;
+    float pad0;
+} pc;
+
+const float CONFIDENCE_MIN = 0.0;
+const float CONFIDENCE_MAX = 1.0;
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(int(pc.width), int(pc.height));
+
+    if(pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    if(pc.mode == 0u)
+    {
+        // ---------------- 梯度 pass ----------------
+        //
+        // ★ 噪声鲁棒（2026-09-29 13:5x，第一次实测后修正）：
+        // 初版直接比较"当帧 1spp 亮度"与"上一帧 1spp 亮度"，而本地光这一项是
+        // **一条可见性射线的二值结果**（亮 or 不亮），于是逐像素的相对差天然 ≈ 1，
+        // 梯度恒为 ~1 ⇒ confidence ≈ exp(-4) ≈ 0.02 ⇒ NRD **每帧重置历史** ⇒
+        // 满幅高频噪点（13:46 录屏即此形态）。
+        //
+        // 官方原法用"同一个光源样本在前后两帧重着色之差"从根上避免这件事
+        // （RTXDI Doc/Confidence.md："Gradients should not capture any changes due to
+        //  the subpixel camera jitter... "），本项目没有上一帧 reservoir/BVH，
+        // 因此改为：**亮度先做时域 EMA（~10 帧）再比较**，把 1spp 噪声压一个量级，
+        // 同时保留"几帧内平滑失效"的能力；残留噪声底再由 mode 1 的死区
+        // （gradientThreshold）吸收。比较对象是 EMA vs EMA，噪声不再被当成光照变化。
+        // ★ 2026-09-29 第 3 项：亮度取样跟随 NRD 打包口径。
+        //   REBLUR：.x = YCoCg 的 Y = 亮度，直接取。
+        //   RELAX ：打包是 float4(线性辐照度, hitDist)，.x 只是 R ⇒ 必须自己算亮度，
+        //           否则"亮度梯度"退化成"红色通道梯度"，confidence 随色相而非明暗变化。
+        // 为什么这条在 RELAX 下更关键（NRD README:802 的两种用法）：
+        //   REBLUR：historyLength *= lerp( confidence, 1, 1/(1+historyLength) )  ← 乘进反馈环
+        //   RELAX ：historyLength = min( historyLength, maxAccumulatedFrameNum * confidence )
+        //           ← **只在 temporal accumulation 里用的硬上限**
+        // 即 RELAX 下 confidence 直接决定"历史最多留几帧"，口径错会被放大成画面上的
+        // 拖影/闪烁，而不是像 REBLUR 那样被 1/(1+A) 稀释。
+        const vec4 packedTerm = imageLoad(diPackedTermImage, pixel);
+#if LOCAL_DI_DENOISER_RELAX
+        const float lumaRaw = max(dot(packedTerm.xyz, vec3(0.2126, 0.7152, 0.0722)), 0.0);
+#else
+        const float lumaRaw = max(packedTerm.x, 0.0);
+#endif
+        const float viewZ = imageLoad(diViewZImage, pixel).r;
+        const vec2 mv = imageLoad(diMotionImage, pixel).xy;
+
+        // IN_VIEWZ 现在是**带符号**视深（前方为负），有效性判据用幅度。
+        bool historyValid = abs(viewZ) > 0.0 && abs(viewZ) < pc.maxViewZ;
+        ivec2 prevPixel = pixel;
+
+        if(historyValid)
+        {
+            prevPixel = ivec2(round(vec2(pixel) + mv * vec2(size)));
+            historyValid =
+                prevPixel.x >= 0 && prevPixel.y >= 0 &&
+                prevPixel.x < size.x && prevPixel.y < size.y;
+        }
+
+        const float lumaEmaPrev = historyValid
+            ? max(imageLoad(diLumaPrev, prevPixel).r, 0.0)
+            : lumaRaw;
+
+        const float lumaEma = historyValid
+            ? mix(lumaEmaPrev, lumaRaw, clamp(pc.lumaEmaBeta, 0.001, 1.0))
+            : lumaRaw;
+
+        // 官方口径：亮度差 / 绝对亮度（相对差），这样亮区的小变化不会误失效。
+        // 无可用历史（首帧/换面/出屏）时给 0：本像素没有"变化"可言，交给 NRD 自己去遮挡判据。
+        float gradient = 0.0;
+
+        if(historyValid)
+        {
+            const float difference = abs(lumaEma - lumaEmaPrev);
+            const float denominator = max(max(lumaEma, lumaEmaPrev), 1.0e-4);
+            gradient = difference / denominator;
+        }
+
+        imageStore(diGradientOut, pixel, vec4(min(gradient, 4.0), 0.0, 0.0, 0.0));
+
+        // 存 EMA（不是原始亮度）：下一帧的比较对象就是它。
+        // 天空/无效接收面也会存，保证下一帧有可用历史。
+        imageStore(diLumaOut, pixel, vec4(lumaEma, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    // ---------------- 宽模糊 + 归一化 + 短时域滤波 ----------------
+    // 宽模糊：3x3、步长 4（覆盖 ±8px 的梯度空间，单 pass 近似官方的 4-pass à-trous）
+    const int BLUR_STEP = 4;
+    float gradientSum = 0.0;
+    float gradientCount = 0.0;
+
+    for(int dy = -1; dy <= 1; ++dy)
+    {
+        for(int dx = -1; dx <= 1; ++dx)
+        {
+            const ivec2 q = pixel + ivec2(dx, dy) * BLUR_STEP;
+            if(q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y)
+            {
+                continue;
+            }
+
+            gradientSum += imageLoad(diGradientIn, q).r;
+            gradientCount += 1.0;
+        }
+    }
+
+    const float blurred = gradientCount > 0.0
+        ? gradientSum / gradientCount
+        : 0.0;
+
+    // 归一化 -> [0,1]：g = 0（稳定）→ 1；g 越大 → 越接近 0。
+    // 死区 gradientThreshold 吸收上一级的残留噪声底（1spp + EMA 不可能做到 0 噪声），
+    // 只有超过死区的相对变化才被当成"光照变了"。
+    const float excess = max(blurred - pc.gradientThreshold, 0.0);
+    float confidence = exp(-pc.gradientSensitivity * excess);
+    confidence = clamp(confidence, CONFIDENCE_MIN, CONFIDENCE_MAX);
+
+    // 短时域滤波（官方 Confidence.md 的第三步）：让失效在几帧内平滑发生，
+    // 避免稀疏梯度造成"斑块式历史失效"与"关灯黑坑"。历史取上一帧 confidence
+    // 在**同一像素**（confidence 是"上一帧的量"，同像素复用即上一帧该像素的值）。
+    const float confidencePrev = imageLoad(diConfidencePrev, pixel).r;
+    confidence = mix(confidencePrev, confidence, clamp(pc.temporalAlpha, 0.0, 1.0));
+
+#if NRD_DI_CONFIDENCE_FORCE_ONE
+    // 判决实验（见文件头 ★★ 第 4 条）：钉成"完全采信历史"。
+    confidence = 1.0;
+#endif
+
+    imageStore(diConfidenceOut, pixel, vec4(confidence, 0.0, 0.0, 0.0));
+}

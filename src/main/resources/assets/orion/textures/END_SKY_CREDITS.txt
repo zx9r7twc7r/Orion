@@ -1,0 +1,46 @@
+末地维度天空（天空即月球视角：太空背景 + 地球 + 远处太阳）
+=========================================================
+
+本目录下 rt_end_atlas.png 是一张 8192x4096 的**合成图集**，四个象限各一张
+等距圆柱（2:1）子图，分别来自两个不同来源：
+
+  左上 (0,    0)      4096x2048   银河系全景（太空背景）
+  右上 (4096, 0)      4096x2048   全球云层（灰度 = 云密度）
+  左下 (0,    2048)   4096x2048   地球昼面
+  右下 (4096, 2048)   4096x2048   地球夜面 / 城市灯光
+
+着色器按象限取 UV（契约见 cpp/shaders/sky_model_common.glsl 与交接文档 §2）。
+
+来源 / Source:
+
+  1) 银河系全景 —— Solar System Scope — Textures
+     https://www.solarsystemscope.com/textures/
+
+     许可 / License:
+       Creative Commons Attribution 4.0 International (CC BY 4.0)
+       https://creativecommons.org/licenses/by/4.0/
+
+     署名 / Attribution:
+       Planet and star textures © Solar System Scope
+       (https://www.solarsystemscope.com/)
+       Licensed under CC BY 4.0.
+
+  2) 地球昼面 / 夜面 / 云层 —— NASA Visible Earth（公有领域 / public domain）
+     Blue Marble: Next Generation（2004-12，含海底地形，21600x10800）
+       https://eoimages.gsfc.nasa.gov/images/imagerecords/73000/73909/world.topo.bathy.200412.3x21600x10800.jpg
+     Black Marble — Earth at Night 2012（13500x6750）
+       https://eoimages.gsfc.nasa.gov/images/imagerecords/79000/79765/dnb_land_ocean_ice.2012.13500x6750.jpg
+     Cloud Combined — 全球云量合成（2048x1024）
+       https://eoimages.gsfc.nasa.gov/images/imagerecords/57000/57747/cloud_combined_2048.jpg
+
+     许可 / License:
+       NASA 素材属公有领域，使用须遵守 NASA Media Usage Guidelines
+       https://www.nasa.gov/nasa-brand-center/images-and-media/
+
+     署名 / Credit:
+       NASA Earth Observatory / NASA Visible Earth
+
+说明:
+  仅做等比降采样、格式转换（JPG -> PNG）与拼图，画面内容未做编辑。
+  Solar System Scope 的 CC BY 4.0 署名需随 mod 分发一并保留。
+  生成脚本（可复现）: deliverables/endatlas_tools/build_end_atlas.ps1

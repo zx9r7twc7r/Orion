@@ -1,0 +1,324 @@
+#version 460
+// =====================================================
+// 本地光 DI 项：à-trous 空间滤波（5 级：1/2/4/8/16）
+//
+// 移植自 MCVR（Minecraft-Radiance/MCVR，GPL-3.0）
+//   src/shader/world/svgf/direct_atrous_step{1,2,4,8,16}.comp
+// 与 direct_atrous_step1.comp 逐行对应。相对参考实现的**唯一**结构性差异：
+//   MCVR 把步长写成每个文件里的 `const int STEP_SIZE`（5 份近乎相同的文件），
+//   本项目沿用"一份 shader + push constant 传步长"，算术逐字相同。
+//
+// 与项目里旧版（我手写那版，已归档为 rt_direct_atrous.comp.p1_space_only_5level.src）
+// 的差异，全部是为了回到参考实现：
+//   1) **方差图**：旧版在 pass 内用 3x3 现算方差；MCVR 由 direct_moments.comp 产出
+//      方差图并在 5 级之间传递（binding 4 输入 / binding 5 输出）。phiL 也由此驱动：
+//          phiL = max(phiColor * sqrt(variance), 1.0)
+//   2) **法线**：MCVR 的 computeWeight 里 `wNormal = 1.0`，**完全不用法线**做边缘停止；
+//      旧版自己加了 `dot(centerNormal, n) > 0 ? 1 : 0` 的门（更严，导致本该被抹平的
+//      噪声在面边界处残留）。
+//   3) **萤火虫钳制**：MCVR 在替换中心颜色的同时把方差也压下来
+//      (`varianceCenter = min(varianceCenter, 0.1)`)，旧版只替换颜色。
+//   4) 深度早退：MCVR 用 `centerDepth >= INF_DISTANCE*0.5`；本项目深度是裁剪空间
+//      z/w、约定不同，故不加这条早退（天空像素由 raygen 另行处理）。
+// =====================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// binding 0/1：颜色输入与输出（C++ 侧在 5 级之间 ping-pong）
+layout(binding = 0, rgba16f) uniform readonly image2D atrousColorInput;
+layout(binding = 1, rgba16f) uniform writeonly image2D atrousColorOutput;
+// binding 2/3：深度与法线·粗糙度引导图（与 MCVR 的 linearDepth / normalRoughness 对应）
+layout(binding = 2, r32f) uniform readonly image2D atrousLinearDepth;
+layout(binding = 3, rgba16f) uniform readonly image2D atrousNormalRoughness;
+// binding 4/5：方差输入与输出（与颜色同 parity 一起 ping-pong）
+layout(binding = 4, r16f) uniform readonly image2D atrousVarianceInput;
+layout(binding = 5, r16f) uniform writeonly image2D atrousVarianceOutput;
+
+layout(push_constant) uniform DirectAtrousPushConstants
+{
+    uint width;
+    uint height;
+    // MCVR 里是 const int STEP_SIZE；这里逐级由 C++ 传入（1/2/4/8/16）
+    uint stepSize;
+    // MCVR 的 kPhiColor，由 C++ 传 4.0
+    float phiColor;
+    // 1 = 这一级是链尾：写回合成端要读的 NRD 输出图，需编回 REBLUR 的 YCoCg。
+    // 中间各级都停留在线性域（本 pass 的 luminance() 是 Rec.709），与 MCVR 一致。
+    uint encodeToYCoCg;
+} atrousPush;
+
+const float kPhiNormal = 128.0;  // MCVR 原值，注释 "Aligned with reference implementation"
+
+// =====================================================
+// 2026-09-28 萤火虫钳制的绝对项：按本项目的辐照度量级取值
+//
+// MCVR 原式是 `中心 > 邻域均值 × 5 + 0.1`，那个 **0.1 是绝对量**，按它自己的辐照度
+// 量级定的。本项目的本地光项亮度落在 0.01~0.1 一带（见 rt_nrd_composite.comp 的
+// 亮度标尺探针分档 0.04/0.08/0.16/…），于是 `+0.1` 让对方判据**几乎永不触发**：
+// 尤其在**光弱**的区域均值趋近 0、`0.1` 完全主导 ⇒ 亮尖峰全部放过 ⇒ 相对噪声爆炸。
+// 这与实测"光越弱噪声越严重"完全吻合。
+//
+// 相对项（×5）保持 MCVR 原值不动，只把绝对项缩到本项目量级。
+// 回退：-DRT_DI_FIREFLY_ABS=0.1（即 MCVR 原值）
+// =====================================================
+#ifndef RT_DI_FIREFLY_ABS
+#define RT_DI_FIREFLY_ABS 0.005
+#endif
+
+// =====================================================
+// 2026-09-28 诊断：à-trous 原样透传（只保留链尾编码）
+//
+// 用途：把"低频云斑"的归属一刀切开。
+//   加深时域窗口（alpha 0.1 -> 0.05）**没有改善** ⇒ 云斑不是时间随机噪声，
+//   而是**时间上稳定、空间上成片**的结构性误差 ⇒ 继续调时域参数不会有用。
+//   于是只剩两种可能：
+//     (a) 空间滤波自己造出来的（宽核 + 萤火虫钳制 + AABB 钳制的非线性）
+//     (b) 本来就在输入里（估计量的空间结构：光源选择/栅格/权重）
+//   本开关 = 1 时，5 级全部退化为"输出=输入"，只保留最后一级的 YCoCg 编码，
+//   于是最终画面就是**时域那一步的输出**。
+//     开启后云斑**消失**  => (a)：病在滤波这一步
+//     开启后云斑**仍在**  => (b)：病在输入（估计量）
+//
+// 回退：不开这个宏即恢复原样（默认 0）。
+// =====================================================
+#ifndef RT_DI_ATROUS_BYPASS
+#define RT_DI_ATROUS_BYPASS 0
+#endif
+
+float luminance(vec3 c)
+{
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 normalizeSafe(vec3 v)
+{
+    float len = length(v);
+    return (len > 1e-4) ? (v / len) : vec3(0.0, 0.0, 1.0);
+}
+
+// 照抄 rt_restir_final.rgen 的 _NRD_LinearToYCoCg（合成端做逆变换，必须同一套）
+vec3 nrdLinearToYCoCg(vec3 color)
+{
+    float Y = dot(color, vec3(0.25, 0.5, 0.25));
+    float Co = dot(color, vec3(0.5, 0.0, -0.5));
+    float Cg = dot(color, vec3(-0.25, 0.5, -0.25));
+
+    return vec3(Y, Co, Cg);
+}
+
+// MCVR computeVarianceCenter：2x2 权重铺在 3x3 上，越界跳过（不做归一化）
+float computeVarianceCenter(ivec2 pixel, ivec2 size)
+{
+    const float kernel[2][2] = float[2][2](
+        float[2](0.25, 0.125),
+        float[2](0.125, 0.0625)
+    );
+
+    float sum = 0.0;
+
+    for(int dy = -1; dy <= 1; ++dy)
+    {
+        for(int dx = -1; dx <= 1; ++dx)
+        {
+            ivec2 q = pixel + ivec2(dx, dy);
+            if(q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y)
+            {
+                continue;
+            }
+
+            float k = kernel[abs(dx)][abs(dy)];
+            sum += imageLoad(atrousVarianceInput, q).r * k;
+        }
+    }
+
+    return sum;
+}
+
+// MCVR estimateDepthFwidth：前向差分的深度梯度，下限 1e-4
+float estimateDepthFwidth(float centerDepth, ivec2 pixel, ivec2 size)
+{
+    float dx = 0.0;
+    float dy = 0.0;
+
+    if(pixel.x + 1 < size.x)
+    {
+        dx = abs(
+            centerDepth -
+            imageLoad(atrousLinearDepth, pixel + ivec2(1, 0)).r
+        );
+    }
+
+    if(pixel.y + 1 < size.y)
+    {
+        dy = abs(
+            centerDepth -
+            imageLoad(atrousLinearDepth, pixel + ivec2(0, 1)).r
+        );
+    }
+
+    return max(max(dx, dy), 1.0e-4);
+}
+
+// MCVR computeWeight：wNormal 恒 1（**不使用法线**）
+float computeWeight(
+    float depthCenter,
+    float depthP,
+    float phiDepth,
+    vec3 normalCenter,
+    vec3 normalP,
+    float phiNormal,
+    float lumCenter,
+    float lumP,
+    float phiColor
+)
+{
+    float wNormal = 1.0;
+    float wZ = abs(depthCenter - depthP) / max(phiDepth, 1.0e-4);
+    float wL = abs(lumCenter - lumP) / max(phiColor, 1.0e-4);
+    return exp(-max(wL, 0.0) - max(wZ, 0.0)) * wNormal;
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(atrousColorInput);
+
+    if(pixel.x >= size.x || pixel.y >= size.y)
+    {
+        return;
+    }
+
+    vec3 centerColor = imageLoad(atrousColorInput, pixel).rgb;
+    float centerDepth = imageLoad(atrousLinearDepth, pixel).r;
+    vec3 centerNormal = imageLoad(atrousNormalRoughness, pixel).xyz;
+    float varianceCenter = imageLoad(atrousVarianceInput, pixel).r;
+    float varianceForPhi = computeVarianceCenter(pixel, size);
+
+    // --- OUTLIER REMOVAL (Firefly Clamp)，MCVR 原样 ---
+    {
+        vec3 sumNeighbors = vec3(0.0);
+        float count = 0.0;
+
+        for(int dy = -1; dy <= 1; ++dy)
+        {
+            for(int dx = -1; dx <= 1; ++dx)
+            {
+                if(dx == 0 && dy == 0)
+                {
+                    continue;
+                }
+
+                ivec2 q = pixel + ivec2(dx, dy);
+                if(q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y)
+                {
+                    continue;
+                }
+
+                sumNeighbors += imageLoad(atrousColorInput, q).rgb;
+                count += 1.0;
+            }
+        }
+
+        if(count > 0.0)
+        {
+            vec3 meanNeighbors = sumNeighbors / count;
+
+            if(luminance(centerColor) >
+               luminance(meanNeighbors) * 5.0 + RT_DI_FIREFLY_ABS)
+            {
+                centerColor = meanNeighbors;
+                varianceCenter = min(varianceCenter, 0.1);
+            }
+        }
+    }
+
+    float centerLum = luminance(centerColor);
+    vec3 nCenter = normalizeSafe(centerNormal);
+    float fwidthZ = estimateDepthFwidth(centerDepth, pixel, size);
+
+    // DIRECT LIGHTING: EXTREME —— 与 MCVR 相同的两个 phi（故意放松边缘停止）
+    float phiDepth = max(fwidthZ, 1.0e-4) * float(atrousPush.stepSize) * 10.0;
+    float phiL = max(atrousPush.phiColor * sqrt(max(varianceForPhi, 0.0)), 1.0);
+
+    float sumW = 1.0;
+    vec3 sumC = centerColor;
+    float sumVarW2 = varianceCenter;
+
+    // 归一化核：1D 和 = 9，2D 归一化 = 9*9
+    const float kernel[5] = float[5](1.0, 2.0, 3.0, 2.0, 1.0);
+    const float kernelNorm = 9.0;
+
+    for(int dy = -2; dy <= 2; ++dy)
+    {
+        for(int dx = -2; dx <= 2; ++dx)
+        {
+            if(dx == 0 && dy == 0)
+            {
+                continue;
+            }
+
+            ivec2 q = pixel + ivec2(dx, dy) * int(atrousPush.stepSize);
+            if(q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y)
+            {
+                continue;
+            }
+
+            vec3 c = imageLoad(atrousColorInput, q).rgb;
+            float d = imageLoad(atrousLinearDepth, q).r;
+            vec3 n = normalizeSafe(
+                imageLoad(atrousNormalRoughness, q).xyz
+            );
+            float lum = luminance(c);
+            float varNeighbor = imageLoad(atrousVarianceInput, q).r;
+
+            float w = computeWeight(
+                centerDepth,
+                d,
+                phiDepth * length(vec2(float(dx), float(dy))),
+                nCenter,
+                n,
+                kPhiNormal,
+                centerLum,
+                lum,
+                phiL
+            );
+
+            float wK = w * (
+                kernel[abs(dx)] * kernel[abs(dy)] /
+                (kernelNorm * kernelNorm)
+            );
+
+            sumC += c * wK;
+            sumW += wK;
+            sumVarW2 += varNeighbor * (wK * wK);
+        }
+    }
+
+#if RT_DI_ATROUS_BYPASS
+    // 诊断透传（见文件上方说明）：把结果换成中心值，其余算术照跑，
+    // 保持执行路径与正式版本一致，只有这一步的输出不同。
+    vec3 outColor = centerColor;
+    float outVar = varianceCenter;
+#else
+    vec3 outColor = sumC / max(sumW, 1.0e-4);
+    float outVar = sumVarW2 / max(sumW * sumW, 1.0e-4);
+#endif
+
+    // 链尾（encodeToYCoCg != 0）写回合成端读的 NRD 输出图，必须编回 YCoCg；
+    // 中间各级停在线性域，与 MCVR 的数学一致。.w 在 REBLUR 里是归一化命中距离，
+    // 本链无消费者（rt_nrd_composite.comp 注释已确认），写 1.0。
+    if(atrousPush.encodeToYCoCg != 0u)
+    {
+        imageStore(
+            atrousColorOutput,
+            pixel,
+            vec4(nrdLinearToYCoCg(outColor), 1.0)
+        );
+    }
+    else
+    {
+        imageStore(atrousColorOutput, pixel, vec4(outColor, 1.0));
+    }
+
+    imageStore(atrousVarianceOutput, pixel, vec4(outVar, 0.0, 0.0, 0.0));
+}

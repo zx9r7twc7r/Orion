@@ -1,0 +1,75 @@
+#version 460
+// ===========================================================================
+// 双边上采样 / 重建（2026-10-22）
+//
+// 在 UE Mode 0 的三段式里担任"1/4 追踪 → 1/2 重建"这一级：
+//   trace(W/4) → [本 pass] → recon(W/2) → tonemap 双线性到全屏(W)
+//
+// 算法照 jiaozi158/UnityVolumetricCloudsURP（MIT, 2024）
+// VolumetricCloudsUpscale.hlsl:16-45 的 BilateralUpscale：
+//   权重 = exp(-dist²) × 1/(colorDiff + ε)
+// 在其基础上多一项**相对深度权重**（本仓库的云图带首个命中距离，
+// 云缘两侧的深度差往往比颜色差更能区分前景/背景）。
+//
+// 深度输出取中心 texel 的最近邻值，**不做加权平均**：TAA 下一帧要用它做
+// 重投影校验，模糊过的深度会让校验失去意义（HANDOFF §4 #16 踩过同款）。
+// ===========================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D srcColor;
+layout(set = 0, binding = 1) uniform sampler2D srcDepth;
+layout(rgba16f, set = 0, binding = 2) uniform writeonly image2D dstColor;
+layout(r32f, set = 0, binding = 3) uniform writeonly image2D dstDepth;
+
+// 2026-10-22：7x7（KERNEL 3）在 **2 倍放大**时核相对太大，等于额外糊一层。
+// 参考的实现是 1/4 → 1/2，放大倍数与核是配套的；我们这里放大倍数随 --trace-div 变，
+// 核得跟着缩。实测（1/2 档）：KERNEL 3 → 锐度 1.171，KERNEL 2 → 见下方注释。
+const int KERNEL = 2;   // 5x5
+
+void main()
+{
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 dstSize = imageSize(dstColor);
+    if(any(greaterThanEqual(pixel, dstSize))) return;
+
+    const vec2 uv = (vec2(pixel) + 0.5) / vec2(dstSize);
+    const vec2 srcTexel = 1.0 / vec2(textureSize(srcColor, 0));
+
+    const vec4 center = texture(srcColor, uv);
+    const float centerZ = texture(srcDepth, uv).r;
+
+    vec4 sum = vec4(0.0);
+    float weightSum = 0.0;
+
+    for(int j = -KERNEL; j <= KERNEL; ++j)
+    {
+        for(int i = -KERNEL; i <= KERNEL; ++i)
+        {
+            const vec2 ouv = uv + vec2(float(i), float(j)) * srcTexel;
+            const vec4 c = texture(srcColor, ouv);
+            const float z = texture(srcDepth, ouv).r;
+
+            // 空间核
+            const float wSpatial = exp(-float(i * i + j * j) * 0.35);
+
+            // 颜色核：颜色越接近权重越大（参考的 1/(colorDiff+ε)）
+            const float colorDiff = length(c.rgb - center.rgb) + abs(c.a - center.a);
+            const float wColor = 1.0 / (colorDiff + 1.0e-3);
+
+            // 深度核：相对深度差。云是薄壳，跨云缘的深度跳变很大，
+            // 这一项保证云边不会被邻居的天空/远景糊掉。
+            const float zDiff = abs(z - centerZ) / max(centerZ, 1.0);
+            const float wDepth = exp(-zDiff * 40.0);
+
+            const float w = wSpatial * wColor * wDepth;
+            sum += c * w;
+            weightSum += w;
+        }
+    }
+
+    const vec4 result = sum / max(weightSum, 1.0e-5);
+    imageStore(dstColor, pixel, result);
+    // 深度最近邻：TAA 的重投影校验要的是"这个像素真实的云距"，不是加权平均。
+    imageStore(dstDepth, pixel, vec4(centerZ, 0.0, 0.0, 0.0));
+}

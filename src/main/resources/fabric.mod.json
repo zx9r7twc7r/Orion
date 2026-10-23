@@ -1,0 +1,45 @@
+{
+	"schemaVersion": 1,
+	"id": "orion",
+	"version": "beta 0.42",
+	"name": "Orion",
+	"description": "Orion RT — real-time path traced renderer for Minecraft (beta 0.42).",
+	"authors": [
+		"yani-neko7"
+	],
+	"contact": {
+		"homepage": "https://github.com/yani-neko7/Orion",
+		"sources": "https://github.com/yani-neko7/Orion",
+		"issues": "https://github.com/yani-neko7/Orion/issues"
+	},
+	"license": "MIT",
+	"icon": "assets/orion/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"com.example.ExampleMod"
+		],
+		"client": [
+			"com.example.client.ExampleModClient"
+		]
+	},
+	"mixins": [
+		"orion.mixins.json",
+		{
+			"config": "orion.client.mixins.json",
+			"environment": "client"
+		},
+		{
+			"config": "orion.dh.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": "~26.3",
+		"java": ">=25"
+	},
+	"suggests": {
+		"distanthorizons": ">=3.3.0"
+	}
+}

@@ -1,0 +1,6 @@
+rt_test.rgen
+ERROR: rt_test.rgen:20103: '' :  syntax error, unexpected RIGHT_BRACE, expecting RIGHT_PAREN
+ERROR: 1 compilation errors.  No code generated.
+
+
+SPIR-V is not generated for failed compile or link

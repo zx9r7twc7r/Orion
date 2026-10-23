@@ -1,0 +1,144 @@
+# gradle
+
+.gradle/
+build/
+out/
+classes/
+
+# eclipse
+
+*.launch
+
+# idea
+
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# vscode
+
+.settings/
+.vscode/
+bin/
+.classpath
+.project
+
+# macos
+
+*.DS_Store
+
+# fabric
+
+run/
+
+# java
+
+hs_err_*.log
+replay_*.log
+*.hprof
+*.jfr
+
+# 2026-09-30 基线备份用：以下目录合计约 3.4 GB，全是缓存/构建产物/参考包副本，
+# 与源码回退无关。首次 git init 前必须排除，否则基线提交会吞掉整个磁盘。
+.gradle-user-home/
+.tmp/
+.tmp_*/
+.gradle/
+caches/
+daemon/
+/wrapper/
+.tools/
+.workbuddy/
+_voxy_probe/
+GuangZhui-Internal-Beta-0.1-Windows-x64/
+
+# cpp 侧构建产物与缓存（cpp/shaders 下的 .rgen/.comp/.spv 要保留，
+# 那是本次删除的对象，必须进基线）
+cpp/build/
+cpp/caches/
+cpp/daemon/
+cpp/wrapper/
+cpp/cmake-build-debug/
+cpp/.tmp/
+# NRD 是带独立 .git 的外部依赖，我们不改它，整目录排除以免
+# git 报 "adding embedded git repository"
+cpp/deps/
+
+# ============================================================
+# 2026-10-23 公开发布前清理：以下全是本地产物 / 历史备份 / 运行日志，
+# 不是源码。排除它们后，仓库里不再出现旧品牌字样（含二进制与备份文件）。
+# ============================================================
+*.bak
+*.bak_*
+*_bak_*
+*.serbak
+*.orig
+*.rej
+*.log
+*.obj
+__pycache__/
+dist/
+dist-*/
+run-deferred/
+.codebuddy/
+.trae/
+.workbuddy-ai/
+.workbuddy/
+voxy-*.jar
+/rtx_backend.dll
+/rtx_backend.exp
+/rtx_backend.lib
+
+# 2026-10-23：实验截图 / 未压缩中间图（shots 内 524 张 .ppm，共 800MB+）
+shots/
+/*.ppm
+/*.png
+/_vc/
+/refs/
+/.cont2-ref/
+
+# 第三方依赖 checkout 里残留的 .git（imgui 本体已作为普通源码提交）
+# imgui 示例字体带独立字体许可且本项目不用，不随仓库分发
+cpp/external/imgui/misc/fonts/
+cpp/external/**/.git/
+cpp/external/**/.git
+
+# 第三方 "RTX40MFG" MFG 解锁模块：非本项目代码、许可未知，不进公开仓库
+/src/main/resources/natives/windows/RTXMFG.dll
+
+# 打包产物 / 旧发布 zip：走 GitHub Releases，不进仓库
+/Orion*.zip
+/src.zip
+/vulkan-rtx-java-current.zip
+*.spvasm
+
+# 开发期临时脚本与验证目录（_deploy_*/_perf_l10 等仍保留）
+/.build_scratch/
+/_tmp_*
+/cpp/shaders/.tmpverify/
+
+# ============================================================
+# 2026-10-23 仓库只保留光追源码：以下为文档 / 实验产物 / 工具脚本，
+# 只留在本地工作区，不进公开仓库。
+# ============================================================
+/tools/
+/perf/
+/deliverables/
+/cpp/deliverables/
+/cpp/native/
+/native/
+/.trae/
+/cpp/aurora_port_probe.py
+
+# 根目录开发期脚本与临时输出
+/_*
+/*.txt
+/HANDOFF-*.md
+/run_preview.bat
+/yarn.xml
+
+# shader 目录里的说明文档（源码与 spv 保留）
+/cpp/shaders/*.md
+/cpp/shaders/rt_ser_probe_compile.txt
+
