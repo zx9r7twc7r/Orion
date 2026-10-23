@@ -3,35 +3,16 @@
 //
 // 2026-10-20: single source of truth (was six hand-synced copies).
 //
-// RT_DEFERRED_MATERIAL undefined (default) -> 20 dwords / 80 B, material carried
-//                                            through traversal, exactly as before.
-// RT_DEFERRED_MATERIAL defined            -> 11 dwords / 48 B identity only; the
-//                                            closest-hit shaders write the hit
-//                                            identity, ray generation evaluates
-//                                            the material into a *local*
-//                                            HitPayload and never touches the ray
-//                                            payload again.
+// 2026-10-23: 延迟材质（RT_DEFERRED_MATERIAL）整段删除后只剩一种 payload ——
+//   材质在命中着色器里求完，20 dwords / 80 B 全字段都要跨 traversal 保留。
+//   曾与该路径并存的 48 B「identity only」版本（结构体 HitIdentity 与宏
+//   HIT_IDENTITY_GLASS_BIT）随之删除。
+//
+// 注：当前没有任何字段是"只为延迟路径存在"的，但也没有做瘦身 —— 缩小 payload
+//     是独立的收益项，不与本次删除混在一起做。
 // =============================================================================
 #ifndef HIT_PAYLOAD_GLSL
 #define HIT_PAYLOAD_GLSL
-
-// Set by the deferred closest-hit shaders so the ray-generation dispatcher knows
-// which material body owns this hit (opaque vs camera-side glass).
-#define HIT_IDENTITY_GLASS_BIT (1u << 13u)
-
-struct HitIdentity {
-    // Deferred ray payload (location 0): only what has to survive traversal.
-    // The material itself is evaluated after the ray, in ray generation.
-    vec3 albedo;              // Any-Hit accumulated tint, or miss sky radiance
-    float hitDistance;
-    uint state;               // ray purpose | HIT_IDENTITY_GLASS_BIT
-    uint instanceIndex;
-    uint primitiveIndex;
-    float baryX;
-    float baryY;
-    float glassAlpha;         // Any-Hit accumulator
-    float parallaxRayTravel;  // Any-Hit accumulator
-};
 
 struct HitPayload {
     float hitDistance;

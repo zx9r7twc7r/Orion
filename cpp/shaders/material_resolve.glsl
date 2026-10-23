@@ -1,17 +1,13 @@
 // =============================================================================
-// Deferred material resolution.
+// Material resolution body (命中着色器内就地求值).
 //
-// 2026-10-20: the closest-hit shaders can now return only the hit *identity*
-// (t, instance, primitive, barycentrics) and leave the whole material evaluation
-// (LabPBR atlases, POM march + self shadow, entity/particle/voxy/DH paths,
-// OpenPBR closure, RR guide inputs) to ray generation, i.e. "after the ray is
-// done".  Rollback entry: nothing in here is compiled unless the translation
-// unit defines RT_DEFERRED_MATERIAL (default 0) -- see the bottom of
-// rt_test.rchit for the two modes.
+// 2026-10-20: 从 rt_test.rchit::main() 抽出来的共享体。
+// 2026-10-23: 延迟材质（RT_DEFERRED_MATERIAL）整段删除后，这里是唯一的材质
+// 求值路径 —— 由 rt_test.rchit 的命中着色器调用，ray generation 不再参与。
 //
 // The body below is the *verbatim* former body of rt_test.rchit::main(), only
-// with the ray builtins replaced by parameters.  Do not restyle it: both modes
-// must stay bit-identical.
+// with the ray builtins replaced by parameters.  Do not restyle it: 它的调用点
+// 假设这段与抽出来之前逐位等价。
 //
 // Contract for the includer:
 //   * a variable named `payload` of type HitPayload (rayPayloadInEXT in the hit

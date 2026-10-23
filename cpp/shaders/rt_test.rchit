@@ -1,8 +1,4 @@
 #version 460
-// 2026-10-21：延迟材质已是唯一模式（见文档 §13），本 TU 只写命中身份。
-#if !defined(RT_DEFERRED_MATERIAL) && !defined(RT_BUILD_PRODUCTION_MODE)
-#define RT_DEFERRED_MATERIAL 1
-#endif
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_ray_tracing : require
 #extension GL_EXT_buffer_reference2 : require
@@ -19,11 +15,7 @@
 
 // 2026-10-20: 结构体单源化，见 hit_payload.glsl（六个 shader 共用同一份布局）。
 #include "hit_payload.glsl"
-#ifdef RT_DEFERRED_MATERIAL
-layout(location = 0) rayPayloadInEXT HitIdentity payload;
-#else
 layout(location = 0) rayPayloadInEXT HitPayload payload;
-#endif
 
 const uint RT_STATE_PURPOSE_MASK       = 0x7u;
 const uint RT_STATE_HIT_CLASS_SHIFT    = 3u;
@@ -74,14 +66,10 @@ uint makeHitState(
         ((transparentProfile & 0x7u) << RT_STATE_PROFILE_SHIFT);
 }
 
-uint getTransparentProfileFromRawMaterialId(float materialId)
-{
-    return uint(
-        round(
-            clamp(fract(materialId) * 10.0, 0.0, 4.0)
-        )
-    );
-}
+// 2026-10-23：原来这里是 5 份副本之一，已收进透明剖面共享头。
+// 本 TU 不 include material_common.glsl（它依赖 rgen 侧的 payload/灯光声明），
+// 所以直接引这个无依赖的小头。
+#include "transparent_profile_common.glsl"
 hitAttributeEXT vec2 attribs;
 
 struct Vertex {
@@ -1899,19 +1887,11 @@ float tracePOMSelfShadow(
 
 
 // =============================================================================
-// 2026-10-20 deferred material (rollback entry: RT_DEFERRED_MATERIAL)
-//
-//   0 (default) = today's behaviour: the closest-hit shader evaluates the whole
-//                 material here, through resolveHitMaterial() (same code, same
-//                 order, same results -- only the function boundary is new).
-//   1           = the closest-hit shader returns only the hit identity; ray
-//                 generation evaluates the material after the ray is done
-//                 (rt_test.rgen: resolveHitMaterial() right after each trace).
-//
-// Both modes share material_resolve.glsl, so they cannot drift apart.
+// 2026-10-23：延迟材质整段删除后，本 TU 是唯一的材质求值点——命中着色器通过
+// resolveHitMaterial() 就地求完整个材质。
 // =============================================================================
-// Deferred material body (shared with rt_test.rgen).  Placed here, after every
-// material helper it calls, so the include sees the helper declarations.
+// 材质体（共享体在 material_resolve.glsl）。放在这里，确保 include 点之前
+// 它调用的每个 helper 都已声明。
 //
 // LOD role indirection: lod_coverage.glsl 的 lodInstanceRole() 读 gl_InstanceCustomIndexEXT，
 // 那是命中着色器的内建；rgen 没有它。共享体因此只认 materialLodRole()，本 TU 直接转调
@@ -1922,34 +1902,16 @@ uint materialLodRole(uint instanceIndex)
 }
 
 // 共享解析体写入它；本 TU 的材质 helper 仍直接读 gl_HitTEXT，这里只是让共享体
-// 在两个 TU 里都能编译。
-//
-// 2026-10-20：原来只补了 materialHitT，漏了 materialRayOrigin / materialRayDirection
-// ⇒ **不定义 RT_DEFERRED_MATERIAL 时整个文件编译不过**（material_resolve.glsl:74
-// "'materialRayOrigin' : undeclared identifier"）。也就是说"默认关闭即旧行为"这条
-// 回退路径此前只在 SPV 层面成立、在源码层面是坏的。三个全局量都在
-// resolveHitMaterial() 开头被写入，初值只为满足声明，不参与求值。
+// 能编译。三个全局量都在 resolveHitMaterial() 开头被写入，初值只为满足声明，
+// 不参与求值。
 float materialHitT = 0.0;
 vec3 materialRayOrigin = vec3(0.0);
 vec3 materialRayDirection = vec3(0.0, 0.0, -1.0);
 
-// 延迟模式下命中着色器不调用材质体（它在 rgen 里跑），共享体只引用旧布局的
-// payload 字段，因此只在旧模式下编译。
-#ifndef RT_DEFERRED_MATERIAL
 #include "material_resolve.glsl"
-#endif
 
 void main()
 {
-#ifdef RT_DEFERRED_MATERIAL
-    // Identity only.  Layout-compatible with the shared 80-byte payload, so the
-    // any-hit / miss / translucent shaders need no change.
-    payload.hitDistance = gl_HitTEXT;
-    payload.instanceIndex = uint(gl_InstanceCustomIndexEXT);
-    payload.primitiveIndex = uint(gl_PrimitiveID);
-    payload.baryX = attribs.x;
-    payload.baryY = attribs.y;
-#else
     // 2026-10-21 根因修复（生产模式崩溃的真正原因）：
     // resolveHitMaterial() 的 miss 判定读 payload.hitDistance，取命中身份读
     // payload.normal.x/.y/.z 与 payload.roughness（见 material_resolve.glsl:41-63）。
@@ -1966,6 +1928,5 @@ void main()
     );
     payload.roughness = attribs.y;
     resolveHitMaterial(gl_WorldRayOriginEXT, gl_WorldRayDirectionEXT);
-#endif
 }
 

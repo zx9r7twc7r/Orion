@@ -1,11 +1,10 @@
 // =============================================================================
-// Deferred material resolution -- translucent (camera-side glass) body.
+// Translucent (camera-side glass) material body.
 //
-// 2026-10-20: rt_test_translucent.rchit can now return only the hit identity and
-// let ray generation evaluate the pane material (dye tint, thin-sheet lobes,
-// stained glass, portal emission, POM relief).  Body below is the verbatim former
+// 2026-10-20: 从 rt_test_translucent.rchit::main() 抽出的共享体（染料色、薄片
+// lobe、染色玻璃、传送门自发光、POM 浮雕）。Body below is the verbatim former
 // body of that shader's main(), with the ray builtins replaced by parameters.
-// Rollback: RT_DEFERRED_MATERIAL undefined -> the shader keeps the old path.
+// 2026-10-23: 延迟材质整段删除后，这是玻璃片材质唯一的求值路径。
 //
 // Includer contract (same as material_resolve.glsl, plus):
 //   * payload, sectionVertexAddressBuffer, Vertices/Vertex/VertexMotions,

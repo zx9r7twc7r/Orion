@@ -51,28 +51,6 @@ loom {
 			// 当前取值会打在 [RT GEOMETRY] counters 行的 opts= 字段上。
 		}
 
-		// =====================================================================
-		// 2026-10-20 双工作区：延迟材质档（RT_DEFERRED_MATERIAL）独立 gameDir。
-		//
-		// 为什么需要独立 gameDir：rtx_backend.dll 用 GetRTXBackendDirectory() +
-		// "shaders\\rt_test.rgen.spv" 这种相对路径取 SPV，而 <gameDir>/shaders 每次
-		// 启动都会被 extractBundledShaders() 从 mod 根目录覆盖。两档共用 run/ 时，
-		// 后部署的一套会静默顶掉另一套 —— 所以两档必须各自有一个 shaders/ 目录，
-		// 也就必须各自有一个 gameDir。
-		//
-		// 生产档：runClient        -> run/           （shaders/ 来自随包的 shaders/）
-		// 延迟档：runClientDeferred -> run-deferred/  （shaders/ 来自 shaders_deferred/）
-		//
-		// 隔离的只有 SPV 与运行期缓存；存档/resourcepacks 用 junction 共享（见
-		// deliverables/延迟材质-2026-10-20.md 第 11 节），避免出现"换档就换存档"。
-		// =====================================================================
-		clientDeferred {
-			client()
-			runDir "run-deferred"
-			vmArg "-XX:NativeMemoryTracking=summary"
-			// 让 extractBundledShaders() 改从 <mod root>/shaders_deferred 取源。
-			vmArg "-Drtx.shaderSet=shaders_deferred"
-		}
 	}
 }
 

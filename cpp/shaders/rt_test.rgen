@@ -1,19 +1,11 @@
 #version 460
-// 2026-10-21：延迟材质（RT_DEFERRED_MATERIAL）已是**唯一模式** —— 生产模式在
-// 本机进世界必崩（"Item in hand" 的 RT 注入 5s 超时，见文档 §13），所以这里无条件
-// 定义，构建不再需要 -D。下面的 #ifdef 分支仅作归档，不再是可选路径。
-#if !defined(RT_DEFERRED_MATERIAL) && !defined(RT_BUILD_PRODUCTION_MODE)
-#define RT_DEFERRED_MATERIAL 1
-#endif
+// 2026-10-23：延迟材质路径（RT_DEFERRED_MATERIAL）已整段删除。材质只在命中着色器
+// 里求值（resolveHitMaterial），ray generation 不再承担材质体；原先"两种模式"的
+// 条件编译与兜底 #define 一并不存在了。
 #extension GL_GOOGLE_include_directive : require
 
 #extension GL_EXT_ray_tracing : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-#ifdef RT_DEFERRED_MATERIAL
-// Needed by material_common.glsl (buffer_reference vertex tables).
-#extension GL_EXT_buffer_reference2 : require
-#extension GL_EXT_scalar_block_layout : require
-#endif
 #ifdef RT_ENABLE_SER
 #extension GL_EXT_shader_invocation_reorder : require
 #endif
@@ -6118,15 +6110,6 @@ bool localLightGridLookupCell(
 // 2026-10-20: 结构体单源化，见 hit_payload.glsl（六个 shader 共用同一份布局）。
 #include "hit_payload.glsl"
 
-#ifdef RT_DEFERRED_MATERIAL
-// Defined in material_resolve.glsl (included just above main).  In this mode the
-// closest-hit shaders only return the hit identity; the material is evaluated
-// here, after the ray, from the packed payload.
-void resolveDeferredHit(vec3 rayOrigin, vec3 rayDirection);
-// 只搬运 hitDistance / glassAlpha / albedo 等"不跑材质也有"的字段，
-// 供距离探针与 SkipClosestHit 的可见性射线使用（定义见文件末尾）。
-void resolveDeferredHitNoMaterial();
-#endif
 
 // First-hit surface data for group3.  This is intentionally only the visible
 // glass shell; the straight behind-glass transport stays in its existing
@@ -6138,18 +6121,11 @@ struct GlassSurfaceInfo {
     float alpha;
 };
 
-#ifdef RT_DEFERRED_MATERIAL
-// Ray payload: identity only.  The material result lives in the file-scope
-// `payload` below, which is NOT preserved across a trace.
-layout(location = 0) rayPayloadEXT HitIdentity hit;
-HitPayload payload;
-#else
 layout(location = 0) rayPayloadEXT HitPayload payload;
 // Old mode keeps one variable for both roles; the seed assignments and the
 // Any-Hit-only sites were retargeted to `hit` when the split was introduced,
 // so alias it back instead of keeping two code paths.
 #define hit payload
-#endif
 
 #ifdef RT_ENABLE_SER
 // Perf-L10.8 - SER now covers every ray path, not only the diffuse-GI bounce.
@@ -6323,9 +6299,6 @@ void traceDiffuseSer(vec3 origin, vec3 direction, uint bouncePhase)
         0xff,
         bouncePhase
     );
-    #ifdef RT_DEFERRED_MATERIAL
-    resolveDeferredHit(origin, direction);
-    #endif
 }
 #endif
 
@@ -7390,9 +7363,6 @@ const float WATER_EXTINCTION_DISTANCE =
                 0xff,
                 step
             );
-            #ifdef RT_DEFERRED_MATERIAL
-            resolveDeferredHit(currentOrigin, currentDir);
-            #endif
         }
         else
 #endif
@@ -7410,9 +7380,6 @@ const float WATER_EXTINCTION_DISTANCE =
                 10000.0,
                 0
             );
-            #ifdef RT_DEFERRED_MATERIAL
-            resolveDeferredHit(currentOrigin, currentDir);
-            #endif
         }
 
         // 没有任何几何体阻挡。
@@ -11781,6 +11748,10 @@ for(
                     0.0;
 
                 hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
+                // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
+                // 见 HANDOFF-2026-10-21-VERTEX-32B-TERRAIN.md §8。否则累乘起点是
+                // 上一条射线的残留 albedo，逐帧不同 ⇒ 静止时被 DLSS-RR 当信号累积。
+                hit.albedo = vec3(1.0);
 
 
 #ifdef RT_ENABLE_SER
@@ -11788,7 +11759,8 @@ for(
                 if(cam.perfSerAb.y != 0u)
                 {
                     serTraceRay(
-                        hitPos + N * 0.035,
+                        // 2026-10-23：偏移改沿射线；沿法线会在方块边缘漏光（复盘见 :3037）
+                        hitPos + sampleDirection * 0.001,
                         0.02,
                         sampleDirection,
                         shadowMaxDistance,
@@ -11813,8 +11785,7 @@ for(
                         0,
                         0,
 
-                        hitPos +
-                            N * 0.035,
+                        hitPos + sampleDirection * 0.001,
 
                         0.02,
 
@@ -12030,8 +12001,9 @@ vec3 traceGlassSceneReflectionOneRay(
     // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
     if(cam.perfSerAb.z != 0u)
     {
+        // 2026-10-23：偏移改沿射线；沿法线会在方块边缘漏光（复盘见 :3037）
         serTraceRay(
-            glassSurfacePosition + N * 0.035,
+            glassSurfacePosition + reflectionDirection * 0.001,
             0.02,
             reflectionDirection,
             10000.0,
@@ -12039,9 +12011,6 @@ vec3 traceGlassSceneReflectionOneRay(
             0xff,
             0u
         );
-        #ifdef RT_DEFERRED_MATERIAL
-        resolveDeferredHit(glassSurfacePosition + N * 0.035, reflectionDirection);
-        #endif
     }
     else
 #endif
@@ -12053,15 +12022,12 @@ vec3 traceGlassSceneReflectionOneRay(
             0,
             0,
             0,
-            glassSurfacePosition + N * 0.035,
+            glassSurfacePosition + reflectionDirection * 0.001,
             0.02,
             reflectionDirection,
             10000.0,
             0
         );
-        #ifdef RT_DEFERRED_MATERIAL
-        resolveDeferredHit(glassSurfacePosition + N * 0.035, reflectionDirection);
-        #endif
     }
 
     // Export the real reflection hit distance for DLSS RR specular
@@ -12088,7 +12054,7 @@ vec3 traceGlassSceneReflectionOneRay(
     {
         vec3 reflectionHitPos =
             glassSurfacePosition +
-            N * 0.035 +
+            reflectionDirection * 0.001 +
             reflectionDirection *
             payload.hitDistance;
 
@@ -12590,6 +12556,10 @@ vec3 evaluateSecondaryDiffuseLocalLights(
                 0.0;
 
             hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
+            // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
+            // 见 HANDOFF-2026-10-21-VERTEX-32B-TERRAIN.md §8。否则累乘起点是
+            // 上一条射线的残留 albedo，逐帧不同 ⇒ 静止时被 DLSS-RR 当信号累积。
+            hit.albedo = vec3(1.0);
 
 
 #ifdef RT_ENABLE_SER
@@ -12604,7 +12574,7 @@ vec3 evaluateSecondaryDiffuseLocalLights(
             if(cam.perfSerAb.z != 0u)
             {
                 serTraceRay(
-                    hitPos + N * 0.035,
+                    hitPos + L * 0.001,
                     0.02,
                     L,
                     shadowMaxDistance,
@@ -12629,8 +12599,7 @@ vec3 evaluateSecondaryDiffuseLocalLights(
                     0,
                     0,
 
-                    hitPos +
-                        N * 0.035,
+                    hitPos + L * 0.001,
 
                     0.02,
 
@@ -12799,7 +12768,7 @@ vec3 traceTransparentLowCostGI(
     if(cam.perfSerAb.z != 0u)
     {
         serTraceRay(
-            hitPos + N * 0.035,
+            hitPos + giDirection * 0.001,
             0.02,
             giDirection,
             10000.0,
@@ -12807,9 +12776,6 @@ vec3 traceTransparentLowCostGI(
             0xff,
             0u
         );
-        #ifdef RT_DEFERRED_MATERIAL
-        resolveDeferredHit(hitPos + N * 0.035, giDirection);
-        #endif
     }
     else
 #endif
@@ -12821,17 +12787,12 @@ vec3 traceTransparentLowCostGI(
             0,
             0,
             0,
-            hitPos +
-                N * 0.035,
+            hitPos + giDirection * 0.001,
             0.02,
             giDirection,
             10000.0,
             0
         );
-        #ifdef RT_DEFERRED_MATERIAL
-        resolveDeferredHit(hitPos +
-                N * 0.035, giDirection);
-        #endif
     }
 
 
@@ -13924,9 +13885,6 @@ vec3 tracePrimarySimpleGlassRadiance(
             0xff,
             0u
         );
-        #ifdef RT_DEFERRED_MATERIAL
-        resolveDeferredHit(glassSurfacePosition + straightDirection * 0.01, straightDirection);
-        #endif
     }
     else
 #endif
@@ -13944,9 +13902,6 @@ vec3 tracePrimarySimpleGlassRadiance(
             10000.0,
             0
         );
-        #ifdef RT_DEFERRED_MATERIAL
-        resolveDeferredHit(glassSurfacePosition + straightDirection * 0.01, straightDirection);
-        #endif
     }
 
     if(payload.hitDistance < 0.0)
@@ -14085,10 +14040,6 @@ bool glassMirrorPathIsClear(
         maxDistance,
         0
     );
-    #ifdef RT_DEFERRED_MATERIAL
-    // 只判"这段距离内有没有东西" ⇒ 不需要材质。
-    resolveDeferredHitNoMaterial();
-    #endif
     // 无命中 ⇒ 这段距离内确实没有东西挡在反射方向上。
     return payload.hitDistance < 0.0;
 }
@@ -14233,9 +14184,6 @@ vec3 tracePrimaryGenericTransparentRadiance(
             0xff,
             0u
         );
-        #ifdef RT_DEFERRED_MATERIAL
-        resolveDeferredHit(startOrigin, straightDirection);
-        #endif
     }
     else
 #endif
@@ -14253,9 +14201,6 @@ vec3 tracePrimaryGenericTransparentRadiance(
             10000.0,
             0
         );
-        #ifdef RT_DEFERRED_MATERIAL
-        resolveDeferredHit(startOrigin, straightDirection);
-        #endif
     }
 
 
@@ -15221,9 +15166,9 @@ vec3 tracePrimaryWaterReceiverIndirectReworked(
     if(!runWaterGI) return vec3(0.0);
 
     uint pathState = lodRandom ^ 0x57474942u;
-    vec3 currentOrigin = receiverPos + normalize(receiverNormal) * 0.035;
     vec3 currentDirection =
         sampleHemisphereCosine(normalize(receiverNormal), pathState);
+    vec3 currentOrigin = receiverPos + currentDirection * 0.001;
     vec3 throughput = receiverAlbedo * 0.7;
 #if GI_GLASS_RECEIVER_INDIRECT
     bool insideWater = startInsideWater;
@@ -15263,9 +15208,6 @@ const float WATER_EXTINCTION_DISTANCE =
                 0xff,
                 pathStep
             );
-            #ifdef RT_DEFERRED_MATERIAL
-            resolveDeferredHit(currentOrigin, currentDirection);
-            #endif
         }
         else
 #endif
@@ -15274,9 +15216,6 @@ const float WATER_EXTINCTION_DISTANCE =
                 topLevelAS, gl_RayFlagsNoneEXT, 0xff, 0, 0, 0,
                 currentOrigin, 0.001, currentDirection, 10000.0, 0
             );
-            #ifdef RT_DEFERRED_MATERIAL
-            resolveDeferredHit(currentOrigin, currentDirection);
-            #endif
         }
 
         if(payload.hitDistance < 0.0)
@@ -15446,8 +15385,8 @@ vec3 tracePrimaryWaterReceiverIndirect(
 
     uint pathState = lodRandom ^ 0x57474942u;
     vec3 N = normalize(receiverNormal);
-    vec3 currentOrigin = receiverPos + N * 0.035;
     vec3 currentDirection = sampleHemisphereCosine(N, pathState);
+    vec3 currentOrigin = receiverPos + currentDirection * 0.001;
     vec3 pathThroughput = receiverAlbedo * 0.7;
     bool insideWater = true;
     int waterInterfaceSteps = 0;
@@ -15477,9 +15416,6 @@ vec3 tracePrimaryWaterReceiverIndirect(
                 0xff,
                 pathStep
             );
-            #ifdef RT_DEFERRED_MATERIAL
-            resolveDeferredHit(currentOrigin, currentDirection);
-            #endif
         }
         else
 #endif
@@ -15497,9 +15433,6 @@ vec3 tracePrimaryWaterReceiverIndirect(
                 10000.0,
                 0
             );
-            #ifdef RT_DEFERRED_MATERIAL
-            resolveDeferredHit(currentOrigin, currentDirection);
-            #endif
         }
 
         if(payload.hitDistance < 0.0)
@@ -15851,9 +15784,6 @@ const vec3 WATER_SCATTER_COLOR = waterScatterColor();
                 0xff,
                 step
             );
-            #ifdef RT_DEFERRED_MATERIAL
-            resolveDeferredHit(currentOrigin, currentDirection);
-            #endif
         }
         else
 #endif
@@ -15871,9 +15801,6 @@ const vec3 WATER_SCATTER_COLOR = waterScatterColor();
                 10000.0,
                 0
             );
-            #ifdef RT_DEFERRED_MATERIAL
-            resolveDeferredHit(currentOrigin, currentDirection);
-            #endif
         }
 
 
@@ -15910,9 +15837,6 @@ if(payload.hitDistance < 0.0)
                 0xff,
                 step
             );
-            #ifdef RT_DEFERRED_MATERIAL
-            resolveDeferredHit(currentOrigin, waterEntryDirection);
-            #endif
         }
         else
 #endif
@@ -15930,9 +15854,6 @@ if(payload.hitDistance < 0.0)
                 10000.0,
                 0
             );
-            #ifdef RT_DEFERRED_MATERIAL
-            resolveDeferredHit(currentOrigin, waterEntryDirection);
-            #endif
         }
 
         if(
@@ -16391,7 +16312,7 @@ if(hitMaterialId >= 2.5)
                     if(cam.perfSerAb.y != 0u)
                     {
                         serTraceRay(
-                            hitPos + hitNormal * 0.035,
+                            hitPos + sunDirection * 0.001,
                             0.02,
                             sunDirection,
                             10000.0,
@@ -16412,7 +16333,7 @@ if(hitMaterialId >= 2.5)
                             0,
                             0,
                             0,
-                            hitPos + hitNormal * 0.035,
+                            hitPos + sunDirection * 0.001,
                             0.02,
                             sunDirection,
                             10000.0,
@@ -16706,9 +16627,6 @@ for(
                 0xff,
                 pathStep
             );
-            #ifdef RT_DEFERRED_MATERIAL
-            resolveDeferredHit(currentOrigin, currentDirection);
-            #endif
         }
         else
 #endif
@@ -16726,9 +16644,6 @@ for(
                 10000.0,
                 0
             );
-            #ifdef RT_DEFERRED_MATERIAL
-            resolveDeferredHit(currentOrigin, currentDirection);
-            #endif
         }
 
 
@@ -17515,7 +17430,8 @@ float traceWaterReflectedSun(
     if(cam.perfSerAb.z != 0u)
     {
         serTraceRay(
-            receiverPos + receiverNormal * 0.035,
+            // 2026-10-23：偏移改沿射线；沿法线会在方块边缘漏光（复盘见 :3037）
+            receiverPos + toWaterDir * 0.001,
             0.02,
             toWaterDir,
             10000.0,
@@ -17523,9 +17439,6 @@ float traceWaterReflectedSun(
             0xff,
             0u
         );
-        #ifdef RT_DEFERRED_MATERIAL
-        resolveDeferredHit(receiverPos + receiverNormal * 0.035, toWaterDir);
-        #endif
     }
     else
 #endif
@@ -17537,17 +17450,12 @@ float traceWaterReflectedSun(
             0,
             0,
             0,
-            receiverPos +
-                receiverNormal * 0.035,
+            receiverPos + toWaterDir * 0.001,
             0.02,
             toWaterDir,
             10000.0,
             0
         );
-        #ifdef RT_DEFERRED_MATERIAL
-        resolveDeferredHit(receiverPos +
-                receiverNormal * 0.035, toWaterDir);
-        #endif
     }
 
 
@@ -17581,7 +17489,7 @@ float traceWaterReflectedSun(
 
     vec3 waterHitPos =
         receiverPos +
-        receiverNormal * 0.035 +
+        toWaterDir * 0.001 +
         toWaterDir *
         payload.hitDistance;
 
@@ -17621,7 +17529,7 @@ float traceWaterReflectedSun(
     if(cam.perfSerAb.y != 0u)
     {
         serTraceRay(
-            waterHitPos + WATER_PLANE_NORMAL * 0.035,
+            waterHitPos + sunDirection * 0.001,
             0.02,
             sunDirection,
             10000.0,
@@ -17642,8 +17550,7 @@ float traceWaterReflectedSun(
             0,
             0,
             0,
-            waterHitPos +
-                WATER_PLANE_NORMAL * 0.035,
+            waterHitPos + sunDirection * 0.001,
             0.02,
             sunDirection,
             10000.0,
@@ -18057,176 +17964,6 @@ bool dhFarNeighborPoint(
     return true;
 }
 
-#ifdef RT_DEFERRED_MATERIAL
-// =============================================================================
-// 2026-10-20 延迟材质（回退入口：不定义 RT_DEFERRED_MATERIAL 即回到旧行为）
-//
-// 命中着色器现在只回写命中**身份**（t / 实例 / 三角形 / 重心坐标），整个材质求值
-// （LabPBR 图集、POM 位移与自阴影、实体/粒子/voxy/DH 分支、OpenPBR 闭包、RR guide
-// 输入）挪到光线打完之后——就在下面每条 traceRayEXT / serTraceRay 的返回处调用
-// resolveDeferredHit()。
-//
-// 身份复用了既有 80 字节 payload 的通道（normal.xy = 实例/三角形号，roughness =
-// 重心 y），因此 rt_test.rahit / rt_test.rmiss / rt_test_translucent.* 一个字都不用改，
-// payload ABI 保持逐字节相同；代价是 payload 没有变小（寄存器/载荷收益留给下一步）。
-// =============================================================================
-
-// LOD 角色表（binding 19）。lod_coverage.glsl 的 lodInstanceRole() 读
-// gl_InstanceCustomIndexEXT，ray generation 没有这个内建，所以这里用同一张表、
-// 同一组常量重写一份；解析器把当前命中的实例号传给 materialLodRole()。
-//
-// 2026-10-20：**同一模块里不能声明两份同 (set,binding) 的 block** —— 那是无效的
-// SPIR-V（SerLodRoles 与 LodRoles 曾经并存，布局虽然相同，仍属重复声明）。SER 档
-// 已经在上面的 serTraceRay 段声明过 binding 19，这里直接复用它。
-#ifndef RT_ENABLE_SER
-layout(std430, binding = 19, set = 0) readonly buffer LodRoles {
-    uint roles[];
-} lodRoles;
-#endif
-
-const uint LOD_ROLE_TERRAIN        = 0u;
-const uint LOD_ROLE_VOXY_LOD       = 1u;
-const uint LOD_ROLE_DH_FAR         = 2u;
-const uint LOD_COVERAGE_SLOT_LIMIT = (1u << 16);
-
-uint materialLodRole(uint instanceIndex)
-{
-    if(instanceIndex >= LOD_COVERAGE_SLOT_LIMIT)
-    {
-        return LOD_ROLE_TERRAIN;
-    }
-
-#ifdef RT_ENABLE_SER
-    return serLodRoles.roles[instanceIndex];
-#else
-    return lodRoles.roles[instanceIndex];
-#endif
-}
-
-#ifdef RT_DEBUG_ALBEDO
-// 诊断档：材质体算出的基础色 + 早退分支编号。
-vec3 g_debugAlbedo = vec3(-1.0);
-vec2 g_debugUV = vec2(-1.0);
-// 材质体早退分支编号（0 = 走到了 albedo 计算）：
-//   1 miss 守卫 · 2 rawAddr==0 · 3 DISTANCE_ONLY · 4 voxy · 5 voxy-水 · 6 DH · 7 entity
-uint g_debugBranch = 0u;
-#endif
-
-#include "material_common.glsl"
-
-#include "material_resolve.glsl"
-#include "material_resolve_glass.glsl"
-
-
-#ifdef RT_DEBUG_IDENTITY
-// 诊断档：主命中的身份色，最终写出处覆盖 currentColor（见 main 末尾）。
-vec3 g_debugIdentity = vec3(-1.0);
-#endif
-
-// 命中身份里带了"是不是玻璃命中着色器"的标记（opaque 写 0.0 / 玻璃写 1.0），
-// 这里按标记分派到两份共享体。所有可能命中玻璃实例的射线都必须走这里。
-void resolveDeferredHit(vec3 rayOrigin, vec3 rayDirection)
-{
-    if(hit.hitDistance < 0.0)
-    {
-        // Miss: reproduce what rt_test.rmiss used to write into the payload.
-        payload.hitDistance = -1.0;
-        payload.albedo = hit.albedo;
-        payload.state = hit.state;
-        payload.normal = vec3(0.0);
-        payload.roughness = 1.0;
-        payload.f0Metal = 0.0;
-        payload.emission = vec3(0.0);
-        payload.parallaxRayTravel = 0.0;
-        payload.pomSelfShadow = 1.0;
-        payload.prevOffsetX = 0.0;
-        payload.prevOffsetY = 0.0;
-        payload.prevOffsetZ = 0.0;
-        return;
-    }
-
-    // Hit: hand the shared bodies the identity they unpack, in their own layout.
-    payload.hitDistance = hit.hitDistance;
-    payload.state = hit.state & 0x7u;
-    payload.normal = vec3(float(hit.instanceIndex), float(hit.primitiveIndex), hit.baryX);
-    payload.roughness = hit.baryY;
-    // Fields the material body only writes on some branches.  The old path
-    // inherited them from the previous hit in the same payload; a local has no
-    // such history, so give them the values the closest-hit fallback uses instead
-    // of leaving uninitialised memory to feed AO/GI occlusion.
-    payload.pomSelfShadow = 1.0;
-    payload.pomMicroOcclusion = 1.0;
-    payload.glassAlpha = hit.glassAlpha;
-    payload.parallaxRayTravel = hit.parallaxRayTravel;
-
-#ifdef RT_DEBUG_IDENTITY
-    // 诊断档（-DRT_DEBUG_IDENTITY=1）：不跑材质，把这个命中的 identity 画成自发
-    // 光色，用来判断"地面花"是身份错了还是 UV/图集寻址错了。
-    //   R = fract(instanceIndex / 64)   同一 section 内连续，跨 section 跳变
-    //   G = fract(primitiveIndex / 64)  每个三角形变化
-    //   B = bary.x                      三角形内连续渐变
-    // 期望：地面是平滑渐变的色块（每个三角形一块、片内连续）。
-    // 若仍是五彩马赛克 ⇒ identity 本身是垃圾。
-    if((hit.state & 0x7u) == RT_PURPOSE_PRIMARY_SKY)
-    {
-        // 存起来，在 main 的最终写出处覆盖颜色：走材质再自发光会被曝光/色调映射
-        // 压成一片白，看不出结构。
-        g_debugIdentity = vec3(
-            fract(float(hit.instanceIndex) / 64.0),
-            fract(float(hit.primitiveIndex) / 64.0),
-            hit.baryX
-        );
-
-        payload.albedo = vec3(0.0);
-        payload.emission = vec3(0.0);
-        payload.f0Metal = 0.0;
-        payload.roughness = 1.0;
-        payload.pomSelfShadow = 1.0;
-        payload.pomMicroOcclusion = 1.0;
-        payload.glassAlpha = 1.0;
-        payload.parallaxRayTravel = 0.0;
-        return;
-    }
-#endif
-
-    if((hit.state & HIT_IDENTITY_GLASS_BIT) != 0u)
-    {
-        resolveHitMaterialGlass(
-            rayOrigin,
-            rayDirection,
-            vec3(
-                1.0 - payload.normal.z - payload.roughness,
-                payload.normal.z,
-                payload.roughness
-            )
-        );
-    }
-    else
-    {
-        resolveHitMaterial(rayOrigin, rayDirection);
-    }
-}
-
-// 2026-10-20 「只求距离 / 只看可见性」的廉价收尾：不跑材质体。
-//
-// 为什么必须单独一条：ray payload 里的命中身份是**上一次 trace 留下的**。
-// 对用 gl_RayFlagsSkipClosestHitShaderEXT 打出去的可见性射线，closest-hit 根本
-// 没运行、身份从来没被写；此时若仍走完整 resolveDeferredHit()，它会拿陈旧身份去
-// 取顶点并跑整段材质 —— 既白烧 ALU，又会把 any-hit 累加出的 glassAlpha 覆盖成
-// 1.0（雨滴曝光的"穿透玻璃"判据因此永远为假）。
-//
-// 消费者只读 hitDistance / glassAlpha / albedo，这里按派发器（resolveDeferredHit
-// 的 miss 分支）口径原样搬运，材质求值整段跳过。
-void resolveDeferredHitNoMaterial()
-{
-    payload.hitDistance = hit.hitDistance;
-    payload.state = hit.state & RT_STATE_PURPOSE_MASK;
-    payload.albedo = hit.albedo;
-    payload.glassAlpha = hit.glassAlpha;
-    payload.parallaxRayTravel = hit.parallaxRayTravel;
-}
-
-#endif
 void main() {
     ivec2 size = imageSize(image);
 
@@ -18486,9 +18223,6 @@ if(cam.perfSerAb.y != 0u)
         0x01,
         s
     );
-    #ifdef RT_DEFERRED_MATERIAL
-    resolveDeferredHit(origin.xyz, worldDir.xyz);
-    #endif
 }
 else
 #endif
@@ -18504,9 +18238,6 @@ else
         10000.0,
         0
     );
-    #ifdef RT_DEFERRED_MATERIAL
-    resolveDeferredHit(origin.xyz, worldDir.xyz);
-    #endif
 }
 
 
@@ -19299,9 +19030,6 @@ if (matId > 0.5 && matId < 2.5) {
                             0xff,
                             s
                         );
-                        #ifdef RT_DEFERRED_MATERIAL
-                        resolveDeferredHitNoMaterial();
-                        #endif
                     }
                     else
 #endif
@@ -19319,9 +19047,6 @@ if (matId > 0.5 && matId < 2.5) {
                             10000.0,
                             0
                         );
-                        #ifdef RT_DEFERRED_MATERIAL
-                        resolveDeferredHitNoMaterial();
-                        #endif
                     }
 
                     if(payload.hitDistance >= 0.0)
@@ -19354,7 +19079,7 @@ if (matId > 0.5 && matId < 2.5) {
                 {
                     waterSurfaceSunTransmittance =
                         traceSunTransmittanceThroughWater(
-                            hitPos + normal * 0.035,
+                            hitPos + sunDir * 0.001,
                             sunDir,
                             true
                         );
@@ -20155,8 +19880,7 @@ for(
             0,
             0,
 
-            hitPos +
-                normal * 0.035,
+            hitPos + aoDir * 0.001,
 
             0.01,
             aoDir,
@@ -20473,6 +20197,10 @@ for (int si = 0;
         0.0;
 
     hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
+    // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
+    // 见 HANDOFF-2026-10-21-VERTEX-32B-TERRAIN.md §8。否则累乘起点是
+    // 上一条射线的残留 albedo，逐帧不同 ⇒ 静止时被 DLSS-RR 当信号累积。
+    hit.albedo = vec3(1.0);
 
 
 #ifdef RT_ENABLE_SER
@@ -20621,6 +20349,10 @@ if(
 
     hit.state =
         makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
+    // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
+    // 见 HANDOFF-2026-10-21-VERTEX-32B-TERRAIN.md §8。否则累乘起点是
+    // 上一条射线的残留 albedo，逐帧不同 ⇒ 静止时被 DLSS-RR 当信号累积。
+    hit.albedo = vec3(1.0);
 
 #ifdef RT_ENABLE_SER
     // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
@@ -20638,9 +20370,6 @@ if(
             RAIN_EXPOSURE_RAY_MASK,
             0u
         );
-        #ifdef RT_DEFERRED_MATERIAL
-        resolveDeferredHitNoMaterial();
-        #endif
     }
     else
 #endif
@@ -20658,9 +20387,6 @@ if(
             rainExposureTMax,
             0
         );
-        #ifdef RT_DEFERRED_MATERIAL
-        resolveDeferredHitNoMaterial();
-        #endif
     }
 
     bool rainExposureCenterEscaped =
@@ -20732,6 +20458,10 @@ if(
 
             hit.state =
                 makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
+            // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
+            // 见 HANDOFF-2026-10-21-VERTEX-32B-TERRAIN.md §8。否则累乘起点是
+            // 上一条射线的残留 albedo，逐帧不同 ⇒ 静止时被 DLSS-RR 当信号累积。
+            hit.albedo = vec3(1.0);
 
 #ifdef RT_ENABLE_SER
             if(cam.perfSerAb.y != 0u)
@@ -20745,9 +20475,6 @@ if(
                     RAIN_EXPOSURE_RAY_MASK,
                     ti
                 );
-                #ifdef RT_DEFERRED_MATERIAL
-                resolveDeferredHitNoMaterial();
-                #endif
             }
             else
 #endif
@@ -20765,9 +20492,6 @@ if(
                     rainExposureTMax,
                     0
                 );
-                #ifdef RT_DEFERRED_MATERIAL
-                resolveDeferredHitNoMaterial();
-                #endif
             }
 
             if(
@@ -22183,9 +21907,6 @@ while(
                     }
 #else
                     traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, 0xff, 0, 0, 0, currentOrigin, 0.001, currentDir, 10000.0, 0);
-                    #ifdef RT_DEFERRED_MATERIAL
-                    resolveDeferredHit(currentOrigin, currentDir);
-                    #endif
 #endif
 
 if (payload.hitDistance < 0.0) {
@@ -24505,9 +24226,6 @@ if (cam.dhFarFieldParams.x > 0.5
                         10000.0,
                         0
                     );
-                    #ifdef RT_DEFERRED_MATERIAL
-                    resolveDeferredHit(dhFarGiOrigin, dhFarGiDir);
-                    #endif
 
                     if (payload.hitDistance < 0.0) {
                         // 与 GI 循环的 miss 项逐字一致（17490）：rmiss 已经把

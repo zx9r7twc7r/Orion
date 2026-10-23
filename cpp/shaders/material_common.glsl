@@ -1,6 +1,7 @@
 // =============================================================================
-// Material evaluation: globals + helpers, shared by rt_test.rchit (inside the
-// closest-hit shader) and rt_test.rgen (after the ray, when RT_DEFERRED_MATERIAL).
+// Material evaluation: globals + helpers used by rt_test.rchit (inside the
+// closest-hit shader)。2026-10-23 延迟材质整段删除后，rgen 不再求材质，
+// 因此本文件只有命中着色器一个消费者。
 //
 // Extracted verbatim from rt_test.rchit pre-main on 2026-10-20.  The includer must
 // provide:
@@ -54,14 +55,9 @@ uint makeHitState(
         ((transparentProfile & 0x7u) << RT_STATE_PROFILE_SHIFT);
 }
 
-uint getTransparentProfileFromRawMaterialId(float materialId)
-{
-    return uint(
-        round(
-            clamp(fract(materialId) * 10.0, 0.0, 4.0)
-        )
-    );
-}
+// 2026-10-23：原来这里是 5 份副本之一，已收进透明剖面共享头（含 round→floor
+// 的取整方向说明与 0.25 潜伏项）。契约、位预算、余量分析都在那份文件里。
+#include "transparent_profile_common.glsl"
 
 struct Vertex {
     float x, y, z;

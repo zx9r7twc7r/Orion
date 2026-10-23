@@ -1,8 +1,4 @@
 #version 460
-// 2026-10-21：延迟材质已是唯一模式（见文档 §13），本 TU 只写命中身份。
-#if !defined(RT_DEFERRED_MATERIAL) && !defined(RT_BUILD_PRODUCTION_MODE)
-#define RT_DEFERRED_MATERIAL 1
-#endif
 #extension GL_EXT_ray_tracing : require
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_scalar_block_layout : require
@@ -21,11 +17,7 @@
 
 // 2026-10-20: 结构体单源化，见 hit_payload.glsl（六个 shader 共用同一份布局）。
 #include "hit_payload.glsl"
-#ifdef RT_DEFERRED_MATERIAL
-layout(location = 0) rayPayloadInEXT HitIdentity payload;
-#else
 layout(location = 0) rayPayloadInEXT HitPayload payload;
-#endif
 
 const uint RT_STATE_PURPOSE_MASK       = 0x7u;
 const uint RT_STATE_HIT_CLASS_SHIFT    = 3u;
@@ -75,14 +67,8 @@ uint makeHitState(
         ((transparentProfile & 0x7u) << RT_STATE_PROFILE_SHIFT);
 }
 
-uint getTransparentProfileFromRawMaterialId(float materialId)
-{
-    return uint(
-        round(
-            clamp(fract(materialId) * 10.0, 0.0, 4.0)
-        )
-    );
-}
+// 2026-10-23：原来这里是 5 份副本之一，已收进透明剖面共享头。
+#include "transparent_profile_common.glsl"
 hitAttributeEXT vec2 attribs;
 
 struct Vertex {
@@ -1309,11 +1295,8 @@ float tracePOMSelfShadow(
 
 
 // =============================================================================
-// 2026-10-20 deferred material (rollback entry: RT_DEFERRED_MATERIAL)
-//   0 = old path: the pane material is evaluated here (same body, moved into
-//       material_resolve_glass.glsl).
-//   1 = identity only (plus the pomSelfShadow=1 glass marker); ray generation
-//       evaluates the pane material after the ray is done.
+// 2026-10-23：延迟材质整段删除后，玻璃片材质只在这里求值（共享体在
+// material_resolve_glass.glsl）。
 // =============================================================================
 // Motion segment reader.  material_resolve_glass.glsl 需要它；本 TU 原本没有这份
 // 声明（运动矢量由 rt_test.rchit 负责），搬过来的共享体要自己算 prevOffset。
@@ -1340,32 +1323,15 @@ uint materialLodRole(uint instanceIndex)
 }
 
 // 共享解析体写入它；本 TU 的材质 helper 仍直接读 gl_HitTEXT，这里只是让共享体
-// 在两个 TU（本文件 / rt_test.rgen）里都能编译。
-//
-// 2026-10-20：与 rt_test.rchit 同一个漏项 —— materialRayOrigin / materialRayDirection
-// 没声明，导致**不定义 RT_DEFERRED_MATERIAL 时本文件编译不过**
-//（material_resolve_glass.glsl:37 undeclared）。三个量都在解算体开头写入。
+// 能编译。三个量都在解算体开头写入，初值只为满足声明。
 float materialHitT = 0.0;
 vec3 materialRayOrigin = vec3(0.0);
 vec3 materialRayDirection = vec3(0.0, 0.0, -1.0);
 
-// 延迟模式下命中着色器不调用材质体（它在 rgen 里跑），共享体只引用旧布局的
-// payload 字段，因此只在旧模式下编译。
-#ifndef RT_DEFERRED_MATERIAL
 #include "material_resolve_glass.glsl"
-#endif
 
 void main()
 {
-#ifdef RT_DEFERRED_MATERIAL
-    payload.hitDistance = gl_HitTEXT;
-    payload.instanceIndex = uint(gl_InstanceCustomIndexEXT);
-    payload.primitiveIndex = uint(gl_PrimitiveID);
-    payload.baryX = attribs.x;
-    payload.baryY = attribs.y;
-    // Mark the owner of this hit for the ray-generation dispatcher.
-    payload.state = (payload.state & 0x7u) | HIT_IDENTITY_GLASS_BIT;
-#else
     // 2026-10-21 根因修复（同 rt_test.rchit 的说明）：生产模式必须先把命中身份与
     // hitT 播种进 ray payload，否则 resolveHitMaterialGlass() 会拿陈旧身份索引
     // sectionVertexAddressBuffer（无边界检查）⇒ 垃圾指针 ⇒ GPU 挂死。
@@ -1381,6 +1347,5 @@ void main()
         gl_WorldRayDirectionEXT,
         vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y)
     );
-#endif
 }
 

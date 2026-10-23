@@ -1,8 +1,4 @@
 #version 460
-// 2026-10-21：延迟材质已是唯一模式（见文档 §13）。
-#if !defined(RT_DEFERRED_MATERIAL) && !defined(RT_BUILD_PRODUCTION_MODE)
-#define RT_DEFERRED_MATERIAL 1
-#endif
 #extension GL_EXT_ray_tracing : require
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_scalar_block_layout : require
@@ -22,11 +18,7 @@
 // 2026-10-20: 结构体单源化，见 hit_payload.glsl（六个 shader 共用同一份布局）。
 #include "hit_payload.glsl"
 
-#ifdef RT_DEFERRED_MATERIAL
-layout(location = 0) rayPayloadInEXT HitIdentity payload;
-#else
 layout(location = 0) rayPayloadInEXT HitPayload payload;
-#endif
 
 const uint RT_STATE_PURPOSE_MASK       = 0x7u;
 const uint RT_PURPOSE_PASSTHROUGH      = 4u;
@@ -202,38 +194,29 @@ bool voxyTileIsFullyCovered(vec2 uv0, vec2 uv1, vec2 uv2)
 }
 
 
-int getTransparentProfileFromRawMaterialId(float materialId)
-{
-    return int(
-        round(
-            clamp(
-                fract(materialId) * 10.0,
-                0.0,
-                4.0
-            )
-        )
-    );
-}
+// 2026-10-23：原来这里是 5 份副本之一（且返回类型漂成了 int，其余四份是
+// uint），已收进透明剖面共享头，统一返回 uint。
+#include "transparent_profile_common.glsl"
 
 // Same per-profile dense-body scale as rt_test.rgen's
 // getTransparentProfileTransmission, so visibility (shadows, AO and local
 // lights) attenuates exactly as much as the surface path transmits.
 //   1 tinted glass / 2 ice / 3 slime / 4 honey, 0 = clear or stained glass.
-float getTransparentProfileTransmissionAnyHit(int transparentProfile)
+float getTransparentProfileTransmissionAnyHit(uint transparentProfile)
 {
-    if(transparentProfile == 1)
+    if(transparentProfile == 1u)
     {
         return 0.06;
     }
-    if(transparentProfile == 2)
+    if(transparentProfile == 2u)
     {
         return 0.55;
     }
-    if(transparentProfile == 3)
+    if(transparentProfile == 3u)
     {
         return 0.45;
     }
-    if(transparentProfile == 4)
+    if(transparentProfile == 4u)
     {
         return 0.32;
     }

@@ -1,19 +1,11 @@
 #version 460
-// 2026-10-21：延迟材质已是唯一模式（见文档 §13）。
-#if !defined(RT_DEFERRED_MATERIAL) && !defined(RT_BUILD_PRODUCTION_MODE)
-#define RT_DEFERRED_MATERIAL 1
-#endif
 #extension GL_EXT_ray_tracing : require
 #extension GL_GOOGLE_include_directive : require
 
 // 2026-10-20: 结构体单源化，见 hit_payload.glsl（六个 shader 共用同一份布局）。
 #include "hit_payload.glsl"
 
-#ifdef RT_DEFERRED_MATERIAL
-layout(location = 0) rayPayloadInEXT HitIdentity payload;
-#else
 layout(location = 0) rayPayloadInEXT HitPayload payload;
-#endif
 
 layout(binding = 2, set = 0) uniform CameraProperties {
     #include "camera_ubo.glsl"
@@ -823,9 +815,7 @@ vec3 evaluateMoonSurface(vec3 rayDir, vec3 moonDir, float limbCosine)
 
 void main() {
     payload.hitDistance = -1.0;
-#ifndef RT_DEFERRED_MATERIAL
     payload.normal = vec3(0.0);
-#endif
 
     vec3 rayDir = gl_WorldRayDirectionEXT;
 
@@ -1380,7 +1370,6 @@ void main() {
     {
         payload.albedo = clamp(finalColor, 0.0, 2.5);
     }
-#ifndef RT_DEFERRED_MATERIAL
     // Deferred mode: these resets happen in the ray-generation dispatcher, which
     // owns the local HitPayload; the identity payload has no such fields.
     payload.roughness = 1.0;
@@ -1388,16 +1377,13 @@ void main() {
     payload.emission = vec3(0.0);
     payload.parallaxRayTravel = 0.0;
     payload.pomSelfShadow = 1.0;
-#endif
 
     // 2026-10-09 运动矢量：显式清零。
     // payload 在同一像素内被多次 traceRay 复用，miss 不清零就会把**上一次命中**的
     // 位移留在里面。rgen 侧虽然用 `primaryHitDistance >= 0` 把 miss 排除在外
     // （rmiss 会把 hitDistance 设成 -1.0），但"靠下游判据兜住未初始化值"不该是
     // 唯一防线 —— 这里补齐是零成本的确定行为。
-#ifndef RT_DEFERRED_MATERIAL
     payload.prevOffsetX = 0.0;
     payload.prevOffsetY = 0.0;
     payload.prevOffsetZ = 0.0;
-#endif
 }

@@ -21063,24 +21063,23 @@ static VkDescriptorSetLayout createRTDescriptorSetLayout(){
     b[1].binding=1; b[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; b[1].descriptorCount=1; b[1].stageFlags=VK_SHADER_STAGE_RAYGEN_BIT_KHR|VK_SHADER_STAGE_COMPUTE_BIT;
     b[2].binding=2; b[2].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; b[2].descriptorCount=1;
     b[2].stageFlags=VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
-    // ★★★ 2026-10-20 延迟材质（RT_DEFERRED_MATERIAL）—— 本段起 RAYGEN 位不是可选装饰。
+    // ★ 历史：2026-10-20 为"延迟材质档"给 raygen 补的 stageFlags。
     //
-    // 延迟档把整个材质求值搬到了 rt_test.rgen：它要在 raygen 里采 blockAtlas /
+    // 延迟档曾把整个材质求值搬到 rt_test.rgen：raygen 要采 blockAtlas /
     // normalAtlas / specularAtlas（3/4/5）、实体与粒子图集（36/37/63/64）、雨条与
     // voxy 图集（40/45）、水波状态（33），并读顶点地址表（21）。这些 binding 历史上
-    // 只有 CLOSEST_HIT|ANY_HIT（唯一的消费者是 rchit），于是 raygen 的读取落在
-    // stageFlags 之外 —— 按 Vulkan 规范属**未定义行为**，而在本机上实测是**稳定读回 0**
-    // （同一台机器、同一类 UB 的既有实例见 binding 50-52 的 2026-09-29 记录：
-    //  compute 读 RAYGEN 独占的 storage image 稳定得 0，直接造出过两个假结论）。
+    // 只有 CLOSEST_HIT|ANY_HIT，于是 raygen 的读取落在 stageFlags 之外 —— 按 Vulkan
+    // 规范属**未定义行为**，而本机实测是**稳定读回 0**（同类 UB 的既有实例见
+    // binding 50-52 的 2026-09-29 记录：compute 读 RAYGEN 独占的 storage image
+    // 稳定得 0，直接造出过两个假结论）。当时的症状：binding 21 读回 0 ⇒ 顶点地址
+    // rawAddr == 0 ⇒ 共享材质体在早退处返回、从不计算 albedo ⇒ 满屏错乱图集纹素。
     //
-    // 后果与症状严丝合缝：binding 21 读回 0 ⇒ 顶点地址 rawAddr == 0 ⇒ 共享材质体
-    // 在 "rawAddr == 0" 早退处返回、**从不计算 albedo** ⇒ 地面用的是未初始化的
-    // payload.albedo，满屏错乱图集纹素；而 state 里的 purpose/instance 仍是对的，
-    // 所以状态编码图呈黄色（hitDistance>=0、instanceIndex!=0、但没走到 albedo）。
-    // 也就是说此前所有"UV 错 / 图集寻址错"的猜测都不成立，材质压根没算。
-    //
-    // 因此：凡是延迟材质体在 raygen 里会碰到的 binding，都必须把 RAYGEN 加进来。
-    // 不定义 RT_DEFERRED_MATERIAL 时这些位只是"多授权"，不改任何行为/性能。
+    // ★★ 2026-10-23：延迟材质路径（RT_DEFERRED_MATERIAL）已从全部 shader 源码删除，
+    //    材质只在命中着色器里求值，raygen 不再承担材质体。**这些 RAYGEN 位保留不动**：
+    //    rt_test.rgen.spv 在删除前后逐字节相同，说明 rgen 实际访问的 binding 集合
+    //    没有变化，因此当前配置仍然自洽；它们只是"多授权"，不改行为也不改性能。
+    //    若要精简，必须逐 binding 核对 rgen 的 SPIR-V 访问集合后再动，不能凭"现在
+    //    只有 rchit 求材质"直接删——那会把上面那类 UB 重新引进来。
     b[3].binding=3; b[3].descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[3].descriptorCount=1; b[3].stageFlags=VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
     b[4].binding=4; b[4].descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[4].descriptorCount=1; b[4].stageFlags=VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
     b[5].binding=5; b[5].descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b[5].descriptorCount=1; b[5].stageFlags=VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
