@@ -80,6 +80,9 @@ A/B rollbacks and experimental features. They are documented in
 [`docs/env-switches.md`](docs/env-switches.md) (default value, effect, restart requirement,
 and which ones may not be combined).
 
+Design decisions that used to live as long comment blocks in the source (why a threshold
+is what it is, what was tried and rejected) are kept in [docs/decisions/](docs/decisions).
+
 ## License
 
 Orion's own source code and assets are released under the **MIT License** — see [LICENSE](LICENSE).
