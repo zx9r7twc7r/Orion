@@ -19,6 +19,8 @@
 | [`nrd-tuning.md`](nrd-tuning.md) | NRD 本地光去噪：lag tuning 第二遍、antilag 对齐、motionVectorBias 曾被误判为根因、本地光全灭的定责过程、关掉 diffuse prepass blur 的依据 |
 | [`ser-overhead.md`](ser-overhead.md) | SER 开销归因：可见性组的键形状/融合调用 A/B，结论是三者都在噪声带内、生产 pin 回 mode 1 |
 | [`mv-probe.md`](mv-probe.md) | MV 读回探针（binding 57）的仪器说明书：为什么必须有它、四种伪彩各代表什么 |
+| [`omm-pool.md`](omm-pool.md) | OMM 缓冲池化为何保持不设限：churnTop 现场、收紧到 2u 会退化成 32MB 分配抖动的推导 |
+| [`object-accounting.md`](object-accounting.md) | 对象创建总账（诊断）：为什么在 vkAllocMB 之外还要逐个 `vkCreate*` 记账，2026-10-15 两局读数 |
 
 其它文档：
 

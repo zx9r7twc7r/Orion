@@ -664,44 +664,10 @@ static void rtxTrackedFreeMemory(
 #define vkFreeMemory rtxTrackedFreeMemory
 
 // =====================================================
-// 2026-10-15 对象创建总账（诊断：「越玩越卡」那条宿主内存增长的第二把刀）
-//
-// 为什么还要一把刀。[RT MEM] 的 vkAllocMB/vkFreeMB/vkLiveMB 只覆盖
-// vkAllocateMemory/VkDeviceMemory（见上面的宏）。2026-10-15 两局实测：
-//   · 18:37:54 → 18:39:29（95 秒 / 6660 帧 / 70.1 fps）：vkAllocMB、vkFreeMB、
-//     vkLiveMB、vkAllocN、vkFreeN、slabAllocMB、slabFreeMB **逐字节冻结**，
-//     vramUsedMB 也冻结，NMT total committed 平 ⇒ 这 95 秒一次 vkAllocateMemory
-//     都没做；而同一窗口 rssMB 12309.1 → 15026.7（+2718MB = 28.6MB/s）、
-//     privateMB +2861MB、sysAvailMB −2676MB，折算 **0.408MB/帧**。
-//   · 19:27:32 → 19:28:55（83 秒）：NMT 全类别合计只 +62.6MB（Java Heap +72，
-//     Thread/Code/GC/Metaspace/Arena/Class 全部 ±5 内），而 rssMB +2778MB
-//     ⇒ 扣掉已知项后仍有 ≈26MB/s 无法归属。
-// ⇒ 增长既不经过 vkAllocateMemory、也不在 JVM 里。剩下的只有两类，而这两类
-//   可以用一把刀切开：
-//     (a) **不调 vkAllocateMemory 的 Vulkan 对象**——描述符池/集、命令池/缓冲、
-//         pipeline layout / shader module / compute pipeline / image view / sampler。
-//         它们在驱动侧各占一块宿主内存，且命令池、描述符池**从不收缩**：
-//         vkFreeCommandBuffers / vkFreeDescriptorSets 只是把对象还给池，池自己
-//         申请过的那几块 chunk 不会退给 OS。本文件里 vkResetCommandPool 与
-//         vkResetDescriptorPool 都是 **0 处**（靠 alloc/free 复用），所以"每帧
-//         alloc/free 一个池对象"是这条曲线上最典型的一种形态。
-//     (b) **驱动 / Streamline（sl.dlss*.dll）内部**——本模组的任何包装都看不见它
-//         （本文件上方 :8174-8203 的注释已经把这条路指出来了）。
-//
-// 口径。只数**创建/分配**侧，不数销毁侧。本刀要回答的是"谁在按帧/按批造对象"：
-// 建数平就说明不在这一层，不需要成对；而为了成对要在 9 个销毁 API 上再各插一刀，
-// 风险大一截、信息量为零。复数型 API 计**对象数**（取 count 字段）而不是调用次数
-// （descSet / cmdBuf / pipe 三项），因为占内存的是对象个数。只在 VK_SUCCESS 时计
-// （失败时并没有对象产生）。
-//
-// 判读：
-//   · 某一项随会话单调涨（尤其每帧/每批固定条数）⇒ 就是它，去那张未池化的表找；
-//   · 全部平、而 rssMB/privateMB 仍按 ≥26MB/s 涨 ⇒ **不在 Vulkan 层**，转去查
-//     驱动 / Streamline（下一步上 VK_EXT_device_memory_report 逐笔报驱动侧分配）。
-//
-// 闸门：ORION_MEM_OBJ_TRACK（默认开；=0 时包装只转发、不计数）。
-// 本刀**零行为变更**：返回值、参数、调用顺序与包装前逐位一致。
-//
+// 为什么还要一把刀：上面的 vkAllocMB/vkFreeMB 只覆盖 vkAllocateMemory/VkDeviceMemory。
+// 2026-10-15 实测到"vk 账逐字节冻结、RSS 仍以 28.6MB/s 增长"的窗口，说明增长发生在
+// 不经过 vkAllocateMemory 的对象上 ⇒ 需要逐个 vkCreate* 记账。
+// 两局读数见 docs/decisions/object-accounting.md
 // 本行**覆盖不到**的（走 vkGetDeviceProcAddr 取函数指针，宏拦不住；明确列出，
 // 免得日后把此行读成"全部对象"）：vkCreateRayTracingPipelinesKHR（:22517、
 // :46341）、vkCreateAccelerationStructureKHR（:12419）、vkCreateMicromapEXT
@@ -18752,40 +18718,11 @@ static void logFrameDoneHeartbeat()
 // 再拿旧 device 去 vkFreeMemory 是未定义行为。此时只清表 —— 必须清，否则句柄会留在
 // 数组里被后续（可能新建的）device 误用。
 // =====================================================
-// 2026-10-10 OMM 缓冲池化
-//
-// 现场（[RT MEM] 的 churnTop，2026-10-10 22:58~23:00 那一局）：
-//   use=0x820000 (MICROMAP_BUILD_INPUT_READ_ONLY|DEVICE_ADDRESS) n=13572 liveN=8   liveMB=0.1
-//   use=0x20020  (STORAGE_BUFFER|DEVICE_ADDRESS)                 n=8435  liveN=8   liveMB=0.4
-//   use=0x1000000(MICROMAP_STORAGE)                              n=6786  liveN≈500 liveMB≈10
-// 前四名占全场分配的 99.5%，且 0x820000 的次数**正好是** 0x1000000 的 2 倍
-// ⇒ createSectionOpacityMicromap 每次构建固定新建 4 个缓冲；实测 51 次构建/秒
-// ⇒ 约 204 次 vkAllocateMemory/秒。可是句柄数几乎不动 ⇒ 全是"新建-即销毁"。
-// 同期 vkAllocMB/vkFreeMB 显示 ~50MB/s 的分配吞吐，而进程提交以 15~30MB/s 涨
-// ⇒ 每次 allocate/free 循环都在驱动侧留下可观的主机侧代价（碎片/记账），
-//   而不是某个活引用在漏。
-//
-// 做法与 Section 顶点/BLAS 完全相同：**只池化 VkDeviceMemory**。
-//   · VkBuffer 在 Vulkan 里只能被绑定一次（VUID-vkBindBufferMemory-buffer-07459），
-//     所以 buffer 仍每次新建 —— 那是 µs 级，不产生 vkAllocateMemory；
-//   · 内存从 Section slab 里切 chunk ⇒ 真 vkAllocateMemory 只在"没有可复用 chunk"
-//     时发生，204 次/秒直接降到近乎 0，并共用同一套命中统计（poolHit/poolMiss）。
-// =====================================================
-// 2026-10-13：**刻意保持 32u（不设限）**，与本次改动之前的行为逐位相同。
-//
-// 上面写意图是 2u，意思是"OMM 几十 KB 的请求别从 4MB-chunk 的几何 slab 里切走
-// 整 4MB"。但 takeSectionChunkFromSlabs 里那个上限当时用循环变量做基准，**从未
-// 生效**（详见该函数 2026-10-13 的修正说明）—— OMM 一直是在借用几何 slab。
-//
-// 修好基准之后 2u 会真的生效，而那是另一件事，不能混进本次"只改几何"的改动：
-//   · OMM 的 4MB 借用是**极短命**的（[RT MEM] 实测 0x820000/0x20020 的
-//     liveN=8、liveMB=0.1，n=13572 ⇒ 借完立刻还），既不长期占容量也不形成浪费；
-//   · 一旦收紧到 2u，OMM 会退化成"自己买 slab"：请求几十 KB ⇒ chunkBytes=64KB
-//     ⇒ chunkCount 撞 512 上限 ⇒ 每块 **32MB**；而超预算时
-//     sectionMemoryPoolEffectiveKeepSlabs() = 0，空掉即 vkFreeMemory，
-//     以 OMM 的构建速率（实测 51 次构建/秒）会变成 32MB 级的分配抖动 ——
-//     正是本项目一直在躲的那种卡顿（[LOD PERF] max=1231ms 那一类）。
-// 所以本次保持不设限。要不要收紧、以及配合什么样的保留策略，留作单独一轮 A/B。
+// 2026-10-10 OMM 缓冲池化：**本次保持不设限**。
+// 收紧到 2u 会让 OMM 退化成自己买 slab（请求几十 KB ⇒ chunk=64KB ⇒ 撞 512 上限 ⇒
+// 每块 32MB），配合"空掉即 vkFreeMemory"的保留策略，会变成 32MB 级的分配抖动 ——
+// 正是本项目一直在躲的那类卡顿。要不要收紧留作单独一轮 A/B。
+// churnTop 现场与完整推导见 docs/decisions/omm-pool.md
 constexpr uint32_t OMM_POOL_CHUNK_WASTE_LOG2 = 32u;
 
 // 从 slab 池取一块 chunk，建一个绑定到它的 VkBuffer。
@@ -30842,43 +30779,10 @@ static void nrdBuildCommonSettings(
     // be "some huge number".
     settings.denoisingRange = 60000.0f;
 
-    // ★ 2026-09-28 实测结论：**这道闸门与此故障无关，已改回生产值 0.01。**
-    //
-    // 做过的事：把阈值从 0.01 放到 0.5（50 倍）后重跑，日志确认生效
-    // （`[NRD-1 DISOC] threshold=0.500000`），用户报告"大幅度移动视角时橙色棋盘照旧"。
-    // 而且这是**过强的一次**测试，不只是放大 50 倍：GetDisocclusionThreshold
-    // （Common.hlsli:585）= `frustumSize * saturate( threshold / max(0.05, NoV) )`，
-    // 里层有 saturate()，阈值 0.5 时只要 NoV < 0.5（绝大多数斜视墙面/地面）比值就 ≥ 1，
-    // 被夹到上限 frustumSize —— 等于直接测了天花板都没有变化。
-    //
-    // 同时排掉的还有法线闸门：REBLUR_ALMOST_ZERO_ANGLE = cos(89°) ≈ 0.017
-    // （REBLUR_Config.hlsli:101），要两根法线几乎垂直才会失败，不可能成为瓶颈。
-    //
-    // 真正常开的开关在这里：antilag（REBLUR_TemporalStabilization.cs.hlsl:157-160）
-    //   diffAntilag = ComputeAntilag(historyLuma, currentLuma, sigma, ...)
-    //   data1.x = lerp( min(data1.x, gHistoryFixFrameNum), data1.x, diffAntilag )
-    // REBLUR_USE_ANTILAG_NOT_INVOKING_HISTORY_FIX = 1（REBLUR_Config.hlsli:39），
-    // 所以那个 min() **只会封顶、永远不会加分**：一旦 antilag 在第 N 帧落到 0，
-    // 累积计数就停在重置后的低值上再也长不起来 —— 这既解释了"全屏橙"，
-    // 也解释了棋盘（data1.x 一直在 1 以下）。我上一轮说"棋盘出现即证明不是
-    // antilag"是错的，已修正。
-    // ★★★ 2026-09-29 15:0x：恢复环境变量覆盖（注释里早就写着"可由环境变量覆盖"，但代码里
-    // 只剩常量，覆盖其实已经没了）。
-    //
-    // 为什么现在要它：转动录像 + validation 宫格定案——**视口 3（我们的 MV vs NRD 期望 MV）
-    // 在纯转动段几乎全黑（99.3% / 96.3% / 99.8%）= MV 没错**，但视口 8（图例标定后）显示历史
-    // 随转动从 60 帧一路掉到 10~30 帧。读 REBLUR_TemporalAccumulation.cs.hlsl:238-267 后，
-    // 运动时只剩一处会收紧：`NoVstrict = lerp(NoV, 1.0, saturate(parallax/30))` 让
-    //   smbDisocclusionThreshold = disocclusionThreshold * frustumSize * saturate(1/NoVstrict)
-    // 从静止斜视时的最多 20 倍宽容（NoV<0.05 → saturate(0.01/0.05)=0.2）**退回基准 0.01×frustumSize**
-    // （3 格处≈0.04 格）。平面距离判据 `|prevViewZ_tap − (worldToViewPrev*Xprev).z| < 阈值` 里，
-    // 两者的差就是"上一帧存储视深 vs 我们预期视深"，容差越紧越容易被亚像素落点/位置量化吃掉。
-    //
-    // 用法（**免重编**，改完重启即可）：
-    //   set RTX_NRD_DISOCCLUSION_THRESHOLD=0.05   （官方的 alternate 量级；0.1 更激进）
-    // 判读：顶部历史色带在**转动时**是否保持青/白；画面噪点是否随之下降。
-    // 注意 NRD 内部还有一层 `saturate(threshold/max(0.05,NoV))`，所以 >0.25 之后基本饱和，
-    // 09-28 那次"放到 0.5 无变化"就是测到了天花板——**有效的对比区间是 0.01 → 0.05 → 0.1**。
+    // disocclusion 阈值保持生产值 0.01：09-28 已证明它与"橙色棋盘"无关（放到 0.5 也照旧）。
+    // 诊断时用环境变量 RTX_NRD_DISOCCLUSION_THRESHOLD 免重编覆盖，**有效对比区间是
+    // 0.01 → 0.05 → 0.1**（NRD 内部有 saturate(threshold/max(0.05,NoV))，>0.25 基本饱和）。
+    // 排查过程见 docs/decisions/nrd-tuning.md#disocclusion-threshold
     float disocclusionThresholdValue = 0.01f;
 
     {

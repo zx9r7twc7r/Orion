@@ -412,3 +412,47 @@ RESTIR_FINAL_DEBUG_RAW 直接转储 pre-NRD 原始估计值来定位。
   本实例只有 diffuse ⇒ 置 0 会**整条跳过 pre-pass**。AREA_5X5 的命中距离重建不受影响，仍然在跑
   （Reblur.cpp:135-142 会把 passIndex 切到 +2 变体）。
 回退：改回 30.0f / 50.0f。
+
+<a id="disocclusion-threshold"></a>
+
+## disocclusion 阈值：与"橙色棋盘"故障无关（已排查）
+
+原位置：`cpp/VulkanCore.cpp:30845-30881`（37 行）
+
+★ 2026-09-28 实测结论：**这道闸门与此故障无关，已改回生产值 0.01。**
+
+做过的事：把阈值从 0.01 放到 0.5（50 倍）后重跑，日志确认生效
+（`[NRD-1 DISOC] threshold=0.500000`），用户报告"大幅度移动视角时橙色棋盘照旧"。
+而且这是**过强的一次**测试，不只是放大 50 倍：GetDisocclusionThreshold
+（Common.hlsli:585）= `frustumSize * saturate( threshold / max(0.05, NoV) )`，
+里层有 saturate()，阈值 0.5 时只要 NoV < 0.5（绝大多数斜视墙面/地面）比值就 ≥ 1，
+被夹到上限 frustumSize —— 等于直接测了天花板都没有变化。
+
+同时排掉的还有法线闸门：REBLUR_ALMOST_ZERO_ANGLE = cos(89°) ≈ 0.017
+（REBLUR_Config.hlsli:101），要两根法线几乎垂直才会失败，不可能成为瓶颈。
+
+真正常开的开关在这里：antilag（REBLUR_TemporalStabilization.cs.hlsl:157-160）
+  diffAntilag = ComputeAntilag(historyLuma, currentLuma, sigma, ...)
+  data1.x = lerp( min(data1.x, gHistoryFixFrameNum), data1.x, diffAntilag )
+REBLUR_USE_ANTILAG_NOT_INVOKING_HISTORY_FIX = 1（REBLUR_Config.hlsli:39），
+所以那个 min() **只会封顶、永远不会加分**：一旦 antilag 在第 N 帧落到 0，
+累积计数就停在重置后的低值上再也长不起来 —— 这既解释了"全屏橙"，
+也解释了棋盘（data1.x 一直在 1 以下）。我上一轮说"棋盘出现即证明不是
+antilag"是错的，已修正。
+★★★ 2026-09-29 15:0x：恢复环境变量覆盖（注释里早就写着"可由环境变量覆盖"，但代码里
+只剩常量，覆盖其实已经没了）。
+
+为什么现在要它：转动录像 + validation 宫格定案——**视口 3（我们的 MV vs NRD 期望 MV）
+在纯转动段几乎全黑（99.3% / 96.3% / 99.8%）= MV 没错**，但视口 8（图例标定后）显示历史
+随转动从 60 帧一路掉到 10~30 帧。读 REBLUR_TemporalAccumulation.cs.hlsl:238-267 后，
+运动时只剩一处会收紧：`NoVstrict = lerp(NoV, 1.0, saturate(parallax/30))` 让
+  smbDisocclusionThreshold = disocclusionThreshold * frustumSize * saturate(1/NoVstrict)
+从静止斜视时的最多 20 倍宽容（NoV<0.05 → saturate(0.01/0.05)=0.2）**退回基准 0.01×frustumSize**
+（3 格处≈0.04 格）。平面距离判据 `|prevViewZ_tap − (worldToViewPrev*Xprev).z| < 阈值` 里，
+两者的差就是"上一帧存储视深 vs 我们预期视深"，容差越紧越容易被亚像素落点/位置量化吃掉。
+
+用法（**免重编**，改完重启即可）：
+  set RTX_NRD_DISOCCLUSION_THRESHOLD=0.05   （官方的 alternate 量级；0.1 更激进）
+判读：顶部历史色带在**转动时**是否保持青/白；画面噪点是否随之下降。
+注意 NRD 内部还有一层 `saturate(threshold/max(0.05,NoV))`，所以 >0.25 之后基本饱和，
+09-28 那次"放到 0.5 无变化"就是测到了天花板——**有效的对比区间是 0.01 → 0.05 → 0.1**。
