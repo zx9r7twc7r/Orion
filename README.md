@@ -73,6 +73,13 @@ absent.
 gradlew runClient
 ```
 
+## Debug switches
+
+The native backend has 47 `ORION_*` environment variables that gate budgets, diagnostics,
+A/B rollbacks and experimental features. They are documented in
+[`docs/env-switches.md`](docs/env-switches.md) (default value, effect, restart requirement,
+and which ones may not be combined).
+
 ## License
 
 Orion's own source code and assets are released under the **MIT License** — see [LICENSE](LICENSE).

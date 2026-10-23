@@ -1,70 +1,32 @@
 // =====================================================================
-// 体积雾（2026-10-19 第二次重做，B 方案）
+// 体积雾（volumetric fog）—— 密度场、ray march、太阳方向自吸收
 //
-// 参考来源（逐行对应）：
-//     · FogDensity()                      （VFOG_NOISE_TYPE == 0 分支，第 5-16 行）
-//     · VolumetricFog()                   （第 70-242 行）
-//     · 出厂标定常量与调用口径
+// 契约（改之前先读这一段）：
+//   · 与体积光**共用同一份介质**：常量与 fogDensityAt() 都在
+//     fog_density_common.glsl。两侧必须逐项同源，否则雾与光柱的密度剖面会对不上。
+//   · 输出 FogResult{scattering, transmittance}，**不做合成**：调用方
+//     （volumetric_clouds*.comp）自己算 `scene * T + scattering`。
+//   · include 顺序有依赖：fog_density_common.glsl → local_light_grid_common.glsl；
+//     后者读 cam.*，调用方必须先在文件顶部声明 `cam`。
 //
-// 用户 2026-10-19 定案：**B = 完全照抄参考标定**。所以密度剖面、步长公式、
-// 太阳项自吸收、能量合成、常量取值都按参考；上一版的"解析闭式高度雾"
-// （单高度指数 + 无 march + 阴影图固定间隔取样）整体作废。
-//
-// 平台适配（参考没有、但本工程必须补的，逐条标注）：
-//   1) 参考在 composite 里直接 `color = T*color + fog + ray`；
-//      本工程由调用方（volumetric_clouds*.comp）统一合成，所以这里返回
-//      FogResult{scattering, transmittance}，内部**仍是参考的 fogColor+rayColor**。
-//   2) 参考的 shadowmap 查询（shadowtex1，第 168-180 行）⇒ 换成本工程的
-//      sunShadowVisibility()（光追阴影图，近图+远图）。
-//   3) 参考的 BlueNoiseTemporal()/bayer64（第 75-79 行）⇒ 换成本文件的
-//      fogDitherPhase()：固定 4×4 Bayer（bayer64 左上子块）。clouds 的 4 个变体
-//      不保证都带 temporalJitter()，且雾没有时域累积，逐帧抖动只会变成噪点。
-//   4) 参考的 globalCloudShadow（第 214/228 行）在本工程的太阳颜色里已由调用方
-//      携带（directLight 走 c3CloudSunTransmittance），这里不再重复乘。
-//   5) 参考的 eyeBrightnessSmoothCurved（室内门控）本工程调用方已有等效门控。
-//
-// 参数车道（CameraUBO，偏移不变，语义按参考重排）：
+// 参数车道（CameraUBO，偏移不变）：
 //   cloudParams7 = (enabled, VFOG_DENSITY_BASE, VFOG_HEIGHT, VFOG_HEIGHT_2)
 //   cloudParams8 = (anisotropyG, VFOG_SUNLIGHT_DENSITY, VFOG_FOG_DENSITY, maxDistance)
 //   cloudParams9 = (startDistance, VFOG_SUNLIGHT_STEPS, VFOG_RAIN_DENSITY_MUL, reserved)
+//   fogExtrasParams = (动态光源强度, 地面锚定强度, 天空环境项强度, 时域抖动强度)
 //
-// ---------------------------------------------------------------------------
-// 2026-10-23 四项扩展：
+// 与参考实现的平台差异（每条都会改变像素，不能随手改回"更简单"的写法）：
+//   1) 合成交给调用方；这里只返回散射/透射率；
+//   2) 阴影查询用 sunShadowVisibility()（光追阴影图，近图+远图），不是 shadowtex1；
+//   3) 抖动 = 固定 4×4 Bayer + 逐帧黄金比相位，不是 BlueNoiseTemporal；
+//   4) 云影由调用方经 c3CloudSunTransmittance 携带，这里不再乘 globalCloudShadow；
+//   5) 室内门控在调用方，本文件不判 eyeBrightness。
 //
-//   · 地面锚定（fogExtrasParams.y → 函数参数 groundAnchor）
-//     fogDensityAt() 的密度带是**绝对世界 Y**（VFOG_HEIGHT / VFOG_HEIGHT_2），
-//     世界一起伏它就失效：相机在谷底时雾带悬在头顶，雾带埋进山坡时坡面没雾。
-//     这里把采样点的 Y 减去 (该列地面 Y − 参考海平面 63) × 强度，再喂给参考的
-//     密度函数 —— 带厚与剖面形状**一个字符都不改**，只换输入的 Y，于是整条带
-//     跟着地形升降（强度 0 ⇒ 逐位旧档）。不能把 VFOG_HEIGHT 直接当"离地高度"：
-//     那是 50..65，会变成"离地 50-65 格的雾"，飘到半空去。
-//     地面高度用 terrain_height.glsl 的 terrainGroundHeight()（每帧 512² 射线
-//     追踪的产物，与旧档贴地薄雾同一个数据源）。
-//
-//   · 时域抖动（fogExtrasParams.w → temporalJitter）
-//     原抖动是固定 4×4 Bayer，同一个像素永远同一个相位 ⇒ 只能压空间条纹、
-//     不能压"沿视线离散步进"造成的同心带。这里把逐帧低差异相位（黄金比序列，
-//     与 volumetric_clouds.comp 的 temporalPhase() 同一招）加到 Bayer 上，
-//     让每个像素的步进相位逐帧滑动。**本文件不自己做累积** —— 消费它的是既有的
-//     volumetric_cloud_resolve.comp（云/雾共用一条 scattering/transmittance 链，
-//     历史权重 cam.cloudParams2.w），所以零新增缓冲、零新增 descriptor。
-//
-//   · 天空辐亮度当环境项（在**调用点**做，不在这里）
-//     原来的环境入散射是 `mix(夜色, 日色, dayAmount)` 两色常量，日出日落时雾
-//     永远是同一个蓝。调用点改成按 fogExtrasParams.z 混入 clearSkyInscatter()
-//     沿视线方向的真实晴空辐亮度 —— 太阳低时雾自己泛红/泛紫，不需要调色板。
-//
-//   · 动态光源照亮雾（fogExtrasParams.x → dynamicLightStrength）
-//     火把/岩浆/发光方块的 in-scatter。灯光数据与 rgen 的本地光表是**同一份**
-//     （binding 12/13，见 local_light_grid_common.glsl 的头注释），亮度口径也
-//     照抄那里的 3.2 × 0.35 × intensity × (emission/15) × 距离衰减 × 范围淡出。
-//     自创部分只有"相位"这一步：介质里没有 N·L，用一个各向同性 + 轻微前向的
-//     相位代替（FOG_LIGHT_PHASE_*），这是体积散射的常规定义，不是我的发明。
-// ---------------------------------------------------------------------------
-//
-// 编译期常量 = 参考出厂值（Settings.glsl）：
+// 编译期常量 = 出厂标定：
 //   VFOG_DENSITY 0.01 / VFOG_FALLOFF 40 / VFOG_QUALITY 6 /
 //   VFOG_SUNLIGHT_ABSORPTION 1.0 / VFOG_SUNLIGHT_STEPLENGTH 5.0
+//
+// 历史、被排除过的方案、四项扩展的动机，见 docs/decisions/volumetric-fog.md
 // =====================================================================
 #ifndef VOLUMETRIC_FOG_GLSL
 #define VOLUMETRIC_FOG_GLSL
