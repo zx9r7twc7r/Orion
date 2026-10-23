@@ -19,12 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
---------------------------------------------------------------------------------
-
-This license covers Orion's own source code and assets.
-
-It does NOT cover the third-party components redistributed alongside it
-(NVIDIA RTX SDKs binaries, Distant Horizons, ImGui, third-party textures, ...),
-which remain under their own terms. See THIRD_PARTY_NOTICES.md and the
-`licenses/` directory for the full texts.

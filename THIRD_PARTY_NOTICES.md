@@ -1,5 +1,12 @@
 # Third-Party Notices
 
+`LICENSE` (MIT) covers **Orion's own source code and assets only**. The third-party
+components redistributed alongside it (NVIDIA RTX SDKs binaries, Distant Horizons,
+Dear ImGui, third-party textures, ...) remain under their own terms — see the
+sections below and the full texts in `licenses/`.
+
+---
+
 The Tyndall cumulus cloud preset and density-shaping approach were adapted
 from `tyndall-clouds`, Copyright (c) 2026 ProxySudo contributors, supplied
 with this project as `tyndall-clouds-main.zip`.
