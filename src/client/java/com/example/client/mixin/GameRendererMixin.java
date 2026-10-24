@@ -2,6 +2,7 @@ package com.example.client.mixin;
 
 import com.example.client.EntityRtCapture;
 import com.example.client.FrameBudget;
+import com.example.client.bench.BenchmarkSession;
 import com.example.vulkan.NativeVulkan;
 import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.renderpearl.api.textures.GpuTexture;
@@ -29,6 +30,9 @@ public class GameRendererMixin {
         EntityRtCapture.resetEntityFrameOpen();
         // 2026-10-13 帧预算二分（见 FrameBudget）：纯读时钟，不动任何渲染状态。
         FrameBudget.head();
+        // 2026-10-24 基准会话（见 com.example.client.bench.BenchmarkSession）：
+        // 未开启时是一行 boolean 判空；开启后每帧两次 nanoTime + 一行 JSON。
+        BenchmarkSession.frameStart();
     }
 
     /**
@@ -42,6 +46,8 @@ public class GameRendererMixin {
     @Inject(method = "render", at = @At("RETURN"))
     private void rtx$frameBudgetTail(CallbackInfo ci) {
         FrameBudget.tail();
+        // 与 HEAD 配对：量的是 GameRenderer.render() 自身的墙钟（含我们的注入与 Java 钩子）。
+        BenchmarkSession.frameEnd();
     }
 
     /**

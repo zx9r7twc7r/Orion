@@ -82,6 +82,7 @@ Java 的 `-D` 传不进去（`build.gradle` 里的 `vmArg` 也到不了游戏 JV
 | `ORION_SER_LADDER` | 关 | 同局内轮换 SER 档位（0/1/4/5/6），每 60 帧一档、300 帧一周期 |
 | `ORION_PERF_ABLATION` | 关 | 消融级联（`alt:3` / `alt:1,2,3,6,10,12` …），逐级关掉 GI / 光泽 / POM 采价格表 |
 | `ORION_PERF_TIMESTAMPS` | 关 | GPU pass 时间戳 + CPU 帧间隔（`[PERF L10 GPU]` / `[PERF L10 CPU]`） |
+| `ORION_GI_HALF` | 关 | 半分辨率 GI（`HANDOFF-2026-10-24-GI-HALFRES.md`）：GI 回路搬到 `rt_test_gi_half.rgen.spv`，按 (w+1)/2 × (h+1)/2 dispatch、四帧轮转四个子像素；主 raygen 改从 `giHalfImage` 做 3×3 深度感知上采样。关掉 = 建图/建管线/dispatch 全不做，UBO 的 `giHalfParams.x` 写 0 ⇒ 主 raygen 走原来的全分辨率 GI 回路（逐位旧画面）。**启用后第一帧仍走旧路径**（图还没建好），第二帧切换。可与 `ORION_PERF_TIMESTAMPS` 同开，用 `rt` 段差值判读 |
 
 ---
 
@@ -102,3 +103,7 @@ IDE 里独立的运行配置（如 `Minecraft Client (ABLATE)`）。
 DH 集成那一套走的是 Java 系统属性（`-Dorion.dh.*`），不是环境变量，见
 `src/client/java/com/example/client/compat/dh/DhFlags.java`；IDE 运行配置
 `.idea/runConfigurations/Minecraft_Client.xml` 里有完整的参数说明。
+
+基准会话与相机路径同理，走 Java 系统属性：`orion.bench.*`（逐帧落盘、心跳、
+可信性判定）与 `orion.campath.*`（录制/回放，固定步长采样）。全部默认关闭，
+完整清单与判读口径见 [benchmarking](benchmarking.md)。

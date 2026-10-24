@@ -124,7 +124,7 @@ layout(binding = 3, set = 0) uniform sampler2D blockAtlas;
 // 全部槽，否则新槽位上的实体几何会被当成"全不透明"。
 // 2026-10-13：32 → 64。三处（本文件、rt_test.rchit、VulkanCore.cpp 的
 // ENTITY_RT_TEXTURE_SLOT_COUNT / 描述符池）必须同步，下面的 switch 也要补满。
-layout(binding = 36, set = 0) uniform sampler2D entityAtlases[64];
+layout(binding = 36, set = 0) uniform sampler2D entityAtlases[128];
 layout(binding = 37, set = 0) uniform sampler2D particleAtlases[3];
 layout(binding = 40, set = 0) uniform sampler2D rainStreakAtlas;
 
@@ -196,6 +196,70 @@ vec4 sampleEntityAlphaAtlas(uint textureSlot, vec2 uv)
         case 62u: return textureLod(entityAtlases[61], uv, 0.0);
         case 63u: return textureLod(entityAtlases[62], uv, 0.0);
         case 64u: return textureLod(entityAtlases[63], uv, 0.0);
+        case 65u: return textureLod(entityAtlases[64], uv, 0.0);
+        case 66u: return textureLod(entityAtlases[65], uv, 0.0);
+        case 67u: return textureLod(entityAtlases[66], uv, 0.0);
+        case 68u: return textureLod(entityAtlases[67], uv, 0.0);
+        case 69u: return textureLod(entityAtlases[68], uv, 0.0);
+        case 70u: return textureLod(entityAtlases[69], uv, 0.0);
+        case 71u: return textureLod(entityAtlases[70], uv, 0.0);
+        case 72u: return textureLod(entityAtlases[71], uv, 0.0);
+        case 73u: return textureLod(entityAtlases[72], uv, 0.0);
+        case 74u: return textureLod(entityAtlases[73], uv, 0.0);
+        case 75u: return textureLod(entityAtlases[74], uv, 0.0);
+        case 76u: return textureLod(entityAtlases[75], uv, 0.0);
+        case 77u: return textureLod(entityAtlases[76], uv, 0.0);
+        case 78u: return textureLod(entityAtlases[77], uv, 0.0);
+        case 79u: return textureLod(entityAtlases[78], uv, 0.0);
+        case 80u: return textureLod(entityAtlases[79], uv, 0.0);
+        case 81u: return textureLod(entityAtlases[80], uv, 0.0);
+        case 82u: return textureLod(entityAtlases[81], uv, 0.0);
+        case 83u: return textureLod(entityAtlases[82], uv, 0.0);
+        case 84u: return textureLod(entityAtlases[83], uv, 0.0);
+        case 85u: return textureLod(entityAtlases[84], uv, 0.0);
+        case 86u: return textureLod(entityAtlases[85], uv, 0.0);
+        case 87u: return textureLod(entityAtlases[86], uv, 0.0);
+        case 88u: return textureLod(entityAtlases[87], uv, 0.0);
+        case 89u: return textureLod(entityAtlases[88], uv, 0.0);
+        case 90u: return textureLod(entityAtlases[89], uv, 0.0);
+        case 91u: return textureLod(entityAtlases[90], uv, 0.0);
+        case 92u: return textureLod(entityAtlases[91], uv, 0.0);
+        case 93u: return textureLod(entityAtlases[92], uv, 0.0);
+        case 94u: return textureLod(entityAtlases[93], uv, 0.0);
+        case 95u: return textureLod(entityAtlases[94], uv, 0.0);
+        case 96u: return textureLod(entityAtlases[95], uv, 0.0);
+        case 97u: return textureLod(entityAtlases[96], uv, 0.0);
+        case 98u: return textureLod(entityAtlases[97], uv, 0.0);
+        case 99u: return textureLod(entityAtlases[98], uv, 0.0);
+        case 100u: return textureLod(entityAtlases[99], uv, 0.0);
+        case 101u: return textureLod(entityAtlases[100], uv, 0.0);
+        case 102u: return textureLod(entityAtlases[101], uv, 0.0);
+        case 103u: return textureLod(entityAtlases[102], uv, 0.0);
+        case 104u: return textureLod(entityAtlases[103], uv, 0.0);
+        case 105u: return textureLod(entityAtlases[104], uv, 0.0);
+        case 106u: return textureLod(entityAtlases[105], uv, 0.0);
+        case 107u: return textureLod(entityAtlases[106], uv, 0.0);
+        case 108u: return textureLod(entityAtlases[107], uv, 0.0);
+        case 109u: return textureLod(entityAtlases[108], uv, 0.0);
+        case 110u: return textureLod(entityAtlases[109], uv, 0.0);
+        case 111u: return textureLod(entityAtlases[110], uv, 0.0);
+        case 112u: return textureLod(entityAtlases[111], uv, 0.0);
+        case 113u: return textureLod(entityAtlases[112], uv, 0.0);
+        case 114u: return textureLod(entityAtlases[113], uv, 0.0);
+        case 115u: return textureLod(entityAtlases[114], uv, 0.0);
+        case 116u: return textureLod(entityAtlases[115], uv, 0.0);
+        case 117u: return textureLod(entityAtlases[116], uv, 0.0);
+        case 118u: return textureLod(entityAtlases[117], uv, 0.0);
+        case 119u: return textureLod(entityAtlases[118], uv, 0.0);
+        case 120u: return textureLod(entityAtlases[119], uv, 0.0);
+        case 121u: return textureLod(entityAtlases[120], uv, 0.0);
+        case 122u: return textureLod(entityAtlases[121], uv, 0.0);
+        case 123u: return textureLod(entityAtlases[122], uv, 0.0);
+        case 124u: return textureLod(entityAtlases[123], uv, 0.0);
+        case 125u: return textureLod(entityAtlases[124], uv, 0.0);
+        case 126u: return textureLod(entityAtlases[125], uv, 0.0);
+        case 127u: return textureLod(entityAtlases[126], uv, 0.0);
+        case 128u: return textureLod(entityAtlases[127], uv, 0.0);
         default: return vec4(1.0);
     }
 }
@@ -683,6 +747,38 @@ if(
         // exactly white and therefore cannot identify a roof by colour.
         payload.glassAlpha = 1.0;
 
+#ifndef GI_CLEAR_GLASS_VISIBILITY_AS_AIR
+#define GI_CLEAR_GLASS_VISIBILITY_AS_AIR 1
+#endif
+#if GI_CLEAR_GLASS_VISIBILITY_AS_AIR
+        // =====================================================
+        // 2026-10-24（用户要求）：可见性射线里，普通（未染色）玻璃也当空气。
+        //
+        // 相机主路径 2026-10-07 起、GI 走查 2026-10-13 起都是这条口径，但
+        // 太阳/AO/本地光的可见性 any-hit 一直漏着：清玻璃在这里仍要乘
+        // glassPaneTransmissionColor（清玻璃 = 白 sprite × 灰面 shade ⇒
+        // 0.5~1.0，随被穿过的面朝向变）× 薄片 Fresnel（正入射 ≈0.92）⇒
+        // 隔着清玻璃的阳光/灯光被压暗 8%~50%，且阴影深浅跟着面朝向走 ——
+        // 这就是"清玻璃根本没当空气"。
+        //
+        // 判据与 rchit 置 RT_STATE_CLEAR_GLASS_BIT 的完全同源：
+        // glassVertexFactorIsFaceShade（顶点色恰为四档灰面 shade ⇒ 没注入染料）。
+        // 染色玻璃（含白/灰染料，色值不等于四档 shade）不受影响。
+        //
+        // 面序/预算的副作用核对：
+        //   · 跳过 = 本体贡献 0 个面；旧档贡献 2 个面（进+出，偶数）⇒ 下游
+        //     染色玻璃的奇偶不变；
+        //   · 清玻璃不再消耗 GI_GLASS_VISIBILITY_MAX_FACES 预算（空气不该消耗）。
+        // A/B：-DGI_CLEAR_GLASS_VISIBILITY_AS_AIR=0 逐位回到旧档。
+        // =====================================================
+        if(materialId < 2.05 &&
+            glassVertexFactorIsFaceShade(vertexColor.rgb))
+        {
+            ignoreIntersectionEXT;
+            return;
+        }
+#endif
+
         // The visibility ray is receiver -> emitter.  For each traversed
         // glass block its first accepted face is the real light-exit face;
         // only that face receives the Orion boundary sheet, so one
@@ -695,11 +791,45 @@ if(
                 )
             );
 
+#ifndef GI_GLASS_SEAM_RESET
+#define GI_GLASS_SEAM_RESET 1
+#endif
+#if GI_GLASS_SEAM_RESET
+        // =====================================================
+        // 2026-10-24：半透明区域断开处重置面序（修"贴不透明方块的一像素亮线"，
+        // 机制见 HANDOFF-2026-10-24-TRANSLUCENT-SEAM.md §2，用户已确认）。
+        //
+        // Minecraft 会裁掉半透明体与不透明方块之间共用的那一面。射线在那里
+        // 只穿过 1 个面（奇数）⇒ 奇偶从这点起整体翻转 ⇒ 同一条射线上游之外
+        // 的所有玻璃/冰的 isLightExitFace 判反 ⇒ 下游本该乘 filter 的面被跳过
+        // —— filter 是乘法只会变暗，"少乘"才是亮线。
+        //
+        // 面距口径（沿同一根射线量）：
+        //   同一个体进/出面 = 1.0 格（薄片更小）
+        //   相邻两格玻璃之间那一面被裁掉 = 2.0 格
+        //   中间隔 N 格空气的下一个体 = N 格（N=1 时仍是 1.0）
+        // 阈值 1.5 ⇒ 只把"整格被裁掉"当新区域，不切开隔 1 格空气的两段。
+        // 已知副作用：相邻同种玻璃每格各补一次 filter（旧档 2 格只 1 次）
+        // —— "一片一滤"的预期语义，多层会均匀略暗（验证判据第 3 条）。
+        // A/B：-DGI_GLASS_SEAM_RESET=0 逐位回到旧档。
+        // =====================================================
+        if(payload.lastGlassFaceT >= 0.0 &&
+            gl_HitTEXT - payload.lastGlassFaceT > 1.5)
+        {
+            glassFaceOrdinal = 0u;
+        }
+        payload.lastGlassFaceT = gl_HitTEXT;
+#endif
+
         bool isLightExitFace =
             (glassFaceOrdinal & 1u) == 0u;
 
+        // 2026-10-24：面序（可被断开重置）与穿层预算（永不重置）拆成两个字段
+        // —— parallaxRayTravel 只剩面序一个用途，重置不再连预算一起清零。
         payload.parallaxRayTravel =
             float(glassFaceOrdinal + 1u);
+        payload.glassFaceBudget =
+            payload.glassFaceBudget + 1.0;
 
 
         if(isLightExitFace)
@@ -769,12 +899,15 @@ if(
 #define GI_GLASS_VISIBILITY_MAX_FACES 16
 #endif
 #if GI_GLASS_VISIBILITY_BUDGET
+        // 2026-10-24：预算改读独立计数器 glassFaceBudget（面序可重置，预算不可）
+        // —— 表达式与旧档 glassFaceOrdinal + 1u >= MAX 逐值同义。
         if(
             max(
                 payload.albedo.r,
                 max(payload.albedo.g, payload.albedo.b)
             ) < GI_GLASS_VISIBILITY_MIN_TRANSMITTANCE ||
-            glassFaceOrdinal + 1u >= uint(GI_GLASS_VISIBILITY_MAX_FACES)
+            payload.glassFaceBudget >=
+                float(GI_GLASS_VISIBILITY_MAX_FACES)
         )
         {
             return;

@@ -2,6 +2,7 @@ package com.example.client.mixin;
 
 import com.example.client.compat.FarFieldGate;
 import com.example.client.compat.dh.DhBridge;
+import com.example.client.access.SectionUploadDedup;
 import com.example.vulkan.NativeVulkan;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
@@ -51,6 +52,8 @@ public class MinecraftLevelLifecycleMixin {
         }
 
         NativeVulkan.clearWorldGeometry();
+        // 2026-10-24：整世界几何已清 ⇒ 上传内容哈希整表失效。
+        SectionUploadDedup.invalidateAll();
 
         // DH 远场网格也住在 g_chunkMeshes 里，已被上面一并清掉，但 Java 侧的
         // 上传指纹仍认为它在线：同一原点重进世界时指纹命中就不会再上传，远场

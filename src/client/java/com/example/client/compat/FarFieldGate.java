@@ -1,5 +1,6 @@
 package com.example.client.compat;
 
+import com.example.client.access.SectionUploadDedup;
 import com.example.vulkan.NativeVulkan;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.ViewArea;
@@ -283,6 +284,11 @@ public final class FarFieldGate {
                     // 24 次 g_chunkMutex 取锁；现在最多 8 次。
                     NativeVulkan.clearChunkLayers(
                             pos.x(), pos.y(), pos.z(), TERRAIN_LAYER_MASK);
+
+                    // 2026-10-24：native 已擦掉该列几何 ⇒ 上传内容哈希必须失效，
+                    // 否则重建时被判"未变"而永不恢复（区块不刷新/空洞）。
+                    SectionUploadDedup.invalidateSection(
+                            pos.x(), pos.y(), pos.z(), TERRAIN_LAYER_MASK);
                     orphanEraseTransitions++;
                     it.remove();
                     transitions++;
@@ -350,6 +356,10 @@ public final class FarFieldGate {
                 // 不会留空洞：擦除仍以 coversSection 为前提，LOD 没铺到就不擦。
                 // 2026-10-03 批量：同上面那条"孤儿擦除"，三层一次传完。
                 NativeVulkan.clearChunkLayers(
+                        pos.x(), pos.y(), pos.z(), TERRAIN_LAYER_MASK);
+
+                // 2026-10-24：同上 —— 擦除后哈希必须失效。
+                SectionUploadDedup.invalidateSection(
                         pos.x(), pos.y(), pos.z(), TERRAIN_LAYER_MASK);
                 entry.setValue(SUPPRESSED);
                 eraseTransitions++;

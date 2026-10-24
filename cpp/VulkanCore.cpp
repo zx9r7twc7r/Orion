@@ -613,6 +613,257 @@ struct RTXTerminateInstaller
 const RTXTerminateInstaller g_rtxTerminateInstaller{};
 }
 
+// =====================================================================
+// 2026-10-23 崩溃捕获层（"下一次必留现场"）
+//
+// 背景：2026-10-23 23:48:09 进世界第 17 帧静默消失 —— rt_debug.log 34.9 万行
+// 零错误、没有 hs_err、Windows 事件日志也没有崩溃记录（对比 22:37 那次
+// nvgpucomp64 崩溃是有 7031 事件的）。这种"什么都不留"的死法无法区分
+// "被外部终止"和"在 JVM 不接管的路径上瞬间消失"，所以先把现场补齐。
+//
+// 三层证据，各自回答一个不同的问题：
+//   [HEARTBEAT]  每 5 秒一行 ⇒ 死前还活着几帧？是冻死还是秒退？
+//   [CRASH]      未处理异常 ⇒ 异常码 + 故障模块+偏移（等价于 hs_err 的
+//                "Problematic frame"，但不需要等 JVM 写 dump）
+//   [CRASH PATH] 最近 16 个阶段 ⇒ 死在哪一步（几何建 BLAS / TLAS 构建 / …）
+//
+// ⚠ 过滤器是**链式**的：记录完把异常交回上一个顶层过滤器（JVM 装的那个），
+//   这样 hs_err_pid*.log 仍会照常产出。不要改成 EXCEPTION_EXECUTE_HANDLER，
+//   那会吃掉 JVM 的崩溃转储。
+// =====================================================================
+static constexpr int RTX_PHASE_RING = 16;
+
+static std::atomic<uint64_t> g_rtxPhaseSeq{0};
+static std::atomic<uint64_t> g_rtxPhaseStamp[RTX_PHASE_RING]{};
+static std::atomic<const char*> g_rtxPhaseName[RTX_PHASE_RING]{};
+static std::atomic<const char*> g_rtxPhaseCurrent{"startup"};
+static std::atomic<uint64_t> g_rtxLastFrameSerial{0};
+
+// 崩溃现场用到的数值（不是统计，只服务 [CRASH] 那一行）：
+//   detailSectionKey   = 正在建 BLAS 的 Section 键（packSectionKey 布局，
+//                        可反解 XYZ/layer），0 表示不是 BLAS 段；
+//   detailSectionVerts = 该段的顶点数；
+//   detailInstances    = 最近一次 TLAS 构建的实例数。
+static std::atomic<uint64_t> g_rtxDetailSectionKey{0};
+static std::atomic<uint64_t> g_rtxDetailSectionVerts{0};
+static std::atomic<uint64_t> g_rtxDetailInstances{0};
+
+static void RTXMarkPhase(const char* name)
+{
+    const uint64_t seq =
+        g_rtxPhaseSeq.fetch_add(1, std::memory_order_relaxed) + 1u;
+    const int slot = static_cast<int>(seq % RTX_PHASE_RING);
+
+    g_rtxPhaseStamp[slot].store(seq, std::memory_order_relaxed);
+    g_rtxPhaseName[slot].store(name, std::memory_order_relaxed);
+    g_rtxPhaseCurrent.store(name, std::memory_order_relaxed);
+}
+
+static std::string RTXHex(uint64_t value)
+{
+    static const char* digits = "0123456789ABCDEF";
+
+    char buffer[20] = { '0', 'x' };
+    int pos = 2;
+    bool started = false;
+
+    for(int shift = 60; shift >= 0; shift -= 4)
+    {
+        const int nibble = static_cast<int>((value >> shift) & 0xFull);
+
+        if(nibble != 0)
+        {
+            started = true;
+        }
+
+        if(started || shift == 0)
+        {
+            buffer[pos] = digits[nibble];
+            pos += 1;
+        }
+    }
+
+    buffer[pos] = '\0';
+
+    return std::string(buffer);
+}
+
+// 故障地址 → "模块名+偏移"（与 hs_err 的 Problematic frame 同口径）。
+static std::string RTXModuleOfPc(uintptr_t pc)
+{
+    HMODULE module = nullptr;
+
+    if(GetModuleHandleExA(
+           GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+           reinterpret_cast<LPCSTR>(pc),
+           &module) &&
+       module != nullptr)
+    {
+        char path[MAX_PATH] = {};
+
+        if(GetModuleFileNameA(module, path, MAX_PATH) > 0)
+        {
+            const char* leaf = std::strrchr(path, '\\');
+            leaf = (leaf != nullptr) ? (leaf + 1) : path;
+
+            return std::string(leaf) +
+                   "+" + RTXHex(pc - reinterpret_cast<uintptr_t>(module));
+        }
+
+        return std::string("<module>+") +
+               RTXHex(pc - reinterpret_cast<uintptr_t>(module));
+    }
+
+    return std::string("<unknown module>@") + RTXHex(pc);
+}
+
+// 阶段面包屑倒序打印（最新在前）。崩溃时也写一份到独立文件，
+// 避免 rt_debug.log 的流在崩溃现场不可用。
+static void RTXDumpCrashContext(const std::string& header)
+{
+    const uint64_t seq = g_rtxPhaseSeq.load(std::memory_order_relaxed);
+    const uint64_t frame = g_rtxLastFrameSerial.load(std::memory_order_relaxed);
+    const char* current = g_rtxPhaseCurrent.load(std::memory_order_relaxed);
+
+    RTLogFlushed(header);
+
+    const uint64_t detailKey =
+        g_rtxDetailSectionKey.load(std::memory_order_relaxed);
+    const uint64_t detailVerts =
+        g_rtxDetailSectionVerts.load(std::memory_order_relaxed);
+    const uint64_t detailInstances =
+        g_rtxDetailInstances.load(std::memory_order_relaxed);
+
+    RTLogFlushed(
+        std::string("[CRASH] frame=") + std::to_string(frame) +
+        " phase=" + (current != nullptr ? current : "?") +
+        " sectionKey=" + std::to_string(detailKey) +
+        " sectionVerts=" + std::to_string(detailVerts) +
+        " tlasInstances=" + std::to_string(detailInstances)
+    );
+
+    for(uint64_t back = 1; back <= 8u && back <= seq; ++back)
+    {
+        const uint64_t stamp = seq - back + 1u;
+        const int slot = static_cast<int>(stamp % RTX_PHASE_RING);
+
+        if(g_rtxPhaseStamp[slot].load(std::memory_order_relaxed) != stamp)
+        {
+            continue;
+        }
+
+        const char* name = g_rtxPhaseName[slot].load(std::memory_order_relaxed);
+
+        RTLogFlushed(
+            std::string("[CRASH PATH] #") + std::to_string(stamp) +
+            " " + (name != nullptr ? name : "?")
+        );
+    }
+
+    std::ofstream crashFile("rt_crash.log", std::ios::app);
+
+    if(crashFile.is_open())
+    {
+        crashFile << header << "\n";
+        crashFile << "[CRASH] frame=" << frame
+                  << " phase=" << (current != nullptr ? current : "?")
+                  << " sectionKey=" << detailKey
+                  << " sectionVerts=" << detailVerts
+                  << " tlasInstances=" << detailInstances << "\n";
+
+        for(uint64_t back = 1; back <= 8u && back <= seq; ++back)
+        {
+            const uint64_t stamp = seq - back + 1u;
+            const int slot = static_cast<int>(stamp % RTX_PHASE_RING);
+
+            if(g_rtxPhaseStamp[slot].load(std::memory_order_relaxed) != stamp)
+            {
+                continue;
+            }
+
+            const char* name = g_rtxPhaseName[slot].load(std::memory_order_relaxed);
+
+            crashFile << "[CRASH PATH] #" << stamp << " "
+                      << (name != nullptr ? name : "?") << "\n";
+        }
+
+        crashFile.flush();
+    }
+}
+
+static LPTOP_LEVEL_EXCEPTION_FILTER g_rtxPreviousExceptionFilter = nullptr;
+
+static LONG WINAPI RTXUnhandledExceptionFilter(EXCEPTION_POINTERS* info)
+{
+    DWORD exceptionCode = 0u;
+    uintptr_t exceptionAddress = 0u;
+    uintptr_t instructionPointer = 0u;
+    uintptr_t stackPointer = 0u;
+
+    if(info != nullptr)
+    {
+        if(info->ExceptionRecord != nullptr)
+        {
+            exceptionCode = info->ExceptionRecord->ExceptionCode;
+            exceptionAddress =
+                reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress);
+        }
+
+        if(info->ContextRecord != nullptr)
+        {
+#if defined(_M_X64)
+            instructionPointer =
+                static_cast<uintptr_t>(info->ContextRecord->Rip);
+            stackPointer =
+                static_cast<uintptr_t>(info->ContextRecord->Rsp);
+#elif defined(_M_ARM64)
+            instructionPointer =
+                static_cast<uintptr_t>(info->ContextRecord->Pc);
+            stackPointer =
+                static_cast<uintptr_t>(info->ContextRecord->Sp);
+#else
+            instructionPointer = exceptionAddress;
+#endif
+        }
+    }
+
+    const uintptr_t faultPc =
+        (exceptionAddress != 0u) ? exceptionAddress : instructionPointer;
+
+    RTXDumpCrashContext(
+        std::string("[CRASH] unhandled native exception code=") +
+        RTXHex(exceptionCode) +
+        " at=" + RTXModuleOfPc(faultPc) +
+        " rip=" + RTXHex(instructionPointer) +
+        " rsp=" + RTXHex(stackPointer) +
+        " thread=" + std::to_string(GetCurrentThreadId())
+    );
+
+    // 链式交回上一个过滤器（JVM 的 hs_err 写入器），不要吞掉异常。
+    if(g_rtxPreviousExceptionFilter != nullptr)
+    {
+        return g_rtxPreviousExceptionFilter(info);
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+namespace
+{
+struct RTXCrashFilterInstaller
+{
+    RTXCrashFilterInstaller()
+    {
+        g_rtxPreviousExceptionFilter =
+            SetUnhandledExceptionFilter(&RTXUnhandledExceptionFilter);
+
+        RTXMarkPhase("startup");
+    }
+};
+const RTXCrashFilterInstaller g_rtxCrashFilterInstaller{};
+}
+
 static bool g_isInWorld = false;
 static const uint32_t MAX_TEXTURES = 4096;
 static uint32_t g_currentAlbedoIndex = 0;
@@ -1850,8 +2101,16 @@ enum PerfL10GpuBoundary : uint32_t
     PERF_L10_GPU_B_WFFT,       // water FFT update done
     PERF_L10_GPU_B_WCAUS,      // water caustic map done
     PERF_L10_GPU_B_CAUS,       // water caustics done
-    PERF_L10_GPU_B_SKY,        // sky atmosphere done
-    PERF_L10_GPU_B_RT,         // main RayGen done
+    // 2026-10-24 细分（见 patch_rt_scopes.py）：原来这三段把"管线创建 /
+    // 远场阴影 / SHaRC update / 天空大气 / 主派发 / 近场阴影 / 高度场 / 云"
+    // 混成了 sky / rt / cloud 三个数，导致 rt=12.5ms 无法归因。
+    PERF_L10_GPU_B_RTPIPE,     // cloud+sky pipeline creation done
+    PERF_L10_GPU_B_SFAR,       // far sun shadow map done
+    PERF_L10_GPU_B_SHARCUP,    // SHaRC update done
+    PERF_L10_GPU_B_SKY,        // sky atmosphere done（scope = 绑定 + 天空大气）
+    PERF_L10_GPU_B_RT,         // main RayGen + SHaRC resolve done
+    PERF_L10_GPU_B_SNEAR,      // near sun shadow map done（在 recordVolumetricClouds 内）
+    PERF_L10_GPU_B_HEIGHT,     // terrain height field done（同上）
     PERF_L10_GPU_B_CLOUD,      // volumetric clouds done
     PERF_L10_GPU_B_DLSS,       // Streamline DLSS/RR Evaluate done
     PERF_L10_GPU_B_SDR,        // SDR display transform done
@@ -1874,8 +2133,13 @@ constexpr const char* PERF_L10_GPU_SCOPE_NAMES[PERF_L10_GPU_SCOPE_COUNT] =
     "wfft",
     "wcaus",
     "caus",
+    "rtpipe",
+    "sfar",
+    "sharcup",
     "sky",
     "rt",
+    "snear",
+    "height",
     "cloud",
     "dlss",
     "sdr",
@@ -1908,6 +2172,13 @@ struct PerfL10GpuPassWindow
     uint32_t serToggle = 0u;
     uint32_t serPaths = 0u;
     uint32_t serMode = 0u;
+    // 2026-10-24：远场阴影 A/B 的臂（0=关，1=开；未启用 A/B 时恒 1）。
+    // 必须在**累积开始时**定格 —— 在打印时刻求值会拿到下一臂（见 patch 注释）。
+    uint32_t abFarArm = 0u;
+    // 2026-10-24：本窗口的 GI 截断档位（格，0 = 不截断）；首个样本时定格。
+    float giMaxDistance = 0.0f;
+    // 2026-10-24：本窗口的 POM 深度（0 = 关闭）；首个样本时定格。
+    float pomDepth = 0.0f;
     double sumScopeMs[PERF_L10_GPU_SCOPE_COUNT]{};
     double maxScopeMs[PERF_L10_GPU_SCOPE_COUNT]{};
     double sumFrameMs = 0.0;
@@ -1919,6 +2190,73 @@ constexpr uint64_t PERF_L10_GPU_WINDOW_FRAMES = 60u;
 static VkQueryPool g_perfL10GpuTimestampPool = VK_NULL_HANDLE;
 static double g_perfL10TimestampPeriodNs = 0.0;
 static uint64_t g_perfL10FrameSerial = 0u;
+
+// 2026-10-24 远场太阳阴影的同局 A/B（ORION_SUNSHADOW_FAR_AB=1）。
+//
+// 为什么需要：远场阴影的收益只能靠 rt= 的变化看出来，而 rt 的成本跟场景强相关
+// （实例数 / 三角形数每局差两三倍），跨局相减等于把场景差当成开关键。所以按
+// **同一个窗口常量**（PERF_L10_GPU_WINDOW_FRAMES）交替开/关，并在 [PERF L10 GPU]
+// 行上打 abFar=，让两臂落在不同窗口、同一个世界里。
+static bool sunShadowFarAbEnabled()
+{
+    static const bool s_enabled = []() -> bool
+    {
+        const char* raw = std::getenv("ORION_SUNSHADOW_FAR_AB");
+
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+
+    return s_enabled;
+}
+
+// 0 = 关臂，1 = 开臂。窗口索引与 [PERF L10 GPU] 完全同源。
+static uint32_t sunShadowFarAbArm()
+{
+    return static_cast<uint32_t>(
+        (g_perfL10FrameSerial / PERF_L10_GPU_WINDOW_FRAMES) & 1u);
+}
+
+
+// 2026-10-23 心跳：每 5 秒一行，回答"死前还活着几帧 / 是冻死还是秒退"。
+// 只写一行且 flush，成本可忽略；若日志里心跳停在某帧之后什么都没有，
+// 说明进程不是死在我们自己的代码路径上（被外部终止）。
+static void RTXHeartbeatTick()
+{
+    static auto s_lastHeartbeat = std::chrono::steady_clock::now();
+    static uint64_t s_lastFrame = std::numeric_limits<uint64_t>::max();
+
+    g_rtxLastFrameSerial.store(
+        static_cast<uint64_t>(g_perfL10FrameSerial),
+        std::memory_order_relaxed
+    );
+
+    const auto now = std::chrono::steady_clock::now();
+
+    // 5 秒一次是稳态节拍；但现场是"进世界 1 秒内就死"，那样一行心跳都赶不上。
+    // 所以再加一条：帧号每前进 60 帧也强制打一行（进世界的前几秒因此有帧级心跳）。
+    const bool timeElapsed =
+        s_lastFrame == std::numeric_limits<uint64_t>::max() ||
+        std::chrono::duration<float>(now - s_lastHeartbeat).count() >= 5.0f;
+    const bool frameElapsed =
+        s_lastFrame == std::numeric_limits<uint64_t>::max() ||
+        (static_cast<uint64_t>(g_perfL10FrameSerial) - s_lastFrame) >= 60u;
+
+    if(!timeElapsed && !frameElapsed)
+    {
+        return;
+    }
+
+    s_lastHeartbeat = now;
+    s_lastFrame = static_cast<uint64_t>(g_perfL10FrameSerial);
+
+    const char* phase = g_rtxPhaseCurrent.load(std::memory_order_relaxed);
+
+    RTLogFlushed(
+        std::string("[HEARTBEAT] frame=") +
+        std::to_string(g_perfL10FrameSerial) +
+        " phase=" + (phase != nullptr ? phase : "?")
+    );
+}
 
 // Section uploads arrive in bursts while Minecraft streams chunks. Rebuilding
 // BLAS/TLAS for every burst drains the RT queue repeatedly and turns loading
@@ -2598,6 +2936,82 @@ static bool ensurePerfL10GpuTimestampPool()
 // Window summary.  Two lines per window: averages, then maxima.  Keeping the
 // maxima next to the averages is what makes a single spiking pass visible
 // instead of being averaged away.
+// 2026-10-24：已完成并落盘的 GPU 窗口数。交错 A/B 的臂号只跟这个走 ——
+// 跟帧号会与"60 样本窗口"同周期拍频，导致窗口永远凑不满
+// （见 .tmp/patch_ablate_windowcount.py 的现场记录）。
+static uint32_t g_perfL10GpuWindowsLogged = 0u;
+
+// 2026-10-24：给 [PERF L10 GPU] 行打 spp=<用户每像素采样数> 的只读影子。
+// g_perfRtSpp 声明在本文件更后面（8366 行），日志函数在 2950 行，所以用这个
+// 影子转发；真正的值在写 CameraUBO.rtSampleParams[0] 的地方同步。
+static std::atomic<float> g_perfL10SppForLog{1.0f};
+
+// =====================================================
+// 2026-10-24 GI 光线距离截断（宿主侧档位）
+//
+// ORION_GI_MAX_DISTANCE=<格>      GI 射线 tMax 上限；未设/0 = 不截断（默认）
+// ORION_GI_MAX_DISTANCE_AB=1      同局交错：偶数窗不截断、奇数窗截断
+//
+// 车道用 CameraUBO.historyPadding0（宿主原本恒写 0，且**全仓无着色器读取**）。
+// 着色器侧见 rt_test.rgen 的 perfGiTraceMaxDistance()。
+// 为什么需要：GI 是 rt 段最大项（noGi −5.47ms / rt 11.58ms），而在
+// giBounces=1 / roulette=1 / rtSpp=1 下所有细分旋钮都测不出收益。
+// =====================================================
+static std::atomic<float> g_perfL10GiMaxForLog{0.0f};
+
+// 2026-10-24：POM 深度影子（只服务日志分组）。0 = POM 关闭（shader 早退）。
+static std::atomic<float> g_perfL10PomForLog{0.05f};
+
+static float giRayMaxDistanceConfigured()
+{
+    static const float s_value = []() -> float
+    {
+        const char* raw = std::getenv("ORION_GI_MAX_DISTANCE");
+
+        if(raw == nullptr)
+        {
+            return 0.0f;
+        }
+
+        const float parsed = static_cast<float>(std::atof(raw));
+
+        return parsed > 0.0f ? parsed : 0.0f;
+    }();
+
+    return s_value;
+}
+
+static bool giRayMaxDistanceAbEnabled()
+{
+    static const bool s_enabled = []() -> bool
+    {
+        const char* raw = std::getenv("ORION_GI_MAX_DISTANCE_AB");
+
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+
+    return s_enabled;
+}
+
+static float giRayMaxDistanceEffective()
+{
+    const float configured = giRayMaxDistanceConfigured();
+
+    if(configured <= 0.0f)
+    {
+        return 0.0f;
+    }
+
+    if(!giRayMaxDistanceAbEnabled())
+    {
+        return configured;
+    }
+
+    // 偶数窗 = 基线（不截断），奇数窗 = 截断。窗口计数与日志窗口同源，
+    // 换臂发生在窗口刚重置之后 ⇒ 一个窗口内取值恒定。
+    return ((g_perfL10GpuWindowsLogged & 1u) == 0u) ? 0.0f : configured;
+}
+
 static void logPerfL10GpuPassWindow(
     uint64_t frameSerial,
     uint32_t renderWidth,
@@ -2628,6 +3042,10 @@ static void logPerfL10GpuPassWindow(
         << " ser=" << (g_perfL10GpuPassWindow.serToggle != 0u ? 1 : 0)
         << " serMode=" << g_perfL10GpuPassWindow.serMode
         << " aoSkip=" << g_perfL10GpuPassWindow.serPaths
+        << " abFar=" << g_perfL10GpuPassWindow.abFarArm
+        << " spp=" << g_perfL10SppForLog.load()
+        << " giMax=" << g_perfL10GpuPassWindow.giMaxDistance
+        << " pom=" << g_perfL10GpuPassWindow.pomDepth
         << " dispatch=" << renderWidth << "x" << renderHeight
         << " avgMs frame=" << std::fixed << std::setprecision(2)
         << (g_perfL10GpuPassWindow.sumFrameMs / sampleCount);
@@ -2640,6 +3058,10 @@ static void logPerfL10GpuPassWindow(
         << " ser=" << (g_perfL10GpuPassWindow.serToggle != 0u ? 1 : 0)
         << " serMode=" << g_perfL10GpuPassWindow.serMode
         << " aoSkip=" << g_perfL10GpuPassWindow.serPaths
+        << " abFar=" << g_perfL10GpuPassWindow.abFarArm
+        << " spp=" << g_perfL10SppForLog.load()
+        << " giMax=" << g_perfL10GpuPassWindow.giMaxDistance
+        << " pom=" << g_perfL10GpuPassWindow.pomDepth
         << " maxMs frame=" << std::fixed << std::setprecision(2)
         << g_perfL10GpuPassWindow.maxFrameMs;
 
@@ -2660,6 +3082,9 @@ static void logPerfL10GpuPassWindow(
     RTLog(maxima.str());
 
     g_perfL10GpuPassWindow = PerfL10GpuPassWindow{};
+
+    // 窗口已落盘 ⇒ 计数 +1。交错 A/B 在这里换臂（下一个窗口整体换到新臂）。
+    g_perfL10GpuWindowsLogged += 1u;
 }
 
 
@@ -2727,6 +3152,20 @@ static void pollPerfL10GpuTimestampSlot(
     g_perfL10GpuPassWindow.serPaths = slot.serPaths;
     g_perfL10GpuPassWindow.serMode = slot.serMode;
 
+    // 第一个样本折进来时定格臂标签（窗口重置后 samples 归零 ⇒ 会重新定格）。
+    if(g_perfL10GpuPassWindow.samples == 0u)
+    {
+        g_perfL10GpuPassWindow.abFarArm =
+            sunShadowFarAbEnabled() ? sunShadowFarAbArm() : 1u;
+
+        // GI 截断档位同样在首个样本定格（打印时刻求值会拿到下一臂）。
+        g_perfL10GpuPassWindow.giMaxDistance =
+            g_perfL10GiMaxForLog.load(std::memory_order_relaxed);
+
+        g_perfL10GpuPassWindow.pomDepth =
+            g_perfL10PomForLog.load(std::memory_order_relaxed);
+    }
+
     double frameMs = 0.0;
 
     for(uint32_t scope = 0u; scope < PERF_L10_GPU_SCOPE_COUNT; ++scope)
@@ -2772,6 +3211,11 @@ static void pollPerfL10GpuTimestampSlot(
 }
 
 
+// 2026-10-24 诊断：本帧已写入的边界位图（bit = PerfL10GpuBoundary）。
+// 用途：一旦某个边界被 if 跳过，[PERF L10 GPU] 会整局静默停摆（槽级丢弃），
+// 这条自检把"缺哪个"打出来。
+static uint32_t g_perfL10BoundaryMask = 0u;
+
 static void writePerfL10GpuBoundary(
     VkCommandBuffer commandBuffer,
     PerfL10GpuBoundary boundary
@@ -2800,6 +3244,8 @@ static void writePerfL10GpuBoundary(
                 PERF_L10_GPU_BOUNDARY_COUNT +
             static_cast<uint32_t>(boundary)
     );
+
+    g_perfL10BoundaryMask |= (1u << static_cast<uint32_t>(boundary));
 }
 
 
@@ -2831,6 +3277,7 @@ static void beginPerfL10GpuFrame(
 )
 {
     g_perfL10GpuActiveSlot = -1;
+    g_perfL10BoundaryMask = 0u;
 
     if(!perfTimestampsEnabled())
     {
@@ -2888,7 +3335,72 @@ static void endPerfL10GpuFrame(
         return;
     }
 
+    // 2026-10-24：补齐本帧缺失的边界。
+    // 只补"序号大于已写最大序号"的那些 —— 它们本来就应该在尾部，补成零长度
+    // scope 不会把别的 pass 的耗时挪到这里。典型来源：FG 关闭时 FG 捕获被跳过
+    // （index 19），少了它整帧时间戳就凑不满，仪器会静默失效。
+    {
+        int32_t highestWritten = -1;
+
+        for(uint32_t index = 0u; index < PERF_L10_GPU_BOUNDARY_COUNT; ++index)
+        {
+            if((g_perfL10BoundaryMask & (1u << index)) != 0u)
+            {
+                highestWritten = static_cast<int32_t>(index);
+            }
+        }
+
+        for(uint32_t index = 0u; index < PERF_L10_GPU_BOUNDARY_COUNT; ++index)
+        {
+            if(index == static_cast<uint32_t>(PERF_L10_GPU_B_TAIL))
+            {
+                continue;
+            }
+
+            if((g_perfL10BoundaryMask & (1u << index)) == 0u &&
+               static_cast<int32_t>(index) > highestWritten)
+            {
+                writePerfL10GpuBoundary(
+                    commandBuffer,
+                    static_cast<PerfL10GpuBoundary>(index)
+                );
+            }
+        }
+    }
+
     writePerfL10GpuBoundary(commandBuffer, PERF_L10_GPU_B_TAIL);
+
+    // 2026-10-24：整帧边界完整性自检（每 300 帧最多一行）。
+    {
+        const uint32_t wanted =
+            (1u << static_cast<uint32_t>(PERF_L10_GPU_BOUNDARY_COUNT)) - 1u;
+
+        if((g_perfL10BoundaryMask & wanted) != wanted)
+        {
+            static uint64_t s_lastReportFrame = 0u;
+
+            if(g_perfL10FrameSerial > s_lastReportFrame + 300u)
+            {
+                s_lastReportFrame = g_perfL10FrameSerial;
+
+                std::string missing;
+
+                for(uint32_t index = 0u; index < PERF_L10_GPU_BOUNDARY_COUNT; ++index)
+                {
+                    if((g_perfL10BoundaryMask & (1u << index)) == 0u)
+                    {
+                        missing += (missing.empty() ? "" : ",");
+                        missing += std::to_string(index);
+                    }
+                }
+
+                RTLogFlushed(
+                    "[PERF L10 GPU] boundaries incomplete, missing index=" + missing +
+                    " (a skipped boundary kills every timestamp slot)"
+                );
+            }
+        }
+    }
 
     g_perfL10GpuActiveSlot = -1;
 }
@@ -2959,8 +3471,37 @@ static void updatePerfL10AblationStage()
             g_perfL10AblationStage = 0u;
             return;
         }
-        const uint32_t windowIndex =
-            static_cast<uint32_t>(g_perfL10FrameSerial / PERF_L10_GPU_WINDOW_FRAMES);
+        // 臂号 = 已完成窗口数（不是帧号）。详见 g_perfL10GpuWindowsLogged 的说明：
+        // 用帧号会与 60 样本窗口同周期拍频，窗口永远凑不满、整局零数据。
+        const uint32_t windowIndex = g_perfL10GpuWindowsLogged;
+
+        // 自检：交错 A/B 靠"窗口落盘"换臂。时间戳没开、或轮询一直失败时，
+        // 窗口永远不会完成 ⇒ 臂卡在第 0 个，而日志看起来一切正常。
+        // 连续 600 帧没有新窗口就显式喊一次（约 10 秒 @60fps / 60 秒 @10fps）。
+        {
+            static uint32_t s_seenWindows = 0xffffffffu;
+            static uint64_t s_seenFrame = 0u;
+
+            if(s_seenWindows == 0xffffffffu)
+            {
+                s_seenWindows = g_perfL10GpuWindowsLogged;
+                s_seenFrame = g_perfL10FrameSerial;
+            }
+            else if(s_seenWindows != g_perfL10GpuWindowsLogged)
+            {
+                s_seenWindows = g_perfL10GpuWindowsLogged;
+                s_seenFrame = g_perfL10FrameSerial;
+            }
+            else if(g_perfL10FrameSerial > s_seenFrame + 600u)
+            {
+                s_seenFrame = g_perfL10FrameSerial;
+
+                RTLogFlushed(
+                    "[PERF L10 ABLATE] stalled: no GPU window in 600 frames "
+                    "(check ORION_PERF_TIMESTAMPS=1; the A/B arm cannot advance)"
+                );
+            }
+        }
         if(windowIndex % 2u == 0u)
         {
             g_perfL10AblationStage = 0u;
@@ -3850,6 +4391,16 @@ struct CameraUBO {
     // ---------------------------------------------------------------------
     float ueCloudA[4];
     float ueCloudB[4];
+
+    // ---------------------------------------------------------------------
+    // 2026-10-24 半分辨率 GI（HANDOFF-2026-10-24-GI-HALFRES.md），偏移 1568。
+    // 与 camera_ubo.glsl 末尾的 `vec4 giHalfParams` 逐项对应。
+    //   x = 0（默认）＝ 旧路径：主 raygen 自己跑全分辨率 GI 回路
+    //       > 0.5    ＝ 新路径：主 raygen 从 giHalfImage 上采样
+    //   yzw 保留（宿主写 0）
+    // ⚠ 资源没建好 / giHalfEnabled() 关时必须写 0，否则主变体去读未写描述符。
+    // ---------------------------------------------------------------------
+    float giHalfParams[4];
 };
 
 // The shaders each re-declare `CameraProperties` as a std140 block.  A block
@@ -4016,7 +4567,11 @@ static_assert(offsetof(CameraUBO, ueCloudA) == 1536,
     "out-of-range and they come back as 0 => black clouds)");
 static_assert(offsetof(CameraUBO, ueCloudB) == 1552,
     "ueCloudB must start at 1552, immediately after ueCloudA");
-static_assert(sizeof(CameraUBO) == 1568,
+static_assert(offsetof(CameraUBO, giHalfParams) == 1568,
+    "giHalfParams must start at 1568, immediately after ueCloudB: 2026-10-24 "
+    "half-resolution GI switch lives in lane x and rt_test.rgen reads it "
+    "through the shared camera_ubo.glsl block declaration");
+static_assert(sizeof(CameraUBO) == 1584,
     "CameraUBO size must match the std140 size of the shaders' CameraProperties "
     "block (1520 -> 1536 when 2026-10-19 sssParams "
     "(foliage subsurface-scattering mode switch) was appended at the tail; "
@@ -4536,6 +5091,9 @@ static VkAccelerationStructureKHR g_terrainHeightTlasHandle = VK_NULL_HANDLE;
 // =====================================================
 static bool g_terrainHeightBuilt = false;
 static uint64_t g_terrainHeightBuiltRevision = 0u;
+// 2026-10-24：这张图是"相机为中心 + 按格量化"烘焙的（terrain_height.glsl:98-99），
+// 所以"要不要重建"必须同时看中心 —— 只看修订号会在走动时让整张图平移。
+static float g_terrainHeightBuiltCenter[2] = { 0.0f, 0.0f };
 
 // =====================================================
 // 2026-10-01：跨 delta 的 RR guide 核半径**定向**放宽（rr_guide_relax.comp）
@@ -6051,6 +6609,76 @@ static VkDeviceMemory g_rrSpecularHitDistanceMemory = VK_NULL_HANDLE;
 static VkImageView g_rrSpecularHitDistanceView = VK_NULL_HANDLE;
 static VkImageLayout g_rrSpecularHitDistanceLayout =
     VK_IMAGE_LAYOUT_UNDEFINED;
+
+
+// -----------------------------------------------------
+// 2026-10-23：DLSS RR 的 TransparencyHint（阶段 1：只管资源与 tag）
+//
+// 为什么需要它：RR 的 7 张输入描述的是**主表面**（深度/法线/粗糙度/反照率），
+// 而玻璃/水后面的内容根本不在 G-buffer 里 —— 那片像素的 MV 正确、深度也正确，
+// 但颜色来自另一条折射/透射路径。RR 据此会把它们当可信历史做时间平均，
+// 于是"相机一动、玻璃里的均匀颗粒就回来"。
+//
+// 语义：R8_UNORM，1 = 这个像素的主命中是半透明（玻璃/水/半透明桶），
+// RR 应降低对该像素历史的信任。
+//
+// 阶段 1 只建资源、打 tag，值由阶段 2（rgen 写）填。期间用环境变量关着：
+//   ORION_RR_TRANSPARENCY_HINT=1 才把这个 tag 计进 RR 输入表。
+// 不写值时图的内容未定义，所以**默认不开**。
+// -----------------------------------------------------
+static VkImage g_rrTransparencyHintImage = VK_NULL_HANDLE;
+static VkDeviceMemory g_rrTransparencyHintMemory = VK_NULL_HANDLE;
+static VkImageView g_rrTransparencyHintView = VK_NULL_HANDLE;
+static VkImageLayout g_rrTransparencyHintLayout =
+    VK_IMAGE_LAYOUT_UNDEFINED;
+
+// -----------------------------------------------------
+// 2026-10-24：半分辨率 GI（HANDOFF-2026-10-24-GI-HALFRES.md，方案 C）
+//
+// 一张 w/2 × h/2 的 RGBA16F：rgb = 解调后的辐照度，a = 主命中视深度（米）。
+// GI 变体写、主变体读（binding 72，见 createRayTracingDescriptorSetLayout）。
+// 未启用 ORION_GI_HALF 时三个句柄恒为 NULL_HANDLE，描述符不写、pass 不录。
+// -----------------------------------------------------
+static VkImage g_giHalfImage = VK_NULL_HANDLE;
+static VkDeviceMemory g_giHalfMemory = VK_NULL_HANDLE;
+static VkImageView g_giHalfView = VK_NULL_HANDLE;
+static VkImageLayout g_giHalfLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+static uint32_t g_giHalfWidth = 0u;
+static uint32_t g_giHalfHeight = 0u;
+// 图刚建/刚重建 ⇒ 需要先清一次再让 imageLoad 读它（未定义内容是 UB，而且这张图的
+// alpha 是深度权重的一半，脏数据会让上采样分母吃垃圾）。
+static bool g_giHalfNeedsClear = false;
+// 描述符句柄缓存：图变了才重写（与 binding 71 的 rrHintBoundView 同一套做法）。
+static VkImageView g_giHalfBoundView = VK_NULL_HANDLE;
+
+// =====================================================
+// ORION_GI_HALF：半分辨率 GI 的**唯一**环境开关（默认关 = 逐位旧画面）。
+//
+// 为什么是环境变量而不是设置项：这是评估阶段的一条对照臂，判据是
+// "[PERF L10 GPU] 的 rt 段下降 ≥ 1.5ms"（HANDOFF §8），不是玩家功能。
+// 关掉时：宿主不建图、不建管线、不 dispatch，且往 UBO 写 0 ⇒ 主 raygen 走
+// 原来的全分辨率 GI 回路（那段代码仍在，只是被运行时分支跳过）。
+// =====================================================
+static bool giHalfEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_GI_HALF");
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+
+    return cached;
+}
+
+
+static bool rrTransparencyHintEnabled()
+{
+    static const bool enabled = []() {
+        const char* raw = std::getenv("ORION_RR_TRANSPARENCY_HINT");
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+    return enabled;
+}
 
 
 static uint32_t g_rrGBufferWidth = 0;
@@ -9694,7 +10322,21 @@ static void createBuffer(VkDevice d,VkPhysicalDevice pd,VkDeviceSize size,VkBuff
 // no longer be produced.  Kept switched off rather than deleted so the host-side
 // plumbing (buffer, staging ring, descriptor, window log) stays reviewable if
 // the ray counts are ever needed again.
-constexpr bool PERF_L10_ENABLE_RAY_STATS = false;
+// 2026-10-24：从编译期常量改成运行期开关。
+// 着色器侧只在 stage 15（原空档 spare15）写计数，所以采集必须：
+//   ORION_RAY_STATS=1  ORION_PERF_ABLATION=pin:15
+// 不设则本函数返回 false，begin/end 直接返回，与改动前逐位相同。
+static bool perfL10RayStatsEnabled()
+{
+    static const bool s_enabled = []() -> bool
+    {
+        const char* raw = std::getenv("ORION_RAY_STATS");
+
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+
+    return s_enabled;
+}
 constexpr uint32_t PERF_L10_RAY_STAT_COUNT = 12u;
 // The staging ring must be deeper than the CPU/GPU lead, same rule as the
 // timestamp ring: a slot is read RING_SIZE frames after it was filled.
@@ -10037,7 +10679,7 @@ static void beginPerfL10RayStats(
     VkCommandBuffer commandBuffer
 )
 {
-    if constexpr(!PERF_L10_ENABLE_RAY_STATS)
+    if(!perfL10RayStatsEnabled())
     {
         (void)commandBuffer;
         return;
@@ -10139,7 +10781,7 @@ static void endPerfL10RayStats(
     VkCommandBuffer commandBuffer
 )
 {
-    if constexpr(!PERF_L10_ENABLE_RAY_STATS)
+    if(!perfL10RayStatsEnabled())
     {
         (void)commandBuffer;
         return;
@@ -10945,6 +11587,99 @@ static std::atomic<int>   g_tlasCullDistance{0};
 // ⚠ 次级射线（太阳阴影/GI/反射/水面）需要屏幕外遮挡体：边距太小的实机表现是
 //   屏幕边缘缺树影/山影、镜面反射缺角 —— A/B 由你。
 static std::atomic<int>   g_tlasFrustumCullMargin{0};
+
+// =====================================================
+// 2026-10-23 TLAS 实例剔除**档位**（移植 Iris 26.1 的"投射者视锥"）。
+//
+// 改动前：两个滑条 lane 各自兼任开关 —— 距离 > 0 才剔距离、边距 > 0 才剔视锥，
+// 而视锥那一档用的是**相机视锥**：它会把"相机身后、但能挡住太阳的地形"一起从
+// TLAS 里拿掉 ⇒ 太阳阴影图查不到遮挡 ⇒ 光柱穿墙（2026-10-11 用光空间保留盒
+// 兜了一手，只兜 ±160 格，见 67309 起的长注释）。
+//
+// 现在把"跑哪些测试"和"参数取值"分开：
+//   -1 = 旧行为（默认，未设 ORION_TLAS_CULL 时逐位不变）
+//    0 = 全关
+//    1 = 只做距离
+//    2 = 只做相机视锥（5 面，旧语义，对次级射线不安全）
+//    3 = 距离 + 相机视锥
+//    4 = 距离 + **投射者视锥**（13 面，ADSC）
+//    5 = **只对主射线做掩码剔除**（实例保留，清 mask 0x01）—— 光追里唯一
+//        不会漏光的那一档：阴影/GI/反射/太阳阴影图仍然能命中被掩码的实例。
+//        mode 4 仍会"删实例"，那对次级射线是**删遮挡体**，转头时因结果冻结
+//        会漏光；要跑剔除又怕漏光就用 5。
+//
+// 4 的保证与边界（别写过头）：ADSC 保留的是"影子能落进画面"的**投射者**，
+// 这一条对太阳阴影图（rt_sun_shadow.comp）是充分的 —— 实测 5 个太阳方位、
+// 1200 个随机点，凡影子进视锥的点 0 漏剔（.tmp/check_caster_frustum.py）。
+// 但镜面反射/GI 的次级射线方向不受光方向约束，可能打到相机身后、影子投不进
+// 画面的几何 ⇒ 那一类要靠边距 lane[7] 外扩兜住（默认 0 = 不外扩）。
+// A/B：ORION_TLAS_CULL=0..4 覆盖；距离仍由 lane[6] 给半径（0 = 不跑距离档）。
+// =====================================================
+static int tlasCullMode()
+{
+    static const int s_mode = []() -> int
+    {
+        const char* raw = std::getenv("ORION_TLAS_CULL");
+
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return -1;
+        }
+
+        return std::min(std::max(std::atoi(raw), 0), 5);
+    }();
+
+    return s_mode;
+}
+
+// 2026-10-23 ±160 光空间保留盒的开关（A/B 用，默认开 = 现状）。
+//
+// 盒子当初（2026-10-11）是为了修"体积光穿墙"：相机视锥剔除会把"相机身后、
+// 但能挡住太阳的地形"一起剔掉。ADSC 投射者视锥（:67519 起）用构造保证了
+// 同一件事，所以对**近场太阳阴影**盒子是冗余的。
+//
+// 不能直接删，因为还有全向消费者吃相机背后的几何（见 patch_keepbox_switch.py
+// 的注释）：高度场 ±256（云/体积光读）、水面模拟 48 格、焦散/GI/镜面反射。
+// 所以关盒子的同时必须给一个近场保底球，两者一起用：
+//     ORION_TLAS_CULL=4 ORION_TLAS_KEEPBOX=0 [ORION_TLAS_NEAR_GUARD=24]
+static bool tlasKeepBoxEnabled()
+{
+    static const bool s_enabled = []() -> bool
+    {
+        const char* raw = std::getenv("ORION_TLAS_KEEPBOX");
+
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return true;
+        }
+
+        return raw[0] != '0';
+    }();
+
+    return s_enabled;
+}
+
+// 近场保底半径（格）：半径内的 Section 永不剔除。
+// 默认 24 —— 覆盖水面模拟的 ±24（48 格见方）与焦散/近场 GI 的最小需求；
+// 反射要更远的话把它调大，或者用 ORION_TLAS_CULL 的边距 lane 外扩视锥。
+static float tlasNearGuardBlocks()
+{
+    static const float s_blocks = []() -> float
+    {
+        const char* raw = std::getenv("ORION_TLAS_NEAR_GUARD");
+
+        if(raw == nullptr)
+        {
+            return 24.0f;
+        }
+
+        const float parsed = static_cast<float>(std::atof(raw));
+
+        return parsed >= 0.0f ? parsed : 24.0f;
+    }();
+
+    return s_blocks;
+}
 
 // ---------------------------------------------------------------------------
 // 2026-10-04 TLAS 视锥剔除的数学件。viewInverse / projInverse 是 JOML 列主序
@@ -14295,6 +15030,92 @@ static void chunkLockNoteMax(
 
 // RAII：构造=开始等锁，构造完成=开始持锁，析构=结束持锁。
 // 分别记最大等待与最大持有（多 worker 并发下用 CAS-max，不加新锁）。
+// =====================================================
+// 2026-10-24：uploadChunk 锁内三次 O(payload) 比较的分项计时（A′ 实施依据）。
+// 只统计最大值，每 256 次上传打一行；不改变任何比较语义。
+// =====================================================
+static std::atomic<uint64_t> g_chunkCmpRaw1MaxNanos{0};
+static std::atomic<uint64_t> g_chunkCmpRaw2MaxNanos{0};
+static std::atomic<uint64_t> g_chunkCmpMeshMaxNanos{0};
+static std::atomic<uint32_t> g_chunkCmpCount{0};
+
+// 2026-10-24：uploadChunk 总调用 / 被 native 判为"内容相同"的次数。
+static std::atomic<uint64_t> g_chunkUploadCalls{0};
+static std::atomic<uint64_t> g_chunkUploadDedup{0};
+static std::atomic<uint64_t> g_chunkCmpLastBytes{0};
+static std::atomic<uint64_t> g_chunkCmpLastVerts{0};
+
+static inline void chunkCmpNoteMax(
+    std::atomic<uint64_t>& slot,
+    uint64_t nanos)
+{
+    uint64_t prev = slot.load(std::memory_order_relaxed);
+
+    while(nanos > prev &&
+          !slot.compare_exchange_weak(
+              prev,
+              nanos,
+              std::memory_order_relaxed))
+    {
+    }
+}
+
+static inline double chunkCmpMsSince(
+    const std::chrono::steady_clock::time_point& from)
+{
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - from
+    ).count();
+}
+
+static void chunkCmpReport()
+{
+    const uint32_t count = g_chunkCmpCount.fetch_add(1u);
+    if((count % 256u) != 255u)
+    {
+        return;
+    }
+
+    RTLog(
+        "[CHUNK CMP] n=256"
+        " maxRaw1=" + std::to_string(
+            g_chunkCmpRaw1MaxNanos.exchange(0u) / 1000000.0) +
+        " maxRaw2=" + std::to_string(
+            g_chunkCmpRaw2MaxNanos.exchange(0u) / 1000000.0) +
+        " maxMesh=" + std::to_string(
+            g_chunkCmpMeshMaxNanos.exchange(0u) / 1000000.0) +
+        " lastBytes=" + std::to_string(
+            g_chunkCmpLastBytes.load()) +
+        " lastVerts=" + std::to_string(
+            g_chunkCmpLastVerts.load()) +
+        " calls=" + std::to_string(g_chunkUploadCalls.load()) +
+        " dedup=" + std::to_string(g_chunkUploadDedup.load())
+    );
+}
+
+static bool chunkMemcmpTimed(
+    const void* lhs,
+    const void* rhs,
+    size_t bytes,
+    std::atomic<uint64_t>& slot)
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool equal = std::memcmp(lhs, rhs, bytes) == 0;
+
+    chunkCmpNoteMax(
+        slot,
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0
+            ).count()
+        )
+    );
+    g_chunkCmpLastBytes.store(static_cast<uint64_t>(bytes));
+    chunkCmpReport();
+
+    return equal;
+}
+
 class ChunkLockTimingGuard
 {
 public:
@@ -14559,7 +15380,7 @@ static bool g_localPlayerASUpdatePending = false;
 // 扩容后 22 种文字贴图 + 实体贴图可同时驻留 ⇒ slotFor 走**命中**路径（只做
 // 一次线性扫描），既不再改槽（修 ①）也不再重推（修 ②）。这是本文件注释里
 // 早就写明的"数组变大后三处必须同步"的那一步，不是新机制。
-static constexpr uint32_t ENTITY_RT_TEXTURE_SLOT_COUNT = 64u;
+static constexpr uint32_t ENTITY_RT_TEXTURE_SLOT_COUNT = 128u;
 static VkImageView g_entityTextureViews[ENTITY_RT_TEXTURE_SLOT_COUNT]{};
 static VkSampler g_entityTextureSamplers[ENTITY_RT_TEXTURE_SLOT_COUNT]{};
 static bool g_entityTexturesDirty = false;
@@ -14886,12 +15707,50 @@ static std::atomic<bool> g_forceSectionASReset{false};
 static std::atomic<bool> g_worldGeometryDirty{false};
 static std::atomic<uint64_t> g_worldGeometryRevision{0u};
 
+// =====================================================
+// 2026-10-24 地形专用修订号（修"按需重建被实体层击穿"）
+//
+// g_worldGeometryRevision 对**所有** Section 上传都 +1，而实体/本地玩家/粒子
+// 聚合逐帧上传（见 markWorldGeometryDirty(false) 的两个调用点）。
+// 于是"修订号没变就不重建"对两张静态探针完全失效 —— 实测每帧白烧
+// snear 1.52ms + height 0.66ms（整帧 12%，见 .tmp/patch_terrain_rev.py）。
+//
+// 这个计数器只被地形类上传递增，供：
+//   · 近场太阳阴影图（sunShadowSignatureChanged，体积光/雾采样）
+//   · 地形高度场（recordTerrainHeightMap，静态实心地面）
+// 使用。A/B：ORION_PROBES_TERRAIN_REV=0 退回旧口径。
+// =====================================================
+static std::atomic<uint64_t> g_terrainGeometryRevision{0u};
+
+static uint64_t probeGeometryRevision()
+{
+    static const bool s_terrainOnly = []() -> bool
+    {
+        const char* raw = std::getenv("ORION_PROBES_TERRAIN_REV");
+
+        // 未设 / 非 "0" ⇒ 用地形口径（新默认）；"0" ⇒ 旧口径（每帧重建）。
+        return !(raw != nullptr && raw[0] == '0');
+    }();
+
+    return s_terrainOnly
+        ? g_terrainGeometryRevision.load(std::memory_order_acquire)
+        : g_worldGeometryRevision.load(std::memory_order_acquire);
+}
+
 // Every producer updates the revision after it has published a new Section
 // payload under g_chunkMutex. The render thread uses this to coalesce the
 // streaming burst without reading container state outside the mutex.
-static void markWorldGeometryDirty()
+// terrainChanged = false：这次上传只动了动态层（实体/本地玩家/粒子），
+// 静态探针（高度场 / 近场太阳阴影）的内容不会变，不应把它们标脏。
+static void markWorldGeometryDirty(bool terrainChanged = true)
 {
     g_worldGeometryRevision.fetch_add(1u, std::memory_order_release);
+
+    if(terrainChanged)
+    {
+        g_terrainGeometryRevision.fetch_add(1u, std::memory_order_release);
+    }
+
     g_worldGeometryDirty.store(true, std::memory_order_release);
 }
 
@@ -16513,7 +17372,134 @@ static VkDeviceSize vliPoolBytesForCapacity(uint32_t capacity)
 }
 
 static std::mutex g_vliMutex;
+
+// =====================================================
+// 2026-10-24：g_vliMutex 的**持锁时长**探针（每个加锁点一份）
+//
+// 动机（实测，不是推测）：
+//   渲染线程 [RT VLI SLOW]  vli=16.30  wait=15.21  gather=0.63 upload=0.23
+//   工作线程 [VLI WORKER]   hold=13.43 lockWait=11.98 cmp=0.11 apply=0.43
+// 两边各等 12~15ms，而锁内实际工作只有 ~1ms ⇒ 存在一段长持锁，但既有探针只量了
+// "等锁"，没量"持锁"。
+//
+// 用法：必须在 lock_guard **之前**声明 —— 析构顺序相反（先解锁再打日志），
+// 否则 RTLog 落在临界区里，等于自己把持锁时间又拉长（同 VliWorkerHoldProbe）。
+// 只在持锁 >= ORION_VLI_LOCK_LOG_MS（默认 2ms）时落盘。
+// =====================================================
+static double vliLockHoldLogThresholdMs()
+{
+    static const double cached = []()
+    {
+        const char* raw = std::getenv("ORION_VLI_LOCK_LOG_MS");
+
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return 2.0;
+        }
+
+        const double parsed = std::atof(raw);
+
+        return parsed <= 0.0 ? 2.0 : parsed;
+    }();
+
+    return cached;
+}
+
+struct VliLockHoldProbe
+{
+    const char* site;
+    std::chrono::steady_clock::time_point begin;
+    bool marked = false;
+
+    explicit VliLockHoldProbe(const char* name)
+        : site(name)
+    {
+    }
+
+    // 取到锁之后调用：只有从这一刻起才算"持锁时长"。
+    // （第一版在 ctor 就记时，测出来的是"等锁 + 持有"，会把别的线程堵住的时间
+    //   算到本站点头上 —— 2026-10-24 实测被这一点误导过一次。）
+    void mark()
+    {
+        begin = std::chrono::steady_clock::now();
+        marked = true;
+    }
+
+    ~VliLockHoldProbe()
+    {
+        if(!marked)
+        {
+            return;
+        }
+
+        const double heldMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - begin
+            ).count();
+
+        if(heldMs < vliLockHoldLogThresholdMs())
+        {
+            return;
+        }
+
+        RTLog(
+            std::string("[VLI LOCK] site=") + site +
+            " held=" + std::to_string(heldMs)
+        );
+    }
+};
 static std::unordered_map<uint64_t, VLISectionCpuPage> g_vliSections;
+
+// =====================================================
+// 2026-10-24（①）：列索引 (chunkX, chunkZ) → 该列的 sectionKey 列表。
+//
+// 病灶：[VLI LOCK] site=chunkUnloadScan 115 次 × 中位 2.99ms（最坏 36.40ms）——
+// 它是持锁次数最多的一项，而要做的只是"找出属于这一列的所有段"。原来靠
+// 遍历整张 g_vliSections（最多 1500 页）线性扫描，现在 O(本列段数)。
+//
+// 维护点三个：插入（emplace）、LRU 淘汰（victim erase）、全清（clearVLISections）。
+// 任何新增的 g_vliSections.erase 都必须同步维护本索引。
+// =====================================================
+static std::unordered_map<uint64_t, std::vector<uint64_t>> g_vliChunkSectionIndex;
+
+static uint64_t vliChunkColumnKey(int32_t chunkX, int32_t chunkZ)
+{
+    return (static_cast<uint64_t>(static_cast<uint32_t>(chunkX)) << 32) |
+        static_cast<uint64_t>(static_cast<uint32_t>(chunkZ));
+}
+
+static void vliChunkIndexAdd(int32_t sectionX, int32_t sectionZ, uint64_t sectionKey)
+{
+    std::vector<uint64_t>& column =
+        g_vliChunkSectionIndex[vliChunkColumnKey(sectionX, sectionZ)];
+
+    if(std::find(column.begin(), column.end(), sectionKey) == column.end())
+    {
+        column.push_back(sectionKey);
+    }
+}
+
+static void vliChunkIndexRemove(int32_t sectionX, int32_t sectionZ, uint64_t sectionKey)
+{
+    const auto it =
+        g_vliChunkSectionIndex.find(vliChunkColumnKey(sectionX, sectionZ));
+
+    if(it == g_vliChunkSectionIndex.end())
+    {
+        return;
+    }
+
+    std::vector<uint64_t>& column = it->second;
+    column.erase(
+        std::remove(column.begin(), column.end(), sectionKey),
+        column.end()
+    );
+
+    if(column.empty())
+    {
+        g_vliChunkSectionIndex.erase(it);
+    }
+}
 static std::vector<VLITableSlot> g_vliTableCpu(VLI_PAGE_TABLE_CAPACITY);
 static std::vector<uint32_t> g_vliFreePages;
 static uint32_t g_vliNextPage = 0u;
@@ -16543,6 +17529,126 @@ struct VLIPendingSection
 };
 
 static std::vector<VLIPendingSection> g_vliPendingSections;
+
+// =====================================================
+// 2026-10-24 架构级第一步：VLI 上传的**内容哈希门**
+//
+// 每次 Section 重建都会走 JNI uploadVoxelLightSection，原实现一律抢 g_vliMutex、
+// 锁内 memcmp 16KB 才发现没变。渲染线程的 gather/scan 抢同一把锁 ⇒ 双方互等
+// （实测 worker lockWait 中位 10.94ms、渲染 wait 6.63ms）。
+//
+// 现在 worker 在锁外算 64 位哈希并与缓存比对：相同直接返回（不碰锁）；不同才进
+// 原路径。淘汰/卸载/全清时必须失效对应缓存项，否则同内容重传会被误判为未变。
+//
+// 锁序：本缓存的锁永不与 g_vliMutex 嵌套（取→放→再取）。
+// =====================================================
+static std::mutex g_vliUploadHashMutex;
+
+// 2026-10-24：哈希门命中计数（每 500 次上传打一行）。
+static std::atomic<uint64_t> g_vliUploadTotal{0};
+
+// 2026-10-24：VLI 上传热区直方图（每 500 次上传一个区间，区间结束打印 top5 并清空）。
+static std::mutex g_vliHotMutex;
+static std::unordered_map<uint64_t, uint32_t> g_vliHotCounts;
+
+static void vliHotRecordAndReport(uint64_t sectionKey, uint64_t ordinal)
+{
+    std::lock_guard<std::mutex> lock(g_vliHotMutex);
+
+    ++g_vliHotCounts[sectionKey];
+
+    if((ordinal % 500u) != 0u || g_vliHotCounts.empty())
+    {
+        return;
+    }
+
+    // 取 top5（区间内条目数通常几百到几千，选择排序足够）。
+    std::string report = "[VLI HOT] n=500 distinct=" +
+        std::to_string(g_vliHotCounts.size());
+
+    for(int rank = 0; rank < 5; ++rank)
+    {
+        uint64_t bestKey = 0u;
+        uint32_t bestCount = 0u;
+
+        for(const auto& entry : g_vliHotCounts)
+        {
+            if(entry.second > bestCount)
+            {
+                bestCount = entry.second;
+                bestKey = entry.first;
+            }
+        }
+
+        if(bestCount == 0u)
+        {
+            break;
+        }
+
+        const int32_t hotX = static_cast<int32_t>(bestKey & 0x3FFFFFull);
+        const int32_t hotZ = static_cast<int32_t>((bestKey >> 22) & 0x3FFFFFull);
+        const int32_t hotY = static_cast<int32_t>((bestKey >> 44) & 0xFFFFull);
+
+        report += " t" + std::to_string(rank + 1) +
+            "=(" + std::to_string(hotX) + "," + std::to_string(hotY) + "," +
+            std::to_string(hotZ) + "):" + std::to_string(bestCount);
+
+        g_vliHotCounts[bestKey] = 0u;
+    }
+
+    RTLog(report);
+    g_vliHotCounts.clear();
+}
+static std::atomic<uint64_t> g_vliUploadGated{0};
+static std::atomic<uint64_t> g_vliUploadApplied{0};
+static std::unordered_map<uint64_t, uint64_t> g_vliUploadHashByKey;
+
+static bool vliHashGateEnabled()
+{
+    static const bool enabled = []()
+    {
+        const char* raw = std::getenv("ORION_VLI_HASH_GATE");
+
+        return !(raw != nullptr && raw[0] == '0');
+    }();
+
+    return enabled;
+}
+
+static uint64_t vliHashWords(const uint32_t* words, size_t count)
+{
+    // FNV-1a 64：足够分散、每次 4096 字约十几微秒。
+    uint64_t hash = 1469598103934665603ull;
+
+    for(size_t i = 0u; i < count; ++i)
+    {
+        hash ^= static_cast<uint64_t>(words[i]);
+        hash *= 1099511628211ull;
+    }
+
+    return hash;
+}
+
+static bool vliUploadHashUnchanged(uint64_t sectionKey, uint64_t hash)
+{
+    std::lock_guard<std::mutex> lock(g_vliUploadHashMutex);
+
+    const auto it = g_vliUploadHashByKey.find(sectionKey);
+
+    return it != g_vliUploadHashByKey.end() && it->second == hash;
+}
+
+static void vliUploadHashStore(uint64_t sectionKey, uint64_t hash)
+{
+    std::lock_guard<std::mutex> lock(g_vliUploadHashMutex);
+    g_vliUploadHashByKey[sectionKey] = hash;
+}
+
+static void vliUploadHashForget(uint64_t sectionKey)
+{
+    std::lock_guard<std::mutex> lock(g_vliUploadHashMutex);
+    g_vliUploadHashByKey.erase(sectionKey);
+}
 
 // VPT-3.3B.2: pageIndex -> Section key.  recordVLIUpdates resolves the Section
 // page behind each dirty page index, and it used to rescan every loaded
@@ -17039,6 +18145,14 @@ static void createCameraUBO() {
     ubo->sssParams[1] = 0.0f;
     ubo->sssParams[2] = 0.0f;
     ubo->sssParams[3] = 0.0f;
+
+    // 2026-10-24 半分辨率 GI（CameraUBO.giHalfParams.x）。**初值必须是 0**：
+    // 第一帧的 giHalfImage 还不存在（由 createGiHalfImage 在帧录制路径里建），
+    // 写 1 会让主 raygen 去读一个没写过的描述符。
+    ubo->giHalfParams[0] = 0.0f;
+    ubo->giHalfParams[1] = 0.0f;
+    ubo->giHalfParams[2] = 0.0f;
+    ubo->giHalfParams[3] = 0.0f;
 
     ubo->playerX = 0.0f;
     ubo->playerY = 0.0f;
@@ -19651,6 +20765,14 @@ static VkDeviceSize createSectionBLAS(
     //   · 回退（6/quad）  ⇒ 只有 quads > 16384 才会发生 ⇒ size > 98304
     // 2026-10-22：判据收进 sectionUsesIndexedGeometry()（与 uploadChunk 的存储布局、
     // 捕获线程的 32B 预打包共用同一份实现），不再在这里手写一遍。
+    RTXMarkPhase("geometry:blas");
+
+    g_rtxDetailSectionKey.store(sectionKey, std::memory_order_relaxed);
+    g_rtxDetailSectionVerts.store(
+        static_cast<uint64_t>(vertices.size()),
+        std::memory_order_relaxed
+    );
+
     const bool indexedGeometry =
         opaqueGeometry &&
         sectionUsesIndexedGeometry(sectionKey, vertices.size());
@@ -21050,7 +22172,7 @@ static VkDescriptorSetLayout createRTDescriptorSetLayout(){
     // 2026-10-09 运动矢量：63 项（binding 0..62）。
     // 2026-10-09 实体 LabPBR：65 项（binding 0..64，新增 63 法线 / 64 高光）。
     // ⚠ 数组长度与 static_assert 必须同步改，见下面 2026-09-28「进世界就崩」的复盘。
-    VkDescriptorSetLayoutBinding b[71]{}; // 71 entries, binding numbers 0..70
+    VkDescriptorSetLayoutBinding b[73]{}; // 73 entries, binding numbers 0..72
     // (50-53 are NRD-1, 54 RR stable radiance, 55 NRD-1 IN_MV,
     //  56 NRD-1 OUT_VALIDATION, 57 MV read-back probe, 58 远场太阳阴影图)
 
@@ -21722,6 +22844,39 @@ static VkDescriptorSetLayout createRTDescriptorSetLayout(){
     b[70].descriptorCount = 1;
     b[70].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
 
+    // =====================================================
+    // 2026-10-23：binding 71 —— DLSS RR 的 TransparencyHint（R8_UNORM）
+    //
+    // rgen 在写四张 RR guide 的同一处写值（1 = 该像素内容来自穿过玻璃/透明接收面
+    // 的路径）。宿主侧只在 ORION_RR_TRANSPARENCY_HINT=1 时把这个 tag 交给 RR；
+    // 但**描述符始终绑定** —— rgen 没有开关，每个像素都会写这个 binding，
+    // 不绑定就是"访问未写描述符"，属未定义行为。
+    //
+    // 数组从 71 扩到 72：bindingCount 由 sizeof(b)/sizeof(b[0]) 推导，不需要另改
+    // 计数（2026-09-28 那次"按手写常数读数组外数据"的教训）。
+    // =====================================================
+    b[71].binding = 71;
+    b[71].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[71].descriptorCount = 1;
+    b[71].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
+    // =====================================================
+    // 2026-10-24：binding 72 —— 半分辨率 GI 的辐照度图（RGBA16F storage image）
+    //
+    // 一个 binding 两用：GI 变体（-DGI_HALFRES=1 的独立 rgen SPV）写它，主变体
+    // 手写 3×3 imageLoad 读它。之所以不拆成 storage + sampler 两个 binding：
+    // 半分辨率的图交给硬件双线性会跨物体边缘糊出去，权重必须自己按深度算 ——
+    // 既然一定要手写取点，sampler 就是纯多余（HANDOFF §5.2）。
+    //
+    // ⚠ 只给 RAYGEN：两个变体的读写都发生在 rgen 里，没有任何 compute 消费它。
+    // ⚠ ORION_GI_HALF=0 时这里**仍然绑定**（资源没建则跳过写，主变体的
+    //   cam.giHalfParams.x 恒 0 ⇒ 分支不执行，不会访问未写描述符）。
+    // =====================================================
+    b[72].binding = 72;
+    b[72].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[72].descriptorCount = 1;
+    b[72].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
     // 2026-09-28 崩溃复盘（我引入又撤回的一处）：
     // 这里一度加过 binding 57/58，但数组是 `b[57]`（下标 0..56），于是既越界写栈、
     // 又让 vkCreateDescriptorSetLayout 按 bindingCount=59 读数组外的数据 —— 表现为
@@ -21741,8 +22896,9 @@ static VkDescriptorSetLayout createRTDescriptorSetLayout(){
     // 2026-10-11：65 → 69（新增 SHaRC 的 bindings 65..68）。数组长度与断言必须
     // 一起改，否则就是 2026-09-28 那次"进世界就崩"（越界写栈 + 布局按错长度读数组）。
     // 2026-10-19：69 → 70（新增折射焦散图 binding 69）；70 → 71（反射层 binding 70）。
+    // 2026-10-23：71 → 72（新增 DLSS RR 的 TransparencyHint binding 71）。
     static_assert(
-        sizeof(b) / sizeof(b[0]) == 71u,
+        sizeof(b) / sizeof(b[0]) == 73u,
         "RT descriptor set layout: update this assert together with b[]"
     );
     ci.bindingCount = static_cast<uint32_t>(sizeof(b) / sizeof(b[0]));
@@ -21807,6 +22963,35 @@ static void destroyHistoryImage(
 // =====================================================
 // DLSS Ray Reconstruction GBuffer image creation
 // =====================================================
+
+// =====================================================
+// 2026-10-23：TransparencyHint 的描述符（binding 71）
+//
+// 用 handle 缓存：图在分辨率变化时销毁重建，句柄一变就重写；稳态每帧零成本。
+// 放在 createRRGuideImage 之前，是因为 createRRGBufferImages 与本函数同属
+// "建 RR 资源"这一层，就近更容易看出两者的生命周期是一致的。
+// =====================================================
+static void updateRRTransparencyHintRayDescriptor()
+{
+    if(g_rayTracingDescriptorSet == VK_NULL_HANDLE ||
+       g_rrTransparencyHintView == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkDescriptorImageInfo info{};
+    info.imageView = g_rrTransparencyHintView;
+    info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = g_rayTracingDescriptorSet;
+    write.dstBinding = 71;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    write.pImageInfo = &info;
+
+    vkUpdateDescriptorSets(g_device, 1, &write, 0, nullptr);
+}
 
 static void createRRGuideImage(
     uint32_t width,
@@ -22135,6 +23320,9 @@ static void createRRGBufferImages(
         g_rrStableRadianceImage !=
             VK_NULL_HANDLE &&
 
+        g_rrTransparencyHintImage !=
+            VK_NULL_HANDLE &&
+
         g_rrGBufferWidth ==
             width &&
 
@@ -22162,6 +23350,9 @@ static void createRRGBufferImages(
             VK_NULL_HANDLE ||
 
         g_rrStableRadianceImage !=
+            VK_NULL_HANDLE ||
+
+        g_rrTransparencyHintImage !=
             VK_NULL_HANDLE;
 
 
@@ -22213,6 +23404,14 @@ static void createRRGBufferImages(
         g_rrStableRadianceMemory,
         g_rrStableRadianceView,
         g_rrStableRadianceLayout
+    );
+
+
+    destroyHistoryImage(
+        g_rrTransparencyHintImage,
+        g_rrTransparencyHintMemory,
+        g_rrTransparencyHintView,
+        g_rrTransparencyHintLayout
     );
 
 
@@ -22275,6 +23474,19 @@ static void createRRGBufferImages(
         g_rrStableRadianceMemory,
         g_rrStableRadianceView,
         g_rrStableRadianceLayout
+    );
+
+
+    // TransparencyHint：R8_UNORM 足够（只有 0/1）。createRRGuideImage 已经给了
+    // STORAGE|SAMPLED|TRANSFER_*，两张用途（rgen 写、SL 读）都覆盖。
+    createRRGuideImage(
+        width,
+        height,
+        VK_FORMAT_R8_UNORM,
+        g_rrTransparencyHintImage,
+        g_rrTransparencyHintMemory,
+        g_rrTransparencyHintView,
+        g_rrTransparencyHintLayout
     );
 
 
@@ -22350,6 +23562,166 @@ static void createRRGBufferImages(
     // specularHitDistance）刚被重建 —— 让 RR guide relax 的描述符缓存失效。
     // 见 g_rrGuideViewGeneration 的说明。
     ++g_rrGuideViewGeneration;
+}
+
+
+// =====================================================
+// 2026-10-24 半分辨率 GI（HANDOFF-2026-10-24-GI-HALFRES.md）
+//
+// 图的内容与口径（两处必须逐字一致）：
+//   rt_test.rgen 的 GI 变体写  vec4(indirectLight / max(brdfWeight,1e-3),
+//                                   主命中视深度/米)
+//   rt_test.rgen 的主变体读  3×3、w = 1/(1e-3 + |z0 - z1|)、再乘回 brdfWeight
+//
+// 生命周期照 createRRGuideImage：分辨率变化（DLSS 动态分辨率 / 窗口缩放）时整张
+// 重建；重建后 g_giHalfNeedsClear 置位，由 recordGiHalfPass 在本帧命令里清一次。
+// 图很小（707×400 内部渲染 ⇒ 354×200 RGBA16F ≈ 0.57MB），重建代价可忽略。
+// =====================================================
+static void updateGiHalfRayDescriptor()
+{
+    if(g_rayTracingDescriptorSet == VK_NULL_HANDLE ||
+       g_giHalfView == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkDescriptorImageInfo info{};
+    info.imageView = g_giHalfView;
+    info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = g_rayTracingDescriptorSet;
+    write.dstBinding = 72;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    write.pImageInfo = &info;
+
+    vkUpdateDescriptorSets(g_device, 1, &write, 0, nullptr);
+}
+
+
+static void createGiHalfImage(uint32_t width, uint32_t height)
+{
+    // ORION_GI_HALF=0：连图都不建（旧路径一行都不碰这张图）。
+    if(!giHalfEnabled())
+    {
+        return;
+    }
+
+    const uint32_t halfWidth = std::max(1u, (width + 1u) / 2u);
+    const uint32_t halfHeight = std::max(1u, (height + 1u) / 2u);
+
+    if(g_giHalfImage != VK_NULL_HANDLE &&
+       g_giHalfWidth == halfWidth &&
+       g_giHalfHeight == halfHeight)
+    {
+        return;
+    }
+
+    if(g_giHalfImage != VK_NULL_HANDLE)
+    {
+        // 照 createRRGBufferImages 的做法：重建前等设备空转。
+        check(FGDeviceWaitIdle(g_device),
+              "wait device before GI half image recreate failed");
+        destroyHistoryImage(
+            g_giHalfImage,
+            g_giHalfMemory,
+            g_giHalfView,
+            g_giHalfLayout);
+        g_giHalfBoundView = VK_NULL_HANDLE;
+    }
+
+    createRRGuideImage(
+        halfWidth,
+        halfHeight,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        g_giHalfImage,
+        g_giHalfMemory,
+        g_giHalfView,
+        g_giHalfLayout);
+
+    g_giHalfWidth = halfWidth;
+    g_giHalfHeight = halfHeight;
+    g_giHalfNeedsClear = true;
+
+    updateGiHalfRayDescriptor();
+    g_giHalfBoundView = g_giHalfView;
+
+    std::cerr << "[GI HALF] giHalfImage created "
+              << halfWidth << "x" << halfHeight
+              << " (render " << width << "x" << height << ")" << std::endl;
+}
+
+
+// 首次使用前的清零。放在帧命令里而不是建图时（建图路径没有现成的 cmd）。
+// 三件事必须按顺序：UNDEFINED→TRANSFER_DST（丢内容）→ clear → TRANSFER_DST→GENERAL。
+static void clearGiHalfImageIfNeeded(VkCommandBuffer cmd)
+{
+    if(!g_giHalfNeedsClear || g_giHalfImage == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkImageSubresourceRange range{};
+    range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    range.baseMipLevel = 0u;
+    range.levelCount = 1u;
+    range.baseArrayLayer = 0u;
+    range.layerCount = 1u;
+
+    VkImageMemoryBarrier toTransfer{
+        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toTransfer.srcAccessMask = 0u;
+    toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toTransfer.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.image = g_giHalfImage;
+    toTransfer.subresourceRange = range;
+
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0u, 0u, nullptr, 0u, nullptr, 1u, &toTransfer);
+
+    // 清成"零辐照度 + 极远深度"，与 GI 变体对天空像素写的哨兵同一组值：
+    // 万一某个 texel 在相位轮转覆盖到它之前就被读到，上采样也只当它是天空。
+    VkClearColorValue clear{};
+    clear.float32[0] = 0.0f;
+    clear.float32[1] = 0.0f;
+    clear.float32[2] = 0.0f;
+    clear.float32[3] = 60000.0f;
+    vkCmdClearColorImage(
+        cmd,
+        g_giHalfImage,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        &clear,
+        1u,
+        &range);
+
+    VkImageMemoryBarrier toGeneral{
+        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toGeneral.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toGeneral.image = g_giHalfImage;
+    toGeneral.subresourceRange = range;
+
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        0u, 0u, nullptr, 0u, nullptr, 1u, &toGeneral);
+
+    g_giHalfLayout = VK_IMAGE_LAYOUT_GENERAL;
+    g_giHalfNeedsClear = false;
 }
 
 
@@ -25285,6 +26657,330 @@ static void recordSharcResolve(VkCommandBuffer cmd)
 
 
 // =====================================================
+// 2026-10-24 半分辨率 GI 的第二条 RT 管线（HANDOFF-2026-10-24-GI-HALFRES.md）
+//
+// 整段照 ensureSharcUpdatePipeline() 写：管线布局与描述符集**复用**主 RT 的
+// （同一个 set 0，只多一个 binding 72），SBT 的 group 排列也相同
+// （0 raygen / 1 opaque / 2 miss / 3 translucent / 4 water），但 handles 必须从
+// **这条管线**重新取（vkGetRayTracingShaderGroupHandlesKHR 按管线句柄查询）。
+//
+// 与 SHaRC update 的两处差别：
+//   · dispatch 是**真降分辨率**（(w+1)/2 × (h+1)/2），不是满屏选块。原因：本变体的
+//     rgen 里 pixelCoord = launchID*2 + phase（相位逐帧轮转），所以降 dispatch
+//     **就是**半分辨率执行，不需要像 SHaRC 那样在 shader 内选像素。
+//   · 失败处理同一套：latch 后不再重试，pass 缺席时 UBO 的 giHalfParams.x 会被
+//     宿主写成 0（见 updateCamera）⇒ 主 raygen 自然走旧路径。
+// =====================================================
+static VkPipeline g_giHalfPipeline = VK_NULL_HANDLE;
+static VkBuffer g_giHalfSbtBuffer = VK_NULL_HANDLE;
+static VkDeviceMemory g_giHalfSbtMemory = VK_NULL_HANDLE;
+static VkStridedDeviceAddressRegionKHR g_giHalfRaygenRegion{};
+static VkStridedDeviceAddressRegionKHR g_giHalfMissRegion{};
+static VkStridedDeviceAddressRegionKHR g_giHalfHitRegion{};
+static VkStridedDeviceAddressRegionKHR g_giHalfCallableRegion{};
+static bool g_giHalfPipelineFailed = false;
+
+static void destroyGiHalfPipeline()
+{
+    if(g_giHalfSbtBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(g_device, g_giHalfSbtBuffer, nullptr);
+        g_giHalfSbtBuffer = VK_NULL_HANDLE;
+    }
+    if(g_giHalfSbtMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(g_device, g_giHalfSbtMemory, nullptr);
+        g_giHalfSbtMemory = VK_NULL_HANDLE;
+    }
+    if(g_giHalfPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_giHalfPipeline, nullptr);
+        g_giHalfPipeline = VK_NULL_HANDLE;
+    }
+}
+
+static void ensureGiHalfPipeline()
+{
+    if(g_giHalfPipeline != VK_NULL_HANDLE || g_giHalfPipelineFailed)
+    {
+        return;
+    }
+
+    if(!giHalfEnabled())
+    {
+        return;
+    }
+
+    // 只依赖 layout 与 SBT 的 handle 尺寸（照 SHaRC update 的 2026-10-12 修复）：
+    // 不要求描述符集/图已就绪，否则创建会被推到首帧录制路径里。
+    if(g_rayTracingPipelineLayout == VK_NULL_HANDLE || g_handleSizeAligned == 0u)
+    {
+        return;
+    }
+
+    std::cerr << "[GI HALF] 开始创建半分辨率 GI 管线（驱动编译着色器，可能阻塞数秒）"
+              << std::endl;
+
+    try
+    {
+        auto giHalfRgen = loadSpv("shaders/rt_test_gi_half.rgen.spv");
+        auto chit = loadSpv("shaders/rt_test.rchit.spv");
+        auto miss = loadSpv("shaders/rt_test.rmiss.spv");
+        auto ahit = loadSpv("shaders/rt_test.rahit.spv");
+        auto translucentChit = loadSpv("shaders/rt_test_translucent.rchit.spv");
+        auto translucentAhit = loadSpv("shaders/rt_test_translucent.rahit.spv");
+
+        VkShaderModule mods[6]{};
+        const char* entry = "main";
+        VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        auto makeModule = [&](const std::vector<uint8_t>& code, VkShaderModule& out)
+        {
+            mci.codeSize = code.size();
+            mci.pCode = reinterpret_cast<const uint32_t*>(code.data());
+            check(vkCreateShaderModule(g_device, &mci, nullptr, &out),
+                  "Failed to create GI half shader module");
+        };
+        makeModule(giHalfRgen, mods[0]);
+        makeModule(chit, mods[1]);
+        makeModule(miss, mods[2]);
+        makeModule(ahit, mods[3]);
+        makeModule(translucentChit, mods[4]);
+        makeModule(translucentAhit, mods[5]);
+
+        VkPipelineShaderStageCreateInfo stages[6]{};
+        const VkShaderStageFlagBits stageKinds[6] = {
+            VK_SHADER_STAGE_RAYGEN_BIT_KHR, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR,
+            VK_SHADER_STAGE_MISS_BIT_KHR, VK_SHADER_STAGE_ANY_HIT_BIT_KHR,
+            VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, VK_SHADER_STAGE_ANY_HIT_BIT_KHR };
+        for(uint32_t i = 0u; i < 6u; ++i)
+        {
+            stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[i].stage = stageKinds[i];
+            stages[i].module = mods[i];
+            stages[i].pName = entry;
+        }
+
+        VkRayTracingShaderGroupCreateInfoKHR groups[5]{};
+        groups[0].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+        groups[0].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+        groups[0].generalShader = 0u;
+        groups[0].closestHitShader = VK_SHADER_UNUSED_KHR;
+        groups[0].anyHitShader = VK_SHADER_UNUSED_KHR;
+        groups[0].intersectionShader = VK_SHADER_UNUSED_KHR;
+        groups[1] = groups[0];
+        groups[1].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+        groups[1].generalShader = VK_SHADER_UNUSED_KHR;
+        groups[1].closestHitShader = 1u;
+        groups[1].anyHitShader = 3u;
+        groups[2] = groups[0];
+        groups[2].generalShader = 2u;
+        groups[3] = groups[1];
+        groups[3].closestHitShader = 4u;
+        groups[3].anyHitShader = 5u;
+        groups[4] = groups[1];
+
+        VkRayTracingPipelineCreateInfoKHR pci{
+            VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR};
+        pci.stageCount = 6u;
+        pci.pStages = stages;
+        pci.groupCount = 5u;
+        pci.pGroups = groups;
+        pci.maxPipelineRayRecursionDepth = 1u;
+        pci.layout = g_rayTracingPipelineLayout;
+        if(g_ommNativeEnabled)
+        {
+            pci.flags |= VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
+        }
+
+        auto createPipe =
+            reinterpret_cast<PFN_vkCreateRayTracingPipelinesKHR>(
+                vkGetDeviceProcAddr(g_device, "vkCreateRayTracingPipelinesKHR"));
+        if(!createPipe)
+        {
+            throw std::runtime_error("vkCreateRayTracingPipelinesKHR unavailable");
+        }
+        check(createPipe(g_device, VK_NULL_HANDLE, getSharedPipelineCache(), 1u,
+                         &pci, nullptr, &g_giHalfPipeline),
+              "Failed to create GI half RT pipeline");
+
+        for(uint32_t i = 0u; i < 6u; ++i)
+        {
+            vkDestroyShaderModule(g_device, mods[i], nullptr);
+        }
+
+        auto getHandles =
+            reinterpret_cast<PFN_vkGetRayTracingShaderGroupHandlesKHR>(
+                vkGetDeviceProcAddr(g_device,
+                                    "vkGetRayTracingShaderGroupHandlesKHR"));
+        if(!getHandles)
+        {
+            throw std::runtime_error(
+                "vkGetRayTracingShaderGroupHandlesKHR unavailable");
+        }
+
+        VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtProps{};
+        rtProps.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
+        VkPhysicalDeviceProperties2 props2{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        props2.pNext = &rtProps;
+        vkGetPhysicalDeviceProperties2(g_physicalDevice, &props2);
+
+        const uint32_t hs = rtProps.shaderGroupHandleSize;
+        const uint32_t ha = rtProps.shaderGroupHandleAlignment;
+        const uint32_t ba = rtProps.shaderGroupBaseAlignment;
+        const uint32_t handleAligned = ((hs + ha - 1u) / ha) * ha;
+        const uint32_t raygenOffset = 0u;
+        const uint32_t missOffset =
+            ((raygenOffset + handleAligned + ba - 1u) / ba) * ba;
+        const uint32_t hitOffset =
+            ((missOffset + handleAligned + ba - 1u) / ba) * ba;
+        const uint32_t sbtSize =
+            ((hitOffset + SBT_HIT_RECORD_COUNT * handleAligned + ba - 1u) / ba) *
+            ba;
+
+        // group 下标与 createRayTracingSBT() 的局部常量一致（RAYGEN=0 / OPAQUE=1 /
+        // MISS=2 / ALPHA=3 / WATER=4），与 SHaRC update 那份也一致。
+        const uint32_t giRaygenGroup = 0u;
+        const uint32_t giMissGroup = 2u;
+        const uint32_t giOpaqueGroup = 1u;
+        const uint32_t giAlphaGroup = 3u;
+        const uint32_t giWaterGroup = 4u;
+        const uint32_t giGroupCount = 5u;
+
+        std::vector<uint8_t> handles((size_t)giGroupCount * hs, 0);
+        check(getHandles(g_device, g_giHalfPipeline, 0u,
+                         giGroupCount, handles.size(), handles.data()),
+              "Failed to get GI half RT shader handles");
+
+        std::vector<uint8_t> data((size_t)sbtSize, 0);
+        std::memcpy(data.data() + raygenOffset,
+                    handles.data() + giRaygenGroup * hs, hs);
+        std::memcpy(data.data() + missOffset,
+                    handles.data() + giMissGroup * hs, hs);
+        const uint32_t recordGroups[SBT_HIT_RECORD_COUNT] = {
+            giOpaqueGroup, giOpaqueGroup, giAlphaGroup,
+            giWaterGroup, giOpaqueGroup };
+        for(uint32_t record = 0u; record < SBT_HIT_RECORD_COUNT; ++record)
+        {
+            std::memcpy(data.data() + hitOffset + record * handleAligned,
+                        handles.data() + recordGroups[record] * hs, hs);
+        }
+
+        createBuffer(g_device, g_physicalDevice, sbtSize,
+                     VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR |
+                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     g_giHalfSbtBuffer, g_giHalfSbtMemory, true);
+
+        void* sbtMapped = nullptr;
+        check(vkMapMemory(g_device, g_giHalfSbtMemory, 0u, sbtSize, 0u,
+                          &sbtMapped),
+              "map GI half SBT failed");
+        std::memcpy(sbtMapped, data.data(), sbtSize);
+        vkUnmapMemory(g_device, g_giHalfSbtMemory);
+
+        const uint64_t sbtAddress =
+            getBufferDeviceAddress(g_device, g_giHalfSbtBuffer);
+        g_giHalfRaygenRegion.deviceAddress = sbtAddress + raygenOffset;
+        g_giHalfRaygenRegion.stride = handleAligned;
+        g_giHalfRaygenRegion.size = handleAligned;
+        g_giHalfMissRegion.deviceAddress = sbtAddress + missOffset;
+        g_giHalfMissRegion.stride = handleAligned;
+        g_giHalfMissRegion.size = handleAligned;
+        g_giHalfHitRegion.deviceAddress = sbtAddress + hitOffset;
+        g_giHalfHitRegion.stride = handleAligned;
+        g_giHalfHitRegion.size = SBT_HIT_RECORD_COUNT * handleAligned;
+        g_giHalfCallableRegion.deviceAddress = 0u;
+        g_giHalfCallableRegion.stride = 0u;
+        g_giHalfCallableRegion.size = 0u;
+
+        std::cerr << "[GI HALF] 管线已创建（rt_test_gi_half.rgen.spv，"
+                     "半分辨率 dispatch = (w+1)/2 × (h+1)/2）" << std::endl;
+    }
+    catch(const std::exception& error)
+    {
+        std::cerr << "[GI HALF] 管线创建失败（本会话不再重试，GI 回到全分辨率）："
+                  << error.what() << std::endl;
+        destroyGiHalfPipeline();
+        g_giHalfPipelineFailed = true;
+        g_giHalfPipeline = VK_NULL_HANDLE;
+    }
+}
+
+static void recordGiHalfPass(VkCommandBuffer cmd, uint32_t width, uint32_t height)
+{
+    if(!giHalfEnabled())
+    {
+        return;
+    }
+    if(g_giHalfImage == VK_NULL_HANDLE ||
+       g_rayTracingPipelineLayout == VK_NULL_HANDLE ||
+       g_rayTracingDescriptorSet == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    ensureGiHalfPipeline();
+    if(g_giHalfPipeline == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    // 句柄缓存（照 binding 71 的 rrHintBoundView）：图重建后重写一次描述符。
+    if(g_giHalfBoundView != g_giHalfView)
+    {
+        updateGiHalfRayDescriptor();
+        g_giHalfBoundView = g_giHalfView;
+    }
+
+    clearGiHalfImageIfNeeded(cmd);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                      g_giHalfPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                            g_rayTracingPipelineLayout, 0u, 1u,
+                            &g_rayTracingDescriptorSet, 0u, nullptr);
+
+    auto trace = getCmdTraceRays();
+    if(!trace)
+    {
+        return;
+    }
+
+    const uint32_t halfWidth = std::max(1u, (width + 1u) / 2u);
+    const uint32_t halfHeight = std::max(1u, (height + 1u) / 2u);
+    trace(cmd, &g_giHalfRaygenRegion, &g_giHalfMissRegion,
+          &g_giHalfHitRegion, &g_giHalfCallableRegion,
+          halfWidth, halfHeight, 1u);
+
+    // GI pass 写 giHalfImage，紧接着的主 trace 在**同一个** RAY_TRACING stage 里读它
+    // （还要挡住上一帧主 trace 的读）。布局全程 GENERAL。
+    VkImageMemoryBarrier giBarrier{
+        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    giBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    giBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    giBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    giBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    giBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    giBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    giBarrier.image = g_giHalfImage;
+    giBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    giBarrier.subresourceRange.baseMipLevel = 0u;
+    giBarrier.subresourceRange.levelCount = 1u;
+    giBarrier.subresourceRange.baseArrayLayer = 0u;
+    giBarrier.subresourceRange.layerCount = 1u;
+
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        0u, 0u, nullptr, 0u, nullptr, 1u, &giBarrier);
+}
+
+
+// =====================================================
 // 2026-10-11 5b-1：更新速率读数（一次性）
 //
 // 为什么必须有：5b-1 不接 query ⇒ 缓存内容不影响任何像素。万一 update 因为某个门控
@@ -26556,7 +28252,7 @@ static void createRtDescriptorRing()
         // 40 → 72（2026-10-06）：binding 36 的 sampler2D 数组从 16 涨到 32，
         // 单集采样器数量随之 +16；沿用 40 会在第 2 个 set 起 OUT_OF_POOL_MEMORY。
         // 2026-10-09 实体 LabPBR：binding 63/64 再加 64 ⇒ 单集 118，池按 128 配。
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 128 * RT_DESCRIPTOR_RING_SIZE },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512 * RT_DESCRIPTOR_RING_SIZE },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20 * RT_DESCRIPTOR_RING_SIZE }
     };
     VkDescriptorPoolCreateInfo pi{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -26720,7 +28416,7 @@ static void createRayTracingDescriptorPoolAndSet()
         // 池按"布局总量"配 128（描述符池是主机侧记账，多配不占显存）。
         // 2026-10-13：槽数 32 → 64 ⇒ 布局总量 118 → 214
         // （36/63/64 各 64 = 192，37 = 3，单张 19），池同步配 256 留头寸。
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 256 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512 },
         // 18 + the two LOD tables at bindings 19/20.
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20 }
     };
@@ -27986,6 +29682,7 @@ static bool applyVLISectionVoxelsLocked(
         page.emitterAliasWords = std::move(emitterAliasWords);
         g_vliSections.emplace(sectionKey, std::move(page));
         g_vliPageSectionKeys[pageIndex] = sectionKey;
+        vliChunkIndexAdd(sectionX, sectionZ, sectionKey);
     }
 
     g_vliDirtySourcePages.insert(pageIndex);
@@ -28019,7 +29716,9 @@ static void refreshVPTEmitterSectionFromLocalLights(
     bool hasVoxelPage = false;
 
     {
+        VliLockHoldProbe vliLockHoldProbe("workerApply");
         std::lock_guard<std::mutex> lock(g_vliMutex);
+        vliLockHoldProbe.mark();
         auto pageIt = g_vliSections.find(sectionKey);
         if(pageIt == g_vliSections.end())
         {
@@ -28230,9 +29929,15 @@ static void recordVLIUpdates(VkCommandBuffer cmd)
     // queue drain inside growVLIPageCapacityLocked() retires every reference to
     // the old buffers, and this command buffer has not recorded any VLI/VPT
     // work yet.
-    if(g_vliGrowthRequested || !g_vliPendingSections.empty())
+    // 2026-10-24（1）：扩容与待办处理拆成两段临界区。
+    // 实测 [VLI LOCK] site=pending held=13.30ms（仅 2 次），原因是 grow 内部要
+    // vkQueueWaitIdle 排空整条队列，而它和 4ms 预算的待办循环串在同一个临界区里
+    // ⇒ 工作线程一次要等满两段之和。拆开后单次持锁 = max(两者)。
+    if(g_vliGrowthRequested)
     {
+        VliLockHoldProbe vliLockHoldProbe("vliGrow");
         std::lock_guard<std::mutex> lock(g_vliMutex);
+        vliLockHoldProbe.mark();
 
         if(g_vliGrowthRequested)
         {
@@ -28242,6 +29947,13 @@ static void recordVLIUpdates(VkCommandBuffer cmd)
                 static_cast<uint32_t>(g_vliPendingSections.size())
             );
         }
+    }
+
+    if(!g_vliPendingSections.empty())
+    {
+        VliLockHoldProbe vliLockHoldProbe("pending");
+        std::lock_guard<std::mutex> lock(g_vliMutex);
+        vliLockHoldProbe.mark();
 
         // 2026-10-22：分帧（实测依据见 vliPendingSectionBudgetMs 处）。
         // index 0 永远做，保证一定有进展；之后一旦超预算或超段数就收手，
@@ -28370,7 +30082,9 @@ static void recordVLIUpdates(VkCommandBuffer cmd)
     std::vector<std::pair<uint32_t, uint32_t>> solvePages;
 
     {
+        VliLockHoldProbe vliLockHoldProbe("gather");
         std::lock_guard<std::mutex> lock(g_vliMutex);
+        vliLockHoldProbe.mark();
 
         // 2026-10-22：gather 窗口 = 取锁等待 + 拷贝。工作线程在 apply 期间一直
         // 持有这把锁，所以先把等待单独量出来。
@@ -35973,8 +37687,9 @@ static bool sunShadowSignatureChanged(
     const CameraUBO* ubo =
         static_cast<const CameraUBO*>(g_cameraUboMapped);
     const float phase = ubo->historyParamsPadding1;
+    // 2026-10-24：只跟地形修订号（动态层逐帧上传不该触发重建）。
     const uint64_t revision =
-        g_worldGeometryRevision.load(std::memory_order_acquire);
+        probeGeometryRevision();
 
     float center[3];
     for(int axis = 0; axis < 3; ++axis)
@@ -36097,20 +37812,56 @@ static void destroySunShadowResources()
 //      体积 pass 的，可以留在原位；
 //   3. 后置屏障的 dstStage 必须含 RAY_TRACING_SHADER_BIT_KHR。
 //
-// 一键回退：环境变量 ORION_SUNSHADOW_FAR=0。资源照建（描述符必须始终有效），
-// 只是不派发、且 UBO 的 w 置 0，rgen 远场分支全短路，画面与改动前一致。
-// ---------------------------------------------------------------
-// 旋钮只读一次。std::getenv 在本文件已有先例（RTX_NRD_DISSOCCLUSION_THRESHOLD 等）。
+// 资源照建（描述符必须始终有效），关掉时只是不派发、且 UBO 的 w 置 0，
+// rgen 远场分支全短路。开关：
+//   ORION_SUNSHADOW_FAR=0  → 关
+//   ORION_SUNSHADOW_FAR=1  → 强制开（2026-10-24 之前的默认行为）
+//   未设                   → **自适应：仅在 DH 远场合成块开着时派发**
+//
+// 2026-10-24 为什么要自适应默认关：这张图的消费者是 rgen 的远场分支，而远场
+// 遮挡体只可能来自 DH 的 LOD 实例。没有 DH 时，视距以外的几何根本不在 TLAS 里
+// （距离剔除 120 格 + 视距 128 格），1024² = 1,048,576 根射线全部 miss ——
+// 纯开销。判据用 g_dhFarFieldMode > 0.5，与实例 mask 特判（:68722）同一口径。
+//
+// 注意：不能退回"static 只读一次"，因为 DH 合成块可以在运行时开关；按帧求值
+// 只是两次读 + 一次比较，且派发/UBO 两条路径本来就每帧问一次。
 static bool sunShadowFarEnabled()
 {
-    static const bool enabled = []() {
+    static const int s_override = []() -> int
+    {
         const char* raw = std::getenv("ORION_SUNSHADOW_FAR");
+
         if(raw == nullptr)
         {
-            return true;
+            return -1;
         }
-        return std::string(raw) != "0";
+
+        return (std::string(raw) != "0") ? 1 : 0;
     }();
+
+    // A/B 优先：按窗口交替，忽略静态覆盖（否则两臂被同一个值压死）。
+    if(sunShadowFarAbEnabled())
+    {
+        return sunShadowFarAbArm() != 0u;
+    }
+
+    const bool enabled =
+        (s_override >= 0) ? (s_override != 0) : (g_dhFarFieldMode > 0.5f);
+
+    // 状态翻转打一行（每帧只在变化时写，稳态零成本）。
+    static std::atomic<int> s_lastLoggedState{-1};
+
+    const int state = enabled ? 1 : 0;
+
+    if(s_lastLoggedState.exchange(state, std::memory_order_relaxed) != state)
+    {
+        RTLog(
+            std::string("[SUNSHADOW-FAR] dispatch=") + (enabled ? "on" : "off") +
+            " dhFarFieldMode=" + std::to_string(g_dhFarFieldMode) +
+            (s_override >= 0 ? " (env override)" : " (auto: needs DH composite)")
+        );
+    }
+
     return enabled;
 }
 
@@ -37088,17 +38839,45 @@ static void recordTerrainHeightMap(VkCommandBuffer cmd)
         return;
     }
 
-    // B1：修订号没变就不重建（见 g_terrainHeightBuilt 处的完整论证）。
+    // B1：内容只取决于"地形修订号 + 量化中心"，两者都不变才跳过。
+    // 2026-10-24：修订号换成地形专用口径 ⇒ 实体/粒子逐帧上传不再触发重建；
+    // 相机走出一格仍然重建，与烘焙用的中心保持同一量化。
     const uint64_t terrainHeightRevision =
-        g_worldGeometryRevision.load(std::memory_order_acquire);
+        probeGeometryRevision();
     const bool terrainHeightForceAlways =
         std::getenv("ORION_TERRAIN_HEIGHT_ALWAYS") != nullptr;
+
+    // 必须与 shader 侧同值：TERRAIN_HEIGHT_EXTENT_XY=256、RESOLUTION=512
+    // ⇒ 中心量化步长 = 2*256/512 = 1.0 格（terrain_height.glsl:66/61/97）。
+    constexpr float kTerrainHeightCenterQuantum = 2.0f * 256.0f / 512.0f;
+
+    float terrainHeightCenterX = 0.0f;
+    float terrainHeightCenterZ = 0.0f;
+
+    if(g_cameraUboMapped != nullptr)
+    {
+        const CameraUBO* heightUbo =
+            static_cast<const CameraUBO*>(g_cameraUboMapped);
+
+        terrainHeightCenterX =
+            std::floor(heightUbo->viewInverse[12] / kTerrainHeightCenterQuantum) *
+            kTerrainHeightCenterQuantum;
+        terrainHeightCenterZ =
+            std::floor(heightUbo->viewInverse[14] / kTerrainHeightCenterQuantum) *
+            kTerrainHeightCenterQuantum;
+    }
+
     if(!terrainHeightForceAlways &&
        g_terrainHeightBuilt &&
-       g_terrainHeightBuiltRevision == terrainHeightRevision)
+       g_terrainHeightBuiltRevision == terrainHeightRevision &&
+       g_terrainHeightBuiltCenter[0] == terrainHeightCenterX &&
+       g_terrainHeightBuiltCenter[1] == terrainHeightCenterZ)
     {
         return;
     }
+
+    g_terrainHeightBuiltCenter[0] = terrainHeightCenterX;
+    g_terrainHeightBuiltCenter[1] = terrainHeightCenterZ;
 
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -38407,6 +40186,16 @@ static void recordVolumetricClouds(VkCommandBuffer cmd)
        g_volumetricCloudResolvePipeline == VK_NULL_HANDLE ||
        g_volumetricCloudCompositePipeline == VK_NULL_HANDLE)
     {
+        // 2026-10-24 诊断修复：本帧不录云（典型：体积云被关闭）时，SNEAR/HEIGHT
+        // 两个时间戳边界**必须照样写满**。pollPerfL10GpuTimestampSlot 的规则是
+        // "任一边界不可用就丢弃整个槽"，少写两个会让 [PERF L10 GPU] 整局静默
+        // 停摆（现场：14:52 那局只出了 frame=60 一个窗口，心跳却到 5880）。
+        if(cmd != VK_NULL_HANDLE)
+        {
+            writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_SNEAR);
+            writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_HEIGHT);
+        }
+
         return;
     }
 
@@ -38417,7 +40206,12 @@ static void recordVolumetricClouds(VkCommandBuffer cmd)
     // 本帧的 render set 上（本地光表扩容或描述符集重建后需要重写）。
     updateCloudLocalLightDescriptors();
     recordSunShadowMap(cmd);
+
+    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_SNEAR);
+
     recordTerrainHeightMap(cmd);
+
+    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_HEIGHT);
     VkImageMemoryBarrier cloudBarriers[3]{};
     cloudBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     cloudBarriers[0].oldLayout = g_volumetricCloudLayout;
@@ -52059,7 +53853,18 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
             ? 1u
             : 0u;
 
-    ubo->historyPadding0 = 0u;
+    // 2026-10-24：GI 射线距离截断档位（float 位型；0 = 不截断）。
+    // historyPadding0 原本恒写 0 且全仓无着色器读取，见 giRayMaxDistanceEffective()。
+    {
+        const float giMaxDistance = giRayMaxDistanceEffective();
+        uint32_t giMaxBits = 0u;
+        std::memcpy(&giMaxBits, &giMaxDistance, sizeof(giMaxBits));
+        ubo->historyPadding0 = giMaxBits;
+        g_perfL10GiMaxForLog.store(giMaxDistance, std::memory_order_relaxed);
+    }
+
+    // POM 深度影子（g_pomDepth 由 setPOMDepth 写，每帧生效）。
+    g_perfL10PomForLog.store(g_pomDepth.load(), std::memory_order_relaxed);
     // Java slider 「本地光源照射强度」 rides this lane as float bits.  It is
     // written as intensity + 1.0 so that a zeroed lane (old DLL, or before the
     // Java push) decodes as -1.0 and the shaders fall back to 1.0 -- which
@@ -52161,6 +53966,17 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     // 2026-10-19 树叶次表面散射：0 = 太阳背光（旧档）；1 = 真次表面散射。
     ubo->sssParams[0] =
         g_sssMode.load();
+
+    // GLSL CameraProperties.giHalfParams.x
+    // 2026-10-24 半分辨率 GI：0 = 主 raygen 自己跑 GI 回路（逐位旧画面）；
+    // 1 = 从 giHalfImage 上采样。**图还没建好时必须写 0** —— 否则主变体会
+    // imageLoad 一个没写过的描述符。图在帧录制路径里建（createGiHalfImage），
+    // 所以启用后的第一帧走旧路径，第二帧才切过去，这是刻意的缓一步。
+    ubo->giHalfParams[0] =
+        (giHalfEnabled() && g_giHalfView != VK_NULL_HANDLE) ? 1.0f : 0.0f;
+    ubo->giHalfParams[1] = 0.0f;
+    ubo->giHalfParams[2] = 0.0f;
+    ubo->giHalfParams[3] = 0.0f;
 
     // GLSL CameraProperties.historyParams.w. This lane is the *only* input of the
     // time-driven sun-direction functions (rgen / rmiss / sun_shadow.glsl all read
@@ -52284,6 +54100,9 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
 
     // 2026-10-06 用户「每像素采样数」(spp)：0.5 = 棋盘交错，1..4 = 像素内采样数。
     ubo->rtSampleParams[0] = std::clamp(g_perfRtSpp.load(), 0.5f, 4.0f);
+
+    // 影子同步（只服务日志分组，不影响渲染）。
+    g_perfL10SppForLog.store(ubo->rtSampleParams[0], std::memory_order_relaxed);
     // 2026-10-07：同一个块的保留 lane 被两项 RT 优化征用（只被 rt_test.rgen 读）：
     //   .y = GI 俄罗斯轮盘开关（1 = 开 = 出厂）
     //   .z = 太阳透射 march 远距简化距离（格；0 = 关 = 固定 6 步）
@@ -53121,8 +54940,16 @@ static uint64_t packSectionKey(int x, int y, int z, int layerId) {
 
 static void clearVLISections()
 {
+    VliLockHoldProbe vliLockHoldProbe("worldClear");
     std::lock_guard<std::mutex> lock(g_vliMutex);
+    vliLockHoldProbe.mark();
     g_vliSections.clear();
+    g_vliChunkSectionIndex.clear();
+
+    {
+        std::lock_guard<std::mutex> uploadHashLock(g_vliUploadHashMutex);
+        g_vliUploadHashByKey.clear();
+    }
     std::fill(g_vliTableCpu.begin(), g_vliTableCpu.end(), VLITableSlot{});
     std::fill(
         g_vliPageSectionKeys.begin(),
@@ -53176,6 +55003,9 @@ static void clearVLISections()
 }
 
 
+// 2026-10-24：簇重插计数（每次调用累计）。用来判定 3ms 是否花在后移重插上。
+static uint64_t g_vliTableReinsertTotal = 0u;
+
 static void eraseVLITableSlot(uint32_t eraseSlot)
 {
     const uint32_t mask = VLI_PAGE_TABLE_CAPACITY - 1u;
@@ -53217,6 +55047,7 @@ static void eraseVLITableSlot(uint32_t eraseSlot)
             g_vliDirtySolveTableSlots.insert(newSlot);
         }
 
+        ++g_vliTableReinsertTotal;
         cursor = (cursor + 1u) & mask;
     }
 }
@@ -53320,6 +55151,8 @@ static bool evictFarthestVLIPageLocked(uint32_t& outPageIndex)
 
     // ① 先摘 map。
     g_vliSections.erase(victimKey);
+    vliChunkIndexRemove(victimX, victimZ, victimKey);
+    vliUploadHashForget(victimKey);
 
     // ② 清页索引反查表。
     g_vliPageSectionKeys[victimPageIndex] = VLI_INVALID_SECTION_KEY;
@@ -53418,6 +55251,31 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadVoxelLightSect
 
     const uint64_t sectionKey = packSectionKey(sectionX, sectionY, sectionZ, 0);
 
+    // 2026-10-24：内容哈希门 —— 绝大多数上传的内容与上次相同，这里直接返回，
+    // 连 g_vliMutex 都不碰（原实现要先进锁再 memcmp 才发现没变）。
+    const uint64_t vliUploadHash = vliHashWords(incomingWords, VLI_SOURCE_WORDS);
+    const bool vliHashGate = vliHashGateEnabled();
+
+    const uint64_t vliUploadOrdinal = ++g_vliUploadTotal;
+
+    vliHotRecordAndReport(sectionKey, vliUploadOrdinal);
+
+    if(vliHashGate && vliUploadHashUnchanged(sectionKey, vliUploadHash))
+    {
+        ++g_vliUploadGated;
+
+        if((vliUploadOrdinal % 500u) == 0u)
+        {
+            RTLog(
+                "[VLI GATE] total=" + std::to_string(g_vliUploadTotal.load()) +
+                " gated=" + std::to_string(g_vliUploadGated.load()) +
+                " applied=" + std::to_string(g_vliUploadApplied.load())
+            );
+        }
+
+        return;
+    }
+
     // The light callback can arrive before or after this voxel callback.
     // Snapshot its accepted records before taking g_vliMutex; do not derive
     // VPT emitters from sourceWords when the authoritative light Section is
@@ -53452,6 +55310,14 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadVoxelLightSect
             ) == 0
         )
         {
+            // 2026-10-24 修正：这里也必须写哈希。
+            // 原来只在"内容确实变了"那条分支写，导致"内容一直没变"的 Section
+            // 永远门不命中，每次仍要抢锁（实测命中率仅 57%）。
+            if(vliHashGate)
+            {
+                vliUploadHashStore(sectionKey, vliUploadHash);
+            }
+
             return;
         }
 
@@ -53468,6 +55334,23 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadVoxelLightSect
         vliWorkerProbe.cmpMs =
             VliWorkerHoldProbe::sinceMs(vliWorkerProbe.begin) -
             vliWorkerProbe.lockWaitMs;
+
+        // 走到这里说明"持久页比对判定为已变"（未变的在上面已 return）。
+        // 记下本次内容的哈希，供下一次锁外比对。
+        if(vliHashGate)
+        {
+            vliUploadHashStore(sectionKey, vliUploadHash);
+            ++g_vliUploadApplied;
+
+            if((vliUploadOrdinal % 500u) == 0u)
+            {
+                RTLog(
+                    "[VLI GATE] total=" + std::to_string(g_vliUploadTotal.load()) +
+                    " gated=" + std::to_string(g_vliUploadGated.load()) +
+                    " applied=" + std::to_string(g_vliUploadApplied.load())
+                );
+            }
+        }
 
         // Derive this Section's emitter list from the voxel words.
         //
@@ -54187,29 +56070,117 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_removeLightChunk(
 
 
     size_t vliRemovedSections = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_vliMutex);
-        std::vector<std::array<int32_t, 3>> removedCoordinates;
 
-        for(auto it = g_vliSections.begin(); it != g_vliSections.end();)
+    // 2026-10-24（A）：把一个长临界区拆成"扫描"+"逐坐标邻域重建"两段。
+    // 实测 [VLI LOCK] site=chunkUnload 最大 27ms，而全表扫描本身是微秒级 ——
+    // 时间几乎全在逐坐标的 neighborhood 重建里。合在一起时工作线程要等满 27ms；
+    // 拆开后扫描立刻放锁，邻域重建逐坐标重新取锁，工作线程可以插进来。
+    std::vector<std::array<int32_t, 3>> vliRemovedCoordinates;
+
+    {
+        VliLockHoldProbe vliLockHoldProbe("chunkUnloadScan");
+        std::lock_guard<std::mutex> lock(g_vliMutex);
+        vliLockHoldProbe.mark();
+
+        // 2026-10-24（①）：不再全表扫描，按列索引直接取本列的段。
+        const uint64_t vliUnloadColumn = vliChunkColumnKey(chunkX, chunkZ);
+        const auto vliColumnIt = g_vliChunkSectionIndex.find(vliUnloadColumn);
+
+        if(vliColumnIt != g_vliChunkSectionIndex.end())
         {
-            const VLISectionCpuPage& page = it->second;
-            if(page.sectionX != chunkX || page.sectionZ != chunkZ)
+            std::vector<uint64_t> vliColumnKeys = std::move(vliColumnIt->second);
+            g_vliChunkSectionIndex.erase(vliColumnIt);
+
+            for(const uint64_t vliColumnKey : vliColumnKeys)
             {
-                ++it;
-                continue;
+                const auto vliPageIt = g_vliSections.find(vliColumnKey);
+
+                if(vliPageIt == g_vliSections.end())
+                {
+                    continue;
+                }
+
+                const VLISectionCpuPage& page = vliPageIt->second;
+
+                vliRemovedCoordinates.push_back({
+                    page.sectionX,
+                    page.sectionY,
+                    page.sectionZ
+                });
+                g_vliFreePages.push_back(page.pageIndex);
+                g_vliPageSectionKeys[page.pageIndex] = VLI_INVALID_SECTION_KEY;
+                eraseVLITableSlot(page.tableSlot);
+                g_vliSections.erase(vliPageIt);
+                vliUploadHashForget(vliColumnKey);
+                ++vliRemovedSections;
+            }
+        }
+
+        // 2026-10-24（①）自检：ORION_VLI_INDEX_CHECK=1 时，上面用索引删完后
+        // 再做一次全表扫描，确认没有本列残留（遗漏会表现为页泄漏 + 光源发光）。
+        // 只在开关打开时付这次扫描的代价，用来证明索引维护没有漏点。
+        {
+            static const bool vliIndexCheckEnabled = []()
+            {
+                const char* raw = std::getenv("ORION_VLI_INDEX_CHECK");
+
+                return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+            }();
+
+            if(vliIndexCheckEnabled)
+            {
+                size_t vliStalePages = 0u;
+
+                for(auto it = g_vliSections.begin(); it != g_vliSections.end();)
+                {
+                    const VLISectionCpuPage& page = it->second;
+
+                    if(page.sectionX != chunkX || page.sectionZ != chunkZ)
+                    {
+                        ++it;
+                        continue;
+                    }
+
+                    g_vliFreePages.push_back(page.pageIndex);
+                    g_vliPageSectionKeys[page.pageIndex] = VLI_INVALID_SECTION_KEY;
+                    eraseVLITableSlot(page.tableSlot);
+                    it = g_vliSections.erase(it);
+                    ++vliStalePages;
+                }
+
+                if(vliStalePages > 0u)
+                {
+                    RTLog(
+                        "[VLI INDEX] stale pages removed=" +
+                        std::to_string(vliStalePages)
+                    );
+                }
+            }
+        }
+
+        // 2026-10-24：簇重插诊断 —— 只有本次卸载的重插量偏大时才打印，
+        // 用来判定 3ms 是否花在 eraseVLITableSlot 的后移重插上。
+        {
+            static uint64_t vliReinsertAtUnloadBegin = 0u;
+            static uint32_t vliUnloadProbeCount = 0u;
+
+            if(vliRemovedSections > 0u)
+            {
+                const uint64_t reinsertsThisUnload =
+                    g_vliTableReinsertTotal - vliReinsertAtUnloadBegin;
+
+                if(reinsertsThisUnload >= 200u || vliUnloadProbeCount < 3u)
+                {
+                    RTLog(
+                        "[VLI UNLOAD] removed=" + std::to_string(vliRemovedSections) +
+                        " reinserts=" + std::to_string(reinsertsThisUnload) +
+                        " pending=" + std::to_string(g_vliPendingSections.size())
+                    );
+                    ++vliUnloadProbeCount;
+                }
             }
 
-            removedCoordinates.push_back({
-                page.sectionX,
-                page.sectionY,
-                page.sectionZ
-            });
-            g_vliFreePages.push_back(page.pageIndex);
-            g_vliPageSectionKeys[page.pageIndex] = VLI_INVALID_SECTION_KEY;
-            eraseVLITableSlot(page.tableSlot);
-            it = g_vliSections.erase(it);
-            ++vliRemovedSections;
+            vliReinsertAtUnloadBegin = g_vliTableReinsertTotal;
         }
 
         // A Section parked before this column unloaded must not be registered
@@ -54231,19 +56202,25 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_removeLightChunk(
             );
         }
 
-        for(const auto& coordinate : removedCoordinates)
-        {
-            markVLINeighborhoodDirty(
-                coordinate[0],
-                coordinate[1],
-                coordinate[2]
-            );
-            rebuildVPTCandidateNeighborhoodLocked(
-                coordinate[0],
-                coordinate[1],
-                coordinate[2]
-            );
-        }
+    }
+
+    // 邻域重建逐坐标取锁：单次持锁从"整批 27ms"降到"一段几毫秒"。
+    for(const auto& coordinate : vliRemovedCoordinates)
+    {
+        VliLockHoldProbe vliLockHoldProbe("chunkUnloadNbr");
+        std::lock_guard<std::mutex> lock(g_vliMutex);
+        vliLockHoldProbe.mark();
+
+        markVLINeighborhoodDirty(
+            coordinate[0],
+            coordinate[1],
+            coordinate[2]
+        );
+        rebuildVPTCandidateNeighborhoodLocked(
+            coordinate[0],
+            coordinate[1],
+            coordinate[2]
+        );
     }
 
 
@@ -54587,6 +56564,8 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadChunk(
         SPATIAL_SECTION_KEY_MASK;
 
     // 【核心修复 1】恢复并严格锁定 28 字节步长校验，拦截非法数据
+    g_chunkUploadCalls.fetch_add(1u, std::memory_order_relaxed);
+
     if (vertexCount == 0 || vertexPointer == 0 || vertexStride != 28) {
         std::lock_guard<std::timed_mutex> lock(g_chunkMutex);
 
@@ -54640,13 +56619,15 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadChunk(
             rawIt != g_chunkRawPayloads.end() &&
             meshIt != g_chunkMeshes.end() &&
             rawIt->second.size() == rawPayloadBytes &&
-            std::memcmp(
+            chunkMemcmpTimed(
                 rawIt->second.data(),
                 rawMemory,
-                rawPayloadBytes
+                rawPayloadBytes,
+                g_chunkCmpRaw1MaxNanos
             ) == 0
         )
         {
+            g_chunkUploadDedup.fetch_add(1u, std::memory_order_relaxed);
             return;
         }
     }
@@ -54939,24 +56920,43 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadChunk(
         if(
             rawIt != g_chunkRawPayloads.end() &&
             rawIt->second.size() == rawPayloadBytes &&
-            std::memcmp(
+            chunkMemcmpTimed(
                 rawIt->second.data(),
                 rawDedupSource,
-                rawPayloadBytes
+                rawPayloadBytes,
+                g_chunkCmpRaw2MaxNanos
             ) == 0
         )
         {
+            g_chunkUploadDedup.fetch_add(1u, std::memory_order_relaxed);
             return;
         }
 
-        if(
-            existingIt != g_chunkMeshes.end() &&
-            sameVertexPayload(
-                existingIt->second,
-                repackedVertices
-            )
-        )
+        bool existingMeshEqual = false;
+
+        if(existingIt != g_chunkMeshes.end())
         {
+            const auto meshCmpT0 = std::chrono::steady_clock::now();
+            existingMeshEqual =
+                sameVertexPayload(
+                    existingIt->second,
+                    repackedVertices
+                );
+            chunkCmpNoteMax(
+                g_chunkCmpMeshMaxNanos,
+                static_cast<uint64_t>(
+                    chunkCmpMsSince(meshCmpT0) * 1000000.0
+                )
+            );
+            g_chunkCmpLastVerts.store(
+                static_cast<uint64_t>(repackedVertices.size())
+            );
+            chunkCmpReport();
+        }
+
+        if(existingMeshEqual)
+        {
+            g_chunkUploadDedup.fetch_add(1u, std::memory_order_relaxed);
             if(uploadRawMoveGateEnabled())
             {
                 g_chunkRawPayloads[chunkKey] =
@@ -56297,7 +58297,8 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endEntityFrame(
     if(requestRebuild)
     {
         g_dirtySectionKeys.insert(ENTITY_RT_SPATIAL_KEY);
-        markWorldGeometryDirty();
+        // 动态层：不推进地形修订号 —— 否则近场阴影图/高度场会每帧重建。
+        markWorldGeometryDirty(false);
         g_entityRebuildRequested.store(true, std::memory_order_release);
     }
 }
@@ -56549,7 +58550,8 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endParticleFrame(
     if(requestDynamicRTASRebuild(changed))
     {
         g_dirtySectionKeys.insert(ENTITY_RT_SPATIAL_KEY);
-        markWorldGeometryDirty();
+        // 动态层：不推进地形修订号 —— 否则近场阴影图/高度场会每帧重建。
+        markWorldGeometryDirty(false);
         g_entityRebuildRequested.store(true, std::memory_order_release);
     }
 }
@@ -57868,6 +59870,20 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
 )
 {
     const LeakProbeScope leakProbeScope;
+
+    RTXMarkPhase("frame:begin");
+    RTXHeartbeatTick();
+
+    // 自检钩子（默认关）：ORION_TEST_CRASH=1 时在第 120 帧故意踩一次空指针，
+    // 用来确认崩溃捕获链在实机上真的能落盘（[CRASH] + [CRASH PATH] + rt_crash.log
+    // + JVM 的 hs_err 四样齐全）。验证完就把环境变量去掉，别留在启动脚本里。
+    if(g_perfL10FrameSerial == 120u &&
+       std::getenv("ORION_TEST_CRASH") != nullptr)
+    {
+        RTLogFlushed("[CRASH TEST] deliberate null write (ORION_TEST_CRASH=1)");
+
+        *static_cast<volatile int*>(nullptr) = 1;
+    }
 
     // 【已弃用，勿启用】RT 管线回收（原因见 beginStreamlineFrame 处的注释：
     // 2026-10-16 实测换管后客户端整窗无响应）。
@@ -59539,6 +61555,14 @@ if(!g_dlssGFeatureInitialized)
     }
 
 
+    // 2026-10-24 半分辨率 GI 的辐照度图（w/2 × h/2，RGBA16F）。
+    // ORION_GI_HALF=0 时本函数第一行就返回 —— 旧路径连显存都不多占。
+    createGiHalfImage(
+        renderWidth,
+        renderHeight
+    );
+
+
     createVPTDirectHistoryBuffers(
         renderWidth,
         renderHeight
@@ -60060,10 +62084,14 @@ if(rrGuideBarrierCount > 0)
     createSkyAtmospherePipeline();
     rtSpikeSkyPipe = rtMark();
 
+    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_RTPIPE);
+
     // 远场太阳阴影图（2026-10-01）必须在 RT 派发之前记录：rgen 的远场分支
     // 采样它做直射阴影。近场那张（给体积光/雾采样）留在原处，两者互不影响。
     recordSunShadowFarMap(cmd);
     rtSpikeShadowFar = rtMark();
+
+    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_SFAR);
 
     // 2026-10-11 5b-1：SHaRC 缓存的首次清零必须**在本帧 RT pass 之前**录进 cmd ——
     // 本帧的 update 一进来就要往清零过的缓存里写（见 recordSharcZeroFillIfNeeded）。
@@ -60074,6 +62102,8 @@ if(rrGuideBarrierCount > 0)
 // SHADER_WRITE→SHADER_READ 屏障，渲染 pass 读缓存时写已可见。
 recordSharcUpdate(cmd, renderWidth, renderHeight);
     rtSpikeSharc = rtMark();
+
+    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_SHARCUP);
 
     // Perf-1.2: custom temporal history barriers removed.
     vkCmdBindPipeline(
@@ -60114,6 +62144,35 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
     rtSpikeSky = rtMark();
 
     writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_SKY);
+
+    // =====================================================
+    // 2026-10-24 半分辨率 GI（HANDOFF-2026-10-24-GI-HALFRES.md）
+    //
+    // 位置有讲究：必须在 recordSkyAtmosphere(cmd) **之后** —— GI 变体自己重发主射线
+    // 并跑材质求值，天空项要读本帧刚算好的 skyScatteringTex；又必须在主 trace
+    // **之前** —— 主变体要 imageLoad 它写出的辐照度。
+    // 它自带"写→读"屏障，且写路径不碰 RR guide（变体在 24156 之前 return）。
+    // 代价照 SHARC 的教训（新增 pass 的固定开销不便宜）：空跑门禁 < 0.5ms。
+    // =====================================================
+    recordGiHalfPass(cmd, renderWidth, renderHeight);
+
+    // recordGiHalfPass 绑过自己的管线与描述符集 ⇒ 主 trace 之前必须绑回主管线。
+    vkCmdBindPipeline(
+        cmd,
+        VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+        g_rayTracingPipeline
+    );
+    vkCmdBindDescriptorSets(
+        cmd,
+        VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+        g_rayTracingPipelineLayout,
+        0,
+        1,
+        &g_rayTracingDescriptorSet,
+        0,
+        nullptr
+    );
+
     trace(
         cmd,
         &g_raygenRegion,
@@ -61782,6 +63841,39 @@ rrSpecularHitDistance.usage =
     VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
 
+// -----------------------------------------------------
+// 2026-10-23：TransparencyHint 资源描述（见 g_rrTransparencyHintImage 处说明）
+// -----------------------------------------------------
+sl::Resource rrTransparencyHint(
+    sl::ResourceType::eTex2d,
+    (void*)g_rrTransparencyHintImage,
+    (void*)g_rrTransparencyHintMemory,
+    (void*)g_rrTransparencyHintView,
+    VK_IMAGE_LAYOUT_GENERAL
+);
+
+rrTransparencyHint.width =
+    g_rrGBufferWidth;
+
+rrTransparencyHint.height =
+    g_rrGBufferHeight;
+
+rrTransparencyHint.nativeFormat =
+    static_cast<uint32_t>(
+        VK_FORMAT_R8_UNORM
+    );
+
+rrTransparencyHint.mipLevels = 1;
+rrTransparencyHint.arrayLayers = 1;
+rrTransparencyHint.flags = 0;
+
+rrTransparencyHint.usage =
+    VK_IMAGE_USAGE_STORAGE_BIT |
+    VK_IMAGE_USAGE_SAMPLED_BIT |
+    VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+    VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+
 // =====================================================
 // Existing DLSS SR tags
 // =====================================================
@@ -61793,6 +63885,17 @@ rrSpecularHitDistance.usage =
         // Dynamic-resolution inputs must all describe
         // the actual render-resolution subrect.
         // =====================================================
+
+        // TransparencyHint 的句柄缓存：图变了才重写描述符。
+        // 无条件执行（不跟环境变量）—— rgen 每像素都会写这个 binding。
+        {
+            static VkImageView rrHintBoundView = VK_NULL_HANDLE;
+            if(rrHintBoundView != g_rrTransparencyHintView)
+            {
+                updateRRTransparencyHintRayDescriptor();
+                rrHintBoundView = g_rrTransparencyHintView;
+            }
+        }
 
         sl::Extent inputExtent{};
 
@@ -61852,6 +63955,14 @@ sl::ResourceTag rrNormalRoughnessTag(
 sl::ResourceTag rrSpecularHitDistanceTag(
     &rrSpecularHitDistance,
     sl::kBufferTypeSpecularHitDistance,
+    sl::eValidUntilEvaluate,
+    &inputExtent
+);
+
+// 阶段 1 只有资源与 tag；值由 rgen 写（阶段 2）。默认不计入 inputCount。
+sl::ResourceTag rrTransparencyHintTag(
+    &rrTransparencyHint,
+    sl::kBufferTypeTransparencyHint,
     sl::eValidUntilEvaluate,
     &inputExtent
 );
@@ -61946,14 +64057,20 @@ sl::ResourceTag outputTag(
         // First real DLSS Ray Reconstruction Evaluate
         // =====================================================
 
+        // 2026-10-23：TransparencyHint 追加在**尾**（viewport 之后）。
+        // 于是 inputCount 在 9/10 之间切换时，前 9 项恒为原来那组（含 viewport），
+        // 不需要重排既有下标 —— 本仓"新条目追加在数组尾部"的既定做法。
         const sl::BaseStructure* inputs[] =
         {
             &inputTag, &outputTag, &depthTag, &motionTag,
             &rrDiffuseAlbedoTag, &rrSpecularAlbedoTag,
             &rrNormalRoughnessTag, &rrSpecularHitDistanceTag,
-            &g_dlssViewport
+            &g_dlssViewport,
+            &rrTransparencyHintTag
         };
-        const uint32_t inputCount = useSR ? 5u : 9u;
+        const uint32_t inputCount = useSR
+            ? 5u
+            : (rrTransparencyHintEnabled() ? 10u : 9u);
 
 
         sl::CommandBuffer* slCmd =
@@ -63640,6 +65757,20 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_cleanup(JNIEnv*,jcla
         );
 
 
+        // 2026-10-24 半分辨率 GI
+        destroyHistoryImage(
+            g_giHalfImage,
+            g_giHalfMemory,
+            g_giHalfView,
+            g_giHalfLayout
+        );
+        g_giHalfWidth = 0u;
+        g_giHalfHeight = 0u;
+        g_giHalfBoundView = VK_NULL_HANDLE;
+        g_giHalfNeedsClear = false;
+        destroyGiHalfPipeline();
+
+
         if(g_rrStableRadianceSampler != VK_NULL_HANDLE)
         {
             vkDestroySampler(
@@ -65129,6 +67260,8 @@ static bool rebuildWorldGeometry(
 
     // 2026-10-08：重建调用计数（配合 counters 行算"每调用搬几块"）。
     g_geometryRebuildCallTotal += 1u;
+
+    RTXMarkPhase("geometry:entry");
 
     // =====================================================
     // 2026-10-10 周期性卡顿修复：入口闸门
@@ -67079,6 +69212,14 @@ static bool rebuildWorldGeometry(
     static float s_tlasFrustumPlanes[5][4] = {};
     static bool s_tlasFrustumPlanesValid = false;
     s_tlasFrustumPlanesValid = false;
+
+    // 2026-10-23：同一组矩阵再解一份 6 面版，供投射者视锥（ADSC）使用。
+    // 平面顺序必须与 Iris 的 BaseClippingPlanes 一致：
+    //   0 left 1 right 2 bottom 3 top 4 far 5 near
+    // 相邻表 kNeighborPlanes 依赖这个顺序，不能自行调整。
+    static float s_tlasBasePlanes[6][4] = {};
+    static bool s_tlasBasePlanesValid = false;
+    s_tlasBasePlanesValid = false;
     {
         const CameraUBO* frustumUbo =
             g_cameraUboMapped != nullptr
@@ -67138,6 +69279,51 @@ static bool rebuildWorldGeometry(
                 }
 
                 s_tlasFrustumPlanesValid = allFinite;
+
+                // 6 面版：前 4 面与上面逐位相同，新增 far（row3 - row2），
+                // near 复用 planes[4]（row3 + row2）。远面在相机视锥剔除里
+                // 是刻意不要的（远面归距离档），但 ADSC 需要它 —— 没有远面，
+                // "相机正前方无限远"会被当成视锥内部，边平面就补错了方向。
+                float basePlanes[6][4];
+
+                for(int k = 0; k < 4; ++k)
+                {
+                    basePlanes[0][k] = planes[0][k];
+                    basePlanes[1][k] = planes[1][k];
+                    basePlanes[2][k] = planes[2][k];
+                    basePlanes[3][k] = planes[3][k];
+                    basePlanes[4][k] = m[k][3] - m[k][2];
+                    basePlanes[5][k] = planes[4][k];
+                }
+
+                bool baseFinite = allFinite;
+
+                for(int p = 0; p < 6; ++p)
+                {
+                    const float len = std::sqrt(
+                        basePlanes[p][0] * basePlanes[p][0] +
+                        basePlanes[p][1] * basePlanes[p][1] +
+                        basePlanes[p][2] * basePlanes[p][2]);
+
+                    if(len > 1.0e-8f)
+                    {
+                        for(int k = 0; k < 4; ++k)
+                        {
+                            s_tlasBasePlanes[p][k] = basePlanes[p][k] / len;
+
+                            if(!std::isfinite(s_tlasBasePlanes[p][k]))
+                            {
+                                baseFinite = false;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        baseFinite = false;
+                    }
+                }
+
+                s_tlasBasePlanesValid = baseFinite;
             }
         }
     }
@@ -67150,7 +69336,7 @@ static bool rebuildWorldGeometry(
     // 就是这个盒里的 Section。
     //
     // 而下面循环里的两个剔除都是按**相机**的视锥/距离剔实例，与光空间方向无关：
-    //   · 距离剔除（「TLAS剔除距离」，0 = 自适应 = clamp(视距×1.25, 64, 512)）把
+    //   · 距离剔除（「TLAS剔除距离」，0 = **关**；值 = 剔除半径，格）把
     //     100 格外的 Section 拿掉；
     //   · 视锥剔除（「TLAS视锥剔除边距」）把相机身后/侧方的 Section 拿掉。
     // 两者都会把"本应挡住太阳、给空气投下影子的地形"从 TLAS 里拿掉 ⇒ 太阳阴影图
@@ -67259,6 +69445,156 @@ static bool rebuildWorldGeometry(
                         s_sunShadowKeepValid = true;
                     }
                 }
+            }
+        }
+    }
+
+    // =====================================================
+    // 2026-10-23 投射者视锥（移植 Iris 26.1 AdvancedShadowCullingFrustum）
+    //
+    // 目的：给"哪些 Section 有可能把影子投进画面"一个**保守但正确**的判据，
+    // 替代把相机视锥直接当剔除用的做法（后者会让光柱穿墙，见 67309 起）。
+    //
+    // 算法（与参考实现逐条对应，见 .tmp/iris/.../advanced/）：
+    //   1. addBackPlanes：法线与"指向太阳的单位向量"点积 > 0 的平面是背平面
+    //      —— 保留（相机身后、但影子可能落进画面）；点积 == 0 的平面既保留
+    //      又参与第 2 步（参考实现里 edge 与 back 同待遇）。
+    //   2. addEdgePlanes：对每个背平面的 4 个邻居里"非背"的那些，补一个边平面：
+    //        I = cross(backNormal, frontNormal)        // 两面交线方向
+    //        N = cross(I, light)                       // 垂直于光 ⇒ 沿光方向无限外扩
+    //        p = ( cross(I,backN)*(-front.w) + cross(frontN,I)*(-back.w) ) / |I|^2
+    //        w = -dot(N, p)
+    //      三平面共线，所以边平面自动与两个父平面在交线上闭合。
+    //   3. 上限：6 个背平面里最多 3 个可同时"朝光"（XY/YZ/ZX 三对各取一），
+    //      每个贡献 2 个边平面 ⇒ 3 + 6 = 9。数组按 13 留量（与参考实现同值）。
+    //
+    // ⚠ 与参考实现的唯一偏差：边平面法线在这里归一化、w 同比缩放。参考实现只
+    //   做 dot>0 判定（缩放无害），而我们的实例测试是 "planeDist < -radius"，
+    //   半径是以"法线为单位长度"为前提的。
+    // =====================================================
+    static float s_casterPlanes[13][4] = {};
+    static int s_casterPlaneCount = 0;
+    s_casterPlaneCount = 0;
+
+    if(s_tlasBasePlanesValid && s_sunShadowKeepValid)
+    {
+        // 指向太阳的单位向量，与上面光空间保留盒同源（basis[2]）⇒
+        // "谁能投影进画面"和"阴影图读哪个盒"用同一个光方向。
+        const float* light = s_sunShadowKeepBasis[2];
+
+        bool isBack[6] = { false, false, false, false, false, false };
+
+        for(int p = 0; p < 6; ++p)
+        {
+            const float dot =
+                s_tlasBasePlanes[p][0] * light[0] +
+                s_tlasBasePlanes[p][1] * light[1] +
+                s_tlasBasePlanes[p][2] * light[2];
+
+            // 参考实现：back = dot > 0；edge = dot == 0；两者都进平面列表。
+            isBack[p] = dot > 0.0f;
+
+            if(dot >= 0.0f && s_casterPlaneCount < 13)
+            {
+                for(int k = 0; k < 4; ++k)
+                {
+                    s_casterPlanes[s_casterPlaneCount][k] =
+                        s_tlasBasePlanes[p][k];
+                }
+
+                s_casterPlaneCount += 1;
+            }
+        }
+
+        // 相邻平面表（NeighboringPlaneSet：TABLE[planeIndex >>> 1]）
+        static const int kNeighborPlanes[3][4] =
+        {
+            { 2, 3, 4, 5 },
+            { 0, 1, 4, 5 },
+            { 0, 1, 2, 3 },
+        };
+
+        for(int p = 0; p < 6; ++p)
+        {
+            if(!isBack[p])
+            {
+                continue;
+            }
+
+            for(int n = 0; n < 4; ++n)
+            {
+                const int front = kNeighborPlanes[p >> 1][n];
+
+                if(isBack[front] || s_casterPlaneCount >= 13)
+                {
+                    continue;
+                }
+
+                const float* backPlane = s_tlasBasePlanes[p];
+                const float* frontPlane = s_tlasBasePlanes[front];
+
+                // 交线方向 I = cross(backNormal, frontNormal)
+                const float ix =
+                    backPlane[1] * frontPlane[2] - backPlane[2] * frontPlane[1];
+                const float iy =
+                    backPlane[2] * frontPlane[0] - backPlane[0] * frontPlane[2];
+                const float iz =
+                    backPlane[0] * frontPlane[1] - backPlane[1] * frontPlane[0];
+
+                const float intersectionLenSq = ix * ix + iy * iy + iz * iz;
+
+                if(intersectionLenSq < 1.0e-12f)
+                {
+                    // 两面平行（参考实现假定非零）。退化时跳过：只少留、不多剔。
+                    continue;
+                }
+
+                // 边平面法线 N = cross(I, light)
+                float nx = iy * light[2] - iz * light[1];
+                float ny = iz * light[0] - ix * light[2];
+                float nz = ix * light[1] - iy * light[0];
+
+                const float normalLen = std::sqrt(nx * nx + ny * ny + nz * nz);
+
+                if(normalLen < 1.0e-8f)
+                {
+                    continue;
+                }
+
+                nx /= normalLen;
+                ny /= normalLen;
+                nz /= normalLen;
+
+                // 交线上的一点（Graphics Gems 1 p.305 / ideasman42 的公式）
+                const float ixbX = iy * backPlane[2] - iz * backPlane[1];
+                const float ixbY = iz * backPlane[0] - ix * backPlane[2];
+                const float ixbZ = ix * backPlane[1] - iy * backPlane[0];
+
+                const float fxiX = frontPlane[1] * iz - frontPlane[2] * iy;
+                const float fxiY = frontPlane[2] * ix - frontPlane[0] * iz;
+                const float fxiZ = frontPlane[0] * iy - frontPlane[1] * ix;
+
+                const float invLenSq = 1.0f / intersectionLenSq;
+
+                const float pointX =
+                    (ixbX * (-frontPlane[3]) + fxiX * (-backPlane[3])) * invLenSq;
+                const float pointY =
+                    (ixbY * (-frontPlane[3]) + fxiY * (-backPlane[3])) * invLenSq;
+                const float pointZ =
+                    (ixbZ * (-frontPlane[3]) + fxiZ * (-backPlane[3])) * invLenSq;
+
+                const float w = -(nx * pointX + ny * pointY + nz * pointZ);
+
+                if(!std::isfinite(w))
+                {
+                    continue;
+                }
+
+                s_casterPlanes[s_casterPlaneCount][0] = nx;
+                s_casterPlanes[s_casterPlaneCount][1] = ny;
+                s_casterPlanes[s_casterPlaneCount][2] = nz;
+                s_casterPlanes[s_casterPlaneCount][3] = w;
+                s_casterPlaneCount += 1;
             }
         }
     }
@@ -67616,6 +69952,63 @@ static bool rebuildWorldGeometry(
             orderedSections.size()
         );
 
+        // 2026-10-23 剔除档位求值（每批一次，不做逐实例判断）。
+        // mode < 0 时逐位等于改动前：距离看 lane>0、相机视锥看边距>0、投射者档不用。
+        RTXMarkPhase("geometry:instances");
+
+        const int tlasCullModeValue = tlasCullMode();
+        const int cullDistanceLane = g_tlasCullDistance.load();
+        const int cullMarginLane = g_tlasFrustumCullMargin.load();
+        const bool cullKeepBoxEnabled = tlasKeepBoxEnabled();
+        const float cullNearGuardBlocks = tlasNearGuardBlocks();
+
+        const bool cullDistanceActive =
+            cullDistanceLane > 0 &&
+            (tlasCullModeValue < 0 ||
+             tlasCullModeValue == 1 ||
+             tlasCullModeValue == 3 ||
+             tlasCullModeValue == 4);
+
+        const bool cullViewFrustumActive =
+            s_tlasFrustumPlanesValid &&
+            (tlasCullModeValue < 0
+                ? cullMarginLane > 0
+                : (tlasCullModeValue == 2 || tlasCullModeValue == 3));
+
+        const bool cullCasterFrustumActive =
+            s_casterPlaneCount > 0 &&
+            tlasCullModeValue == 4;
+
+        // mode 5：不删实例，只在后面清 mask 的主射线位。
+        // 计数器放在**函数作用域**（不是下面那个每实例的诊断块里），
+        // 因为清 mask 的位置在诊断块之外，那里看不到块内的 static。
+        const bool cullPrimaryMaskActive = tlasCullModeValue == 5;
+        static int s_cullPrimaryMaskedCount = 0;
+
+        // 半径 = 16³ Section 半对角 8√3 + 用户边距。显式档位下边距只表示"额外外扩"，
+        // 0 也是保守值：8√3 已经覆盖整个立方体，不会因为中心在面外就误剔。
+        const float cullSphereRadius =
+            13.8564f + static_cast<float>(std::max(cullMarginLane, 0));
+
+        static bool s_tlasCullModeLogged = false;
+
+        if(tlasCullModeValue >= 0 && !s_tlasCullModeLogged)
+        {
+            s_tlasCullModeLogged = true;
+
+            RTLog(
+                std::string("[TLAS CULL] mode=") +
+                std::to_string(tlasCullModeValue) +
+                " distanceLane=" + std::to_string(cullDistanceLane) +
+                " marginLane=" + std::to_string(cullMarginLane) +
+                " casterPlanes=" + std::to_string(s_casterPlaneCount) +
+                " radius=" + std::to_string(cullSphereRadius) +
+                " keepBox=" + std::to_string(cullKeepBoxEnabled ? 1 : 0) +
+                " nearGuard=" + std::to_string(
+                    static_cast<int>(cullNearGuardBlocks))
+            );
+        }
+
 
         for(
             uint32_t instanceIndex = 0;
@@ -67630,6 +70023,9 @@ static bool rebuildWorldGeometry(
                 *orderedSections[instanceIndex];
 
             float diagDistance = 0.0f;
+
+            // mode 5 的判定结果（块内算、块外用，见 patch_mask_mode5_fix.py）。
+            bool primaryMaskCull = false;
 
             // =====================================================
             // 2026-10-03 剔除可行性诊断（零行为变化，只统计）：
@@ -67673,6 +70069,7 @@ static bool rebuildWorldGeometry(
                 static uint64_t diagTotalTriangles = 0;
                 static int diagCulledCount = 0;
                 static int diagFrustumCulled = 0;
+                static int diagCasterCulled = 0;
                 static int diagCullLimit = 0;
                 static std::chrono::steady_clock::time_point diagLastPrint{};
                 static bool diagLastPrintValid = false;
@@ -67711,7 +70108,17 @@ static bool rebuildWorldGeometry(
                             " tris=" + std::to_string(diagTotalTriangles) +
                             " culled=" + std::to_string(diagCulledCount) +
                             " frustumCulled=" + std::to_string(diagFrustumCulled) +
-                            " cullDist=" + std::to_string(diagCullLimit));
+                            " casterCulled=" + std::to_string(diagCasterCulled) +
+                            " primaryMasked=" + std::to_string(s_cullPrimaryMaskedCount) +
+                            " cullDist=" + std::to_string(diagCullLimit) +
+                            " mode=" + std::to_string(tlasCullModeValue) +
+                            " casterPlanes=" + std::to_string(s_casterPlaneCount) +
+                            " keepBox=" + std::to_string(cullKeepBoxEnabled ? 1 : 0) +
+                            " nearGuard=" + std::to_string(
+                                static_cast<int>(cullNearGuardBlocks)) +
+                            " planes=" + std::to_string(s_tlasFrustumPlanesValid ? 1 : 0) +
+                            " base=" + std::to_string(s_tlasBasePlanesValid ? 1 : 0) +
+                            " sun=" + std::to_string(s_sunShadowKeepValid ? 1 : 0));
                     }
                     diagLastPrint = diagNow;
                     diagLastPrintValid = true;
@@ -67720,6 +70127,8 @@ static bool rebuildWorldGeometry(
                     diagTotalTriangles = 0;
                     diagCulledCount = 0;
                     diagFrustumCulled = 0;
+                    diagCasterCulled = 0;
+                    s_cullPrimaryMaskedCount = 0;
                 }
 
                 // =================================================
@@ -67746,8 +70155,11 @@ static bool rebuildWorldGeometry(
                 // 太阳阴影保留盒（初始化见 instances 声明之前）：三轴投影都落在
                 // 光空间盒（含一个 Section 半对角的余量）内 ⇒ 这个 Section 可能是
                 // 太阳阴影图射线的遮挡体，两个剔除都放过它。
+                // 2026-10-23：盒子可关（ORION_TLAS_KEEPBOX=0）。关掉之后，
+                // "遮挡体"这件事完全交给 ADSC 的投射者视锥；近场由
+                // cullGuardKeepsSection 兜底。默认（未设变量）= 现状。
                 bool sunShadowKeepsSection = false;
-                if(s_sunShadowKeepValid)
+                if(cullKeepBoxEnabled && s_sunShadowKeepValid)
                 {
                     const float keepX =
                         sectionWorldX - s_sunShadowKeepCenter[0];
@@ -67774,49 +70186,95 @@ static bool rebuildWorldGeometry(
                                 SUN_SHADOW_EXTENT_Z + SECTION_HALF_DIAGONAL;
                 }
 
+                // 近场保底：水面模拟（48 格）、焦散、近场 GI 需要相机周围一圈
+                // 完整几何，方向无关。半径 0 = 不保底（纯 A/B 用）。
+                const bool cullGuardKeepsSection =
+                    cullNearGuardBlocks > 0.0f &&
+                    diagDistance < cullNearGuardBlocks;
+
+                // mode 5：主射线掩码判定。放这里是因为世界坐标 / 近场保底 /
+                // 真实世界高度这三个判据都在本块内。
+                // 判据：视锥外 + 不在近场保底球内 + 真实世界高度 ⇒ 清主射线位。
+                if(cullPrimaryMaskActive &&
+                   diagWorldHeightSection &&
+                   !cullGuardKeepsSection &&
+                   s_tlasFrustumPlanesValid)
+                {
+                    for(int plane = 0; plane < 5; ++plane)
+                    {
+                        const float planeDist =
+                            s_tlasFrustumPlanes[plane][0] * sectionWorldX +
+                            s_tlasFrustumPlanes[plane][1] * sectionWorldY +
+                            s_tlasFrustumPlanes[plane][2] * sectionWorldZ +
+                            s_tlasFrustumPlanes[plane][3];
+
+                        if(planeDist < -cullSphereRadius)
+                        {
+                            primaryMaskCull = true;
+                            break;
+                        }
+                    }
+                }
+
                 if(diagWorldHeightSection && !sunShadowKeepsSection &&
-                   diagCullLimit > 0 &&
+                   !cullGuardKeepsSection &&
+                   cullDistanceActive &&
                    diagDistance > static_cast<float>(diagCullLimit))
                 {
                     diagCulledCount += 1;
                     continue;
                 }
 
-                // 2026-10-04 TLAS 实例视锥剔除：5 面测试（left/right/bottom/top/near，
-                // 远面归距离剔除）。AABB 半径 = 16 格 Section 半对角 8√3 + 外扩边距；
+                // 2026-10-04 TLAS 实例视锥/投射者视锥剔除（2026-10-23 档位化）：
+                //   · mode 2/3 = 相机视锥 5 面（left/right/bottom/top/near，远面归
+                //     距离档）—— 旧语义，对次级射线不安全；
+                //   · mode 4 = 投射者视锥 ≤9 面（ADSC，构造见 67519 起）—— 保留
+                //     "相机身后但能投影进画面"的遮挡体，可给太阳阴影/GI/反射用。
+                // AABB 半径 = 16 格 Section 半对角 8√3 + 用户边距（0 也是保守值）；
                 // 面距 = plane·center + d，< -radius 即整体落在该面外侧 ⇒ 剔除。
                 // ⚠ 与距离剔除共用同一保留 Y 段守卫（diagWorldHeightSection）：
                 //   voxy LOD / 动态实体聚合不参与（X/Z 非世界坐标，见上方 ⚠⚠ 注释）。
                 if(diagWorldHeightSection && !sunShadowKeepsSection &&
-                   s_tlasFrustumPlanesValid)
+                   !cullGuardKeepsSection &&
+                   (cullViewFrustumActive || cullCasterFrustumActive))
                 {
-                    const int frustumMargin = g_tlasFrustumCullMargin.load();
-                    if(frustumMargin > 0)
+                    const float (*cullPlanes)[4] =
+                        cullCasterFrustumActive
+                            ? s_casterPlanes
+                            : s_tlasFrustumPlanes;
+
+                    const int cullPlaneCount =
+                        cullCasterFrustumActive ? s_casterPlaneCount : 5;
+
+                    bool frustumOutside = false;
+
+                    for(int plane = 0; plane < cullPlaneCount; ++plane)
                     {
-                        const float cullRadius =
-                            13.8564f + static_cast<float>(frustumMargin);
+                        const float planeDist =
+                            cullPlanes[plane][0] * sectionWorldX +
+                            cullPlanes[plane][1] * sectionWorldY +
+                            cullPlanes[plane][2] * sectionWorldZ +
+                            cullPlanes[plane][3];
 
-                        bool frustumOutside = false;
-                        for(int plane = 0; plane < 5; ++plane)
+                        if(planeDist < -cullSphereRadius)
                         {
-                            const float planeDist =
-                                s_tlasFrustumPlanes[plane][0] * sectionWorldX +
-                                s_tlasFrustumPlanes[plane][1] * sectionWorldY +
-                                s_tlasFrustumPlanes[plane][2] * sectionWorldZ +
-                                s_tlasFrustumPlanes[plane][3];
-
-                            if(planeDist < -cullRadius)
-                            {
-                                frustumOutside = true;
-                                break;
-                            }
+                            frustumOutside = true;
+                            break;
                         }
+                    }
 
-                        if(frustumOutside)
+                    if(frustumOutside)
+                    {
+                        if(cullCasterFrustumActive)
+                        {
+                            diagCasterCulled += 1;
+                        }
+                        else
                         {
                             diagFrustumCulled += 1;
-                            continue;
                         }
+
+                        continue;
                     }
                 }
             }
@@ -67909,6 +70367,15 @@ static bool rebuildWorldGeometry(
             if(geometryClass == SECTION_AS_CLASS_PARTICLE)
             {
                 instance.mask = 0xf7;
+            }
+
+            // 2026-10-24 mode 5：主射线掩码剔除。
+            // 判定在上面的逐实例诊断块里算好（primaryMaskCull），这里只做动作 ——
+            // instance.mask 在这个位置才最终确定（上面每个 class 都会重写它）。
+            if(cullPrimaryMaskActive && primaryMaskCull)
+            {
+                instance.mask &= 0xfeu;
+                s_cullPrimaryMaskedCount += 1;
             }
 
             if(geometryClass == SECTION_AS_CLASS_OPAQUE)
@@ -68768,6 +71235,13 @@ static bool rebuildWorldGeometry(
         };
 
 
+    RTXMarkPhase("tlas:build");
+
+    g_rtxDetailInstances.store(
+        static_cast<uint64_t>(instances.size()),
+        std::memory_order_relaxed
+    );
+
     // 优化②：实例表未变化 ⇒ 跳过 build 命令（TLAS 保持上一帧内容 = 内容一致）
     if(!tlasInstancesUnchanged)
     {
@@ -68778,6 +71252,8 @@ static bool rebuildWorldGeometry(
             tlasRanges
         );
     }
+
+    RTXMarkPhase("tlas:built");
 
 
     check(

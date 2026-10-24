@@ -3,6 +3,7 @@ package com.example.client.mixin;
 import com.example.vulkan.NativeVulkan;
 import com.example.client.access.PBRAtlasStorage;
 import com.example.client.access.OmmCutoutClassifier;
+import com.example.client.access.SectionUploadDedup;
 import com.example.client.access.RtStateCache;
 import com.example.client.compat.FarFieldGate;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
@@ -26,6 +27,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.IdentityHashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 @Mixin(SectionCompiler.class)
@@ -245,6 +247,10 @@ public class SectionCompilerMixin {
     // （含其内部 JNI）。256 个 section 一报，标签 [SECTION COMPILE]。
     // =====================================================
     private static final int SC_REPORT_WINDOW = 256;
+
+    // 2026-10-24：uploadChunk 内容哈希去重（实现见 SectionUploadDedup）。
+    // 这里只追踪世界对象身份，换世界时整表失效。
+    private static volatile Object SC_DEDUP_LEVEL = null;
 
     private static final AtomicLong SC_COUNT = new AtomicLong();
     private static final AtomicLong SC_TOTAL_NANOS = new AtomicLong();
@@ -573,6 +579,34 @@ public class SectionCompilerMixin {
                     long pointer =
                             MemoryUtil.memAddress(vertexBuffer);
 
+                    // 2026-10-24：内容哈希去重 —— 相同内容不必进 native。
+                    long scChunkHash = 0L;
+
+                    if (SectionUploadDedup.enabled() && vertexCount > 0) {
+                        final Object level =
+                                net.minecraft.client.Minecraft.getInstance().level;
+
+                        if (SC_DEDUP_LEVEL != level) {
+                            SC_DEDUP_LEVEL = level;
+                            SectionUploadDedup.invalidateAll();
+                        }
+
+                        final long scKey =
+                                SectionUploadDedup.key(
+                                        sectionPos.x(),
+                                        sectionPos.y(),
+                                        sectionPos.z(),
+                                        layerId
+                                );
+
+                        scChunkHash =
+                                SectionUploadDedup.hash(pointer, vertexCount * stride);
+
+                        if (SectionUploadDedup.shouldSkip(scKey, scChunkHash)) {
+                            continue;
+                        }
+                    }
+
                     final long scTJni = System.nanoTime();
                     try {
                         NativeVulkan.uploadChunk(
@@ -588,6 +622,18 @@ public class SectionCompilerMixin {
                         t.printStackTrace();
                     }
                     scJniNanos += System.nanoTime() - scTJni;
+
+                    if (SectionUploadDedup.enabled() && vertexCount > 0) {
+                        SectionUploadDedup.record(
+                                SectionUploadDedup.key(
+                                        sectionPos.x(),
+                                        sectionPos.y(),
+                                        sectionPos.z(),
+                                        layerId
+                                ),
+                                scChunkHash
+                        );
+                    }
 
                     if (layerId == 1) {
                         final long scTOmm = System.nanoTime();
@@ -653,6 +699,15 @@ public class SectionCompilerMixin {
                 t.printStackTrace();
             }
             scClearNanos += System.nanoTime() - scTClear;
+
+            // 2026-10-24：native 已擦掉这些层的几何 ⇒ 哈希必须同步失效，
+            // 否则下次相同内容会被判为"未变"而不再上传（表现为空洞）。
+            SectionUploadDedup.invalidateSection(
+                    sectionPos.x(),
+                    sectionPos.y(),
+                    sectionPos.z(),
+                    missingLayerMask
+            );
         }
 
         // The VPT source pass already resolves the tracked-glass marker for

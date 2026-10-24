@@ -857,6 +857,26 @@ if(
         // Clear glass remains a rain blocker even when it transmits white.
         payload.glassAlpha = 1.0;
 
+#ifndef GI_CLEAR_GLASS_VISIBILITY_AS_AIR
+#define GI_CLEAR_GLASS_VISIBILITY_AS_AIR 1
+#endif
+#if GI_CLEAR_GLASS_VISIBILITY_AS_AIR
+        // =====================================================
+        // 2026-10-24（用户要求）：可见性射线里，普通（未染色）玻璃也当空气。
+        // 与 rt_test.rahit 的同名块逐字同源（那份有完整推导）：判据与 rchit 的
+        // RT_STATE_CLEAR_GLASS_BIT 同源（glassVertexFactorIsFaceShade），清玻璃
+        // 不再乘 面shade×Fresnel 滤镜、不计面序、不消耗穿层预算；跳过 = 0 面
+        // （偶数），下游染色玻璃奇偶不变。
+        // A/B：-DGI_CLEAR_GLASS_VISIBILITY_AS_AIR=0 逐位回到旧档。
+        // =====================================================
+        if(materialId < 2.05 &&
+            glassVertexFactorIsFaceShade(vertexColor.rgb))
+        {
+            ignoreIntersectionEXT;
+            return;
+        }
+#endif
+
         // The visibility ray is receiver -> emitter.  For each traversed
         // glass block its first accepted face is the real light-exit face;
         // only that face receives the Orion boundary sheet and the
@@ -870,11 +890,32 @@ if(
                 )
             );
 
+#ifndef GI_GLASS_SEAM_RESET
+#define GI_GLASS_SEAM_RESET 1
+#endif
+#if GI_GLASS_SEAM_RESET
+        // =====================================================
+        // 2026-10-24：半透明区域断开处重置面序 —— 与 rt_test.rahit 的同名块
+        // 逐字同源（那份有完整推导与面距口径）。机制：贴不透明方块的半透明体
+        // 被裁掉一面 ⇒ 奇偶整体翻转 ⇒ 下游丢一次 filter ⇒ 一像素亮线。
+        // A/B：-DGI_GLASS_SEAM_RESET=0 逐位回到旧档。
+        // =====================================================
+        if(payload.lastGlassFaceT >= 0.0 &&
+            gl_HitTEXT - payload.lastGlassFaceT > 1.5)
+        {
+            glassFaceOrdinal = 0u;
+        }
+        payload.lastGlassFaceT = gl_HitTEXT;
+#endif
+
         bool isLightExitFace =
             (glassFaceOrdinal & 1u) == 0u;
 
+        // 2026-10-24：面序（可重置）与穿层预算（永不重置）拆成两个字段。
         payload.parallaxRayTravel =
             float(glassFaceOrdinal + 1u);
+        payload.glassFaceBudget =
+            payload.glassFaceBudget + 1.0;
 
 
         vec3 surfaceTransmission =
@@ -990,12 +1031,14 @@ if(
 #define GI_GLASS_VISIBILITY_MAX_FACES 16
 #endif
 #if GI_GLASS_VISIBILITY_BUDGET
+        // 2026-10-24：预算改读独立计数器 glassFaceBudget（与 rt_test.rahit 同源）。
         if(
             max(
                 payload.albedo.r,
                 max(payload.albedo.g, payload.albedo.b)
             ) < GI_GLASS_VISIBILITY_MIN_TRANSMITTANCE ||
-            glassFaceOrdinal + 1u >= uint(GI_GLASS_VISIBILITY_MAX_FACES)
+            payload.glassFaceBudget >=
+                float(GI_GLASS_VISIBILITY_MAX_FACES)
         )
         {
             return;

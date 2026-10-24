@@ -444,7 +444,7 @@ layout(binding = 3, set = 0) uniform sampler2D blockAtlas;
 // 2026-10-13：32 → 64。必须与 VulkanCore.cpp 的 ENTITY_RT_TEXTURE_SLOT_COUNT
 // 及 EntityRtCapture.MAX_TEXTURE_SLOTS 同步，并且下面的 switch 必须补满 N 个
 // case（本设备没开 descriptor indexing，只能静态索引）。
-layout(binding = 36, set = 0) uniform sampler2D entityAtlases[64];
+layout(binding = 36, set = 0) uniform sampler2D entityAtlases[128];
 // 2026-10-09：实体 LabPBR（`_n`/`_s`）。与 entityAtlases 同槽、同 UV（Java 按
 // "同一 Identifier 加 _n/_s" 查找），C++ 侧与 binding 36 同构：每槽一个 view。
 // 没有贴图的槽由 C++ 填中性 1×1 兜底（normal=(0,0,0,1)、specular=(0,0,0,1)），
@@ -530,6 +530,70 @@ vec4 sampleEntityAtlas(uint textureSlot, vec2 uv)
         case 62u: return textureLod(entityAtlases[61], uv, 0.0);
         case 63u: return textureLod(entityAtlases[62], uv, 0.0);
         case 64u: return textureLod(entityAtlases[63], uv, 0.0);
+        case 65u: return textureLod(entityAtlases[64], uv, 0.0);
+        case 66u: return textureLod(entityAtlases[65], uv, 0.0);
+        case 67u: return textureLod(entityAtlases[66], uv, 0.0);
+        case 68u: return textureLod(entityAtlases[67], uv, 0.0);
+        case 69u: return textureLod(entityAtlases[68], uv, 0.0);
+        case 70u: return textureLod(entityAtlases[69], uv, 0.0);
+        case 71u: return textureLod(entityAtlases[70], uv, 0.0);
+        case 72u: return textureLod(entityAtlases[71], uv, 0.0);
+        case 73u: return textureLod(entityAtlases[72], uv, 0.0);
+        case 74u: return textureLod(entityAtlases[73], uv, 0.0);
+        case 75u: return textureLod(entityAtlases[74], uv, 0.0);
+        case 76u: return textureLod(entityAtlases[75], uv, 0.0);
+        case 77u: return textureLod(entityAtlases[76], uv, 0.0);
+        case 78u: return textureLod(entityAtlases[77], uv, 0.0);
+        case 79u: return textureLod(entityAtlases[78], uv, 0.0);
+        case 80u: return textureLod(entityAtlases[79], uv, 0.0);
+        case 81u: return textureLod(entityAtlases[80], uv, 0.0);
+        case 82u: return textureLod(entityAtlases[81], uv, 0.0);
+        case 83u: return textureLod(entityAtlases[82], uv, 0.0);
+        case 84u: return textureLod(entityAtlases[83], uv, 0.0);
+        case 85u: return textureLod(entityAtlases[84], uv, 0.0);
+        case 86u: return textureLod(entityAtlases[85], uv, 0.0);
+        case 87u: return textureLod(entityAtlases[86], uv, 0.0);
+        case 88u: return textureLod(entityAtlases[87], uv, 0.0);
+        case 89u: return textureLod(entityAtlases[88], uv, 0.0);
+        case 90u: return textureLod(entityAtlases[89], uv, 0.0);
+        case 91u: return textureLod(entityAtlases[90], uv, 0.0);
+        case 92u: return textureLod(entityAtlases[91], uv, 0.0);
+        case 93u: return textureLod(entityAtlases[92], uv, 0.0);
+        case 94u: return textureLod(entityAtlases[93], uv, 0.0);
+        case 95u: return textureLod(entityAtlases[94], uv, 0.0);
+        case 96u: return textureLod(entityAtlases[95], uv, 0.0);
+        case 97u: return textureLod(entityAtlases[96], uv, 0.0);
+        case 98u: return textureLod(entityAtlases[97], uv, 0.0);
+        case 99u: return textureLod(entityAtlases[98], uv, 0.0);
+        case 100u: return textureLod(entityAtlases[99], uv, 0.0);
+        case 101u: return textureLod(entityAtlases[100], uv, 0.0);
+        case 102u: return textureLod(entityAtlases[101], uv, 0.0);
+        case 103u: return textureLod(entityAtlases[102], uv, 0.0);
+        case 104u: return textureLod(entityAtlases[103], uv, 0.0);
+        case 105u: return textureLod(entityAtlases[104], uv, 0.0);
+        case 106u: return textureLod(entityAtlases[105], uv, 0.0);
+        case 107u: return textureLod(entityAtlases[106], uv, 0.0);
+        case 108u: return textureLod(entityAtlases[107], uv, 0.0);
+        case 109u: return textureLod(entityAtlases[108], uv, 0.0);
+        case 110u: return textureLod(entityAtlases[109], uv, 0.0);
+        case 111u: return textureLod(entityAtlases[110], uv, 0.0);
+        case 112u: return textureLod(entityAtlases[111], uv, 0.0);
+        case 113u: return textureLod(entityAtlases[112], uv, 0.0);
+        case 114u: return textureLod(entityAtlases[113], uv, 0.0);
+        case 115u: return textureLod(entityAtlases[114], uv, 0.0);
+        case 116u: return textureLod(entityAtlases[115], uv, 0.0);
+        case 117u: return textureLod(entityAtlases[116], uv, 0.0);
+        case 118u: return textureLod(entityAtlases[117], uv, 0.0);
+        case 119u: return textureLod(entityAtlases[118], uv, 0.0);
+        case 120u: return textureLod(entityAtlases[119], uv, 0.0);
+        case 121u: return textureLod(entityAtlases[120], uv, 0.0);
+        case 122u: return textureLod(entityAtlases[121], uv, 0.0);
+        case 123u: return textureLod(entityAtlases[122], uv, 0.0);
+        case 124u: return textureLod(entityAtlases[123], uv, 0.0);
+        case 125u: return textureLod(entityAtlases[124], uv, 0.0);
+        case 126u: return textureLod(entityAtlases[125], uv, 0.0);
+        case 127u: return textureLod(entityAtlases[126], uv, 0.0);
+        case 128u: return textureLod(entityAtlases[127], uv, 0.0);
         default: return vec4(1.0);
     }
 }

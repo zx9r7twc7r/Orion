@@ -220,7 +220,20 @@ public class VulkanCameraMixin {
         CameraRenderState cameraState =
                 this.gameRenderState.levelRenderState.cameraRenderState;
 
-        Vec3 pos = cameraState.pos;
+        // 2026-10-24 相机路径（见 com.example.client.bench.CameraPathDriver）。
+        // 放在这里、而不是另开一个注入点，是因为这一刻的位姿就是 native 即将收到的
+        // 那一份（下面 306 行起的 viewInvArray / handRotationArray 全部由它派生），
+        // 录下来的路径因此与当时的画面严格对应；回放替换的也只是这一份，不碰玩家本体、
+        // 物理与区块加载。
+        final com.example.client.bench.CameraPathDriver.Pose replayPose =
+                com.example.client.bench.CameraPathDriver.frame(
+                        cameraState.pos,
+                        this.mainCamera.xRot(),
+                        this.mainCamera.yRot());
+
+        Vec3 pos = replayPose == null
+                ? cameraState.pos
+                : new Vec3(replayPose.x(), replayPose.y(), replayPose.z());
 
         if ((frameCount % 60) == 0 && RTX_DEBUG) {
             System.out.println(
@@ -231,8 +244,12 @@ public class VulkanCameraMixin {
             );
         }
 
+        // 回放帧用路径位姿重建视图旋转（公式与 Camera#getViewRotationMatrix 逐字一致，
+        // 见 CameraPathDriver.Pose#viewRotationMatrix）；非回放帧仍是相机自己的矩阵。
         Matrix4fc viewRotationMatrix =
-                cameraState.viewRotationMatrix;
+                replayPose == null
+                        ? cameraState.viewRotationMatrix
+                        : replayPose.viewRotationMatrix();
 
         Matrix4fc projectionMatrix =
                 cameraState.projectionMatrix;

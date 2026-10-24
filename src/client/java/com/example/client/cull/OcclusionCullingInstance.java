@@ -88,6 +88,19 @@ public class OcclusionCullingInstance {
                             return true;
                         }
 
+                        if (cachedValue < 0) {
+                            // 2026-10-23：getCacheValue() 的 -1 是「缓存网格外」
+                            // （|Δ| > reach-2 = 126 格），不是「已判被挡」。它此前和 2
+                            // 一起落进下面的 skipList ⇒ 越界格被整块当成不可见。
+                            // 后果：距相机 126~128 格的实体（大 hitbox 更宽，半宽 25 时
+                            // 中心 101 格起就可能）只要「朝相机的那些面格」落在越界区，
+                            // 那几面就从不参与射线检测；其余面又被墙挡住 ⇒ 整只实体
+                            // 被判不可见，且每轮都如此（与缓存状态无关，不会自愈）。
+                            // 越界只表示「这个格无法回答」，按本类既有的 failsafe 口径
+                            // （异常/无 data 一律可见）保守判可见。
+                            return true;
+                        }
+
                         if (cachedValue != 0) {
                             // was checked and it wasn't visible
                             skipList.set(id);

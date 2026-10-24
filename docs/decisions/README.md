@@ -21,6 +21,8 @@
 | [`mv-probe.md`](mv-probe.md) | MV 读回探针（binding 57）的仪器说明书：为什么必须有它、四种伪彩各代表什么 |
 | [`omm-pool.md`](omm-pool.md) | OMM 缓冲池化为何保持不设限：churnTop 现场、收紧到 2u 会退化成 32MB 分配抖动的推导 |
 | [`object-accounting.md`](object-accounting.md) | 对象创建总账（诊断）：为什么在 vkAllocMB 之外还要逐个 `vkCreate*` 记账，2026-10-15 两局读数 |
+| [`russian-roulette.md`](russian-roulette.md) | RR 生存率曲线与参考实现的定量对比；地板是方差取舍不是偏倚；η² 在薄壁玻璃下恒为 1；"照抄参考 RR"为何被否决 |
+| [`sharc-default-off.md`](sharc-default-off.md) | SHaRC 默认关闭的现状；为什么管线门控写在 `ensureSharcUpdatePipeline()` 内部（114 秒教训）；关闭后的 GI 成本结构与构建侧死重 |
 
 其它文档：
 

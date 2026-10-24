@@ -241,6 +241,25 @@ uniform image2D rrNormalRoughnessImage;
 layout(binding = 16, set = 0, r32f)
 uniform image2D rrSpecularHitDistanceImage;
 
+// 2026-10-23：DLSS RR 的 TransparencyHint（binding 71，R8_UNORM）。
+// 1 = 本像素内容来自穿过玻璃/透明接收面的路径。宿主只在开关打开时把它作为
+// kBufferTypeTransparencyHint 交给 RR；但描述符始终绑定，所以这里无条件写。
+layout(binding = 71, set = 0, r8)
+uniform image2D rrTransparencyHintImage;
+
+// ============================================================================
+// 2026-10-24 半分辨率 GI（HANDOFF-2026-10-24-GI-HALFRES.md）
+//
+// 唯一一张"两用"图：GI 变体（-DGI_HALFRES=1，独立 SPV）写它，主变体读它。
+// 布局 rgba16f：
+//   rgb = 解调后的辐照度（indirectLight / brdfWeight）
+//   a   = 主命中视深度（米，正数）
+// 用 storage image + 手写 imageLoad 3×3，不另建 sampler —— 半分辨率的图做
+// 硬件双线性只会跨物体边缘糊边，权重必须自己按深度算（见 upsampleGiHalf）。
+// ============================================================================
+layout(binding = 72, set = 0, rgba16f)
+uniform image2D giHalfImage;
+
 // Analytic (zero-variance) radiance the denoiser must not touch.  Written by
 // this raygen with the pane's mirror lobe + solar gloss removed from every
 // other pixel, read back by the display transform after DLSS RR.  See
@@ -563,6 +582,35 @@ bool perfL10DisableLocalEmitterHitScan()
 //   · evaluateVPTLocalSecondaryBounce() → 恒 vec3(0)（本地光二级弹射归零）
 // 只用于量价格，观感会穿墙。
 // =====================================================
+// =====================================================
+// 2026-10-24 射线计数（Perf-L10.3 仪器的缺失半边）
+//
+// binding 46 在宿主侧早就建好、每帧清零回读（VulkanCore.cpp:22037），但一直没有
+// 着色器写入 ⇒ instrumentedPixels 恒 0 ⇒ [PERF L10 RAY] 从不出现。
+//
+// 只在 stage 15（原空档 spare15）写：生产档（stage 0）里 perfRayStatAdd 的第一
+// 个分支就返回，零成本。采集用 ORION_PERF_ABLATION=pin:15。
+//
+// 下标与 C++ PerfL10RayStatIndex 严格同序（VulkanCore.cpp:10198）。
+// =====================================================
+layout(binding = 46) buffer PerfL10RayStatsBuf
+{
+    uint perfRayStatCount[12];
+};
+
+bool perfRayStatsOn()
+{
+    return perfL10Stage() == 15u;
+}
+
+void perfRayStatAdd(uint index, uint value)
+{
+    if(perfRayStatsOn())
+    {
+        atomicAdd(perfRayStatCount[index], value);
+    }
+}
+
 bool perfL10DisableVoxelDda()
 {
     return perfL10Stage() == 16u;
@@ -665,6 +713,28 @@ float perfL10TierScale()
     return perfL10Stage() == 13u
         ? 0.5
         : 1.0;
+}
+
+// =====================================================
+// 2026-10-24 GI 光线距离截断（运行期档位）
+//
+// 车道：CameraUBO.historyPadding0（宿主恒写 0、全仓无读者；按 float 位型解释）。
+//   0     = 不截断（默认，与本改动前逐位相同）
+//   > 0   = GI 射线的 tMax 上限（格）
+//
+// 为什么需要：GI 是 rt 段最大一项（noGi 实测 −5.47ms / rt 11.58ms = 47%），
+// 而在 giBounces=1 / roulette=1 / rtSpp=1 下所有细分旋钮都测不出收益
+// （stage 8/11/12/13/14 全在 ±0.15ms 内）⇒ 只能减每条射线的长度。
+//
+// 语义代价：被截断的射线按未命中处理，GI 回路退回天空项（albedo*0.6），
+// 远处间接光会变淡变平。用 A/B 权衡，别在生产档里凭感觉定值。
+// =====================================================
+float perfGiTraceMaxDistance(float baseMax)
+{
+    const float limit =
+        uintBitsToFloat(cam.historyPadding0);
+
+    return limit > 0.0 ? min(baseMax, limit) : baseMax;
 }
 
 // Binding 34 (the old 256x256 wavefront-area caustic map) is deliberately no
@@ -2554,6 +2624,38 @@ bool vptReprojectPreviousPixel(
 );
 
 
+// =====================================================
+// 2026-10-24：RIS 提案数默认值（修"候选数旋钮断线"⇒ 每帧只抽 1 个提案）
+//
+// perfPrimary/perfSecondary 两条 lane 在 Perf-L10 改造后已无任何写入方
+// （VulkanCore.cpp / Java 全仓 grep 无命中 ⇒ 恒 0），而本文件三处读
+// perfSecondary.x 当"提案数"：clamp(0, 1, 32) = 1 ⇒ 本地光 RIS 从那时起
+// 一直只抽 **1 个**提案 —— 权重归一里 weightSum/(proposals×selectedWeight)
+// 在 proposals=1 时逐位等于 1，估计值就是"随机一个发射体的全额贡献"，
+// 方差最大档。09-30 用户实测"候选数怎么调都不动"正是因为设置旋钮从来没
+// 接到过这条 lane。
+//
+// 提案是纯 buffer 读 + 权重 ALU，**不新增可见性射线**（仍然每次调用恰好
+// 1 条，见 VPT_LOCAL_KEEP 处的记载）；1 → 16 只花 ALU，直接压掉"挑选
+// 方差"这一层。lane 将来若重新接线，非 0 值仍然生效。
+// A/B：-DVPT_RIS_PROPOSAL_OVERRIDE=1 回到旧档（死 lane ⇒ 恒 1）。
+// =====================================================
+#ifndef VPT_RIS_PROPOSAL_FLOOR
+#define VPT_RIS_PROPOSAL_FLOOR 16
+#endif
+
+uint vptRisProposalCount()
+{
+#if VPT_RIS_PROPOSAL_OVERRIDE
+    return clamp(cam.perfSecondary.x, 1u, 32u);
+#else
+    uint proposalLane = cam.perfSecondary.x;
+    return proposalLane != 0u
+        ? clamp(proposalLane, 1u, 32u)
+        : uint(VPT_RIS_PROPOSAL_FLOOR);
+#endif
+}
+
 vec3 evaluateVPTRISDirectLightingSingle(
     vec3 hitPos,
     vec3 hitNormal,
@@ -2843,7 +2945,7 @@ vec3 evaluateVPTRISDirectLightingSingle(
     }
 
     for(uint proposalIndex = 0u;
-        proposalIndex < clamp(cam.perfSecondary.x, 1u, 32u);
+        proposalIndex < vptRisProposalCount();
         ++proposalIndex)
     {
         // 2026-10-03 借目录混合：本次提案按权重挑捐助者目录（自有页存在时
@@ -3115,7 +3217,7 @@ vec3 evaluateVPTRISDirectLightingSingle(
         vec3(0.2126, 0.7152, 0.0722)), 1.0e-6);
     return applyLocalGlassTint(
         selectedContribution * (weightSum /
-            (float(clamp(cam.perfSecondary.x, 1u, 32u)) * selectedWeight)) *
+            (float(vptRisProposalCount()) * selectedWeight)) *
             max(hitAlbedo, vec3(0.0)) * 0.92,
         transmittance
     );
@@ -3358,9 +3460,10 @@ vec3 evaluateDynamicLightRISDirect(
     }
 
     vec3 N = normalize(hitNormal);
-    // 提案数取「局部光 RIS 候选」同一档（perfSecondary.x），但上限压到 4：动态光源通常
-    // 只有个位数条，再多提案边际收益很低，而每条被接受的候选要付一条可见性射线。
-    uint proposals = clamp(cam.perfSecondary.x, 1u, 4u);
+    // 提案数取「局部光 RIS 候选」同一档（vptRisProposalCount，死 lane ⇒ 16），
+    // 但上限压到 4：动态光源通常只有个位数条，再多提案边际收益很低，
+    // 而每条被接受的候选要付一条可见性射线。
+    uint proposals = min(vptRisProposalCount(), 4u);
     vec3 selectedContribution = vec3(0.0);
     vec3 selectedPosition = vec3(0.0);
     float weightSum = 0.0;
@@ -3481,6 +3584,54 @@ vec3 evaluateVPTRISDirectLighting(
     // f0 = vec3(-1.0)：未知材质 ⇒ 移动光源退回纯 Lambert（与本次改动前逐位相同）。
     return evaluateVPTRISDirectLighting(
         hitPos, hitNormal, hitAlbedo, vec3(0.0), vec3(-1.0), -1.0, 1.0, rngState);
+}
+
+// =====================================================
+// 2026-10-24 透明接收面的多样本直射估计（修"静止时彩色玻璃上积累的噪点"）
+//
+// 透过玻璃/水看到的接收面写不进主 G-buffer ⇒ DLSS-RR 拿不到它的表面历史；
+// 它唯一的时域平均是 evaluateVPTCandidateDirectTemporal 的世界空间历史。
+// 而那份历史每帧只喂入 **1 个** RIS 样本（1 次发射体选择 + 1 条可见性射线），
+// 历史封顶后残余方差仍有 1/sqrt(N_history) ≈ 14% 的 1spp 量级 —— 隔着染色
+// 玻璃看就是一层持续闪烁的彩色颗粒。09-30 用户实测"采样数/候选数怎么调都
+// 还在"指的是设置面板旋钮（太阳阴影采样 / RIS 提案数），它们不改变这条
+// 路径**每帧只有 1 个独立样本**的结构。
+//
+// 这里给这条路径（且只有这条路径）把每帧样本数提高到 N：方差 ÷ sqrt(N)，
+// 与历史长度相乘。rngState 由 inout 链式推进 ⇒ N 个样本相互独立。
+// 动态（移动）光源保持单样本 —— 它必须逐帧响应，不该被平均拖慢。
+// 调用点：evaluateVPTCandidateDirectTemporal（透明/水下接收面，唯一消费者）。
+// A/B：-DVPT_TRANSPARENT_RECEIVER_RIS_SAMPLES=1 回到单样本。
+// =====================================================
+#ifndef VPT_TRANSPARENT_RECEIVER_RIS_SAMPLES
+#define VPT_TRANSPARENT_RECEIVER_RIS_SAMPLES 4
+#endif
+
+vec3 evaluateVPTRISDirectLightingMultiSample(
+    vec3 hitPos,
+    vec3 hitNormal,
+    vec3 hitAlbedo,
+    vec3 geometricFaceNormal,
+    inout uint rngState
+)
+{
+    vec3 cameraPosition =
+        (cam.viewInverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+    float receiverCameraDistance = length(hitPos - cameraPosition);
+
+    vec3 voxelDirect = vec3(0.0);
+    for(int sampleIndex = 0;
+        sampleIndex < VPT_TRANSPARENT_RECEIVER_RIS_SAMPLES;
+        ++sampleIndex)
+    {
+        voxelDirect += evaluateVPTRISDirectLightingSingle(
+            hitPos, hitNormal, hitAlbedo, geometricFaceNormal, rngState);
+    }
+    voxelDirect *= 1.0 / float(VPT_TRANSPARENT_RECEIVER_RIS_SAMPLES);
+
+    return voxelDirect + evaluateDynamicLightRISDirect(
+        hitPos, hitNormal, hitAlbedo, receiverCameraDistance,
+        vec3(-1.0), -1.0, 1.0, rngState);
 }
 
 // VPT-3.4A: cosine-sample one true voxel surface, then read that surface's
@@ -5161,8 +5312,14 @@ vec3 evaluateVPTPrimaryTemporal(
 // 为什么这是治"均匀残留颗粒"的正解：这份内容写不进主 G-buffer，RR 拿不到它的
 // 表面记录，它的时域平均**只有**这一份 rgen 历史；RR 只能在空间上再帮一层。
 // =====================================================
+// 2026-10-24：48 -> 96。这是"透过玻璃/水看到的接收面"唯一的时域平均，残余方差
+// 1/sqrt(N)：48 帧 ≈14%、96 帧 ≈10%。本地光发射体（火把等）静态，长历史没有
+// 拖影代价；动态光源不走这份历史（evaluateDynamicLightRISDirect 每帧现算）。
+// 与 VPT_TRANSPARENT_RECEIVER_RIS_SAMPLES=4 相乘，总残余约为此前的 1/2.9。
+// 代价：玻璃后光照突变（放/拆火把）的收敛约 1.6 秒（60fps）。
+// A/B：-DVPT_TRANSPARENT_HISTORY_FRAMES=48 回到上一档。
 #ifndef VPT_TRANSPARENT_HISTORY_FRAMES
-#define VPT_TRANSPARENT_HISTORY_FRAMES 48.0
+#define VPT_TRANSPARENT_HISTORY_FRAMES 96.0
 #endif
 
 
@@ -5553,11 +5710,60 @@ vec3 evaluateVPTCandidateDirectTemporal(
     // is bounded by the real face (relief texels tilted past the horizon no
     // longer light up).  vec3(0) = old behaviour.
     // 2026-10-07：透明接收路径拿不到材质 ⇒ 哨兵（移动光源退回纯 Lambert）。
-    vec3 currentRadiance = evaluateVPTRISDirectLighting(
+    // 2026-10-24：改走多样本变体（见 evaluateVPTRISDirectLightingMultiSample 处
+    // 的完整推导）—— 本函数是它的唯一消费者；rngState 链式推进，样本相互独立。
+    vec3 currentRadiance = evaluateVPTRISDirectLightingMultiSample(
         hitPosition, hitNormal, hitAlbedo, receiverGeometricNormal,
-        vec3(-1.0), -1.0, 1.0,
         temporalSeed
     );
+
+#ifndef VPT_TRANSPARENT_FIREFLY_CLAMP
+#define VPT_TRANSPARENT_FIREFLY_CLAMP 1
+#endif
+#if VPT_TRANSPARENT_FIREFLY_CLAMP
+    // =====================================================
+    // 2026-10-24：火萤钳制（修"静止时玻璃上/后的孤立亮点"）。
+    //
+    // 2026-09-25 消融对同形症状（"sparse bright specks behind glass"）的结论：
+    // 孤立亮点 = 大方差估计量的**重尾样本**，不是滤波/引导问题。多样本（4）
+    // 把方差压了 2 倍（用户实测"变少了"），但重尾仍在：RIS 选中"半遮挡的亮
+    // 发射体"时，该帧样本远超均值，进历史后被 EMA 拉成一串缓慢衰减的亮点，
+    // 静止时尤其显眼（DLSS-RR 把它当信号反复平均）。
+    //
+    // 这里把当帧样本的亮度钳到**历史均值的 8 倍**：静态火把场景几乎无偏
+    // （真实直射不会跳到 8 倍均值以上并停住），而重尾直接消失。三个护栏：
+    //   · 只在位置判据通过（同一接收面）时钳 —— 此时历史均值才有意义；
+    //   · 历史计数 < 4 或历史亮度 <= 1e-3 时不钳（均值未立起/纯黑起点，
+    //     否则 8×0=0 会把第一盏灯永久压黑）；
+    //   · 只压亮度标量，不动色度方向。
+    // 代价：玻璃后光照真跳变（放一盏更亮的灯）的收敛慢几帧（钳顶逐帧让位）。
+    // A/B：-DVPT_TRANSPARENT_FIREFLY_CLAMP=0 回到无钳制。
+    // =====================================================
+    if(reprojectOk && positionOk &&
+        previousHistory.radianceAndSampleCount.w >= 4.0)
+    {
+        float historyLuma =
+            dot(
+                max(previousHistory.radianceAndSampleCount.rgb, vec3(0.0)),
+                vec3(0.2126, 0.7152, 0.0722)
+            );
+        if(historyLuma > 1.0e-3)
+        {
+            float sampleLuma =
+                dot(
+                    max(currentRadiance, vec3(0.0)),
+                    vec3(0.2126, 0.7152, 0.0722)
+                );
+            float fireflyCeiling =
+                8.0 * historyLuma;
+            if(sampleLuma > fireflyCeiling)
+            {
+                currentRadiance *= fireflyCeiling / sampleLuma;
+            }
+        }
+    }
+#endif
+
     // 历史携带量（见 VPT_TRANSPARENT_HISTORY_NORMAL_DECAY）：
     //   位置判据通过 + 法线通过 ⇒ 全额携带；
     //   位置判据通过 + 法线失败 ⇒ 按比例衰减（间歇失配不该扔掉整份历史）；
@@ -5605,7 +5811,53 @@ vec3 evaluateVPTCandidateDirectTemporal(
     // 这条路径只有透明接收面（玻璃/水后面的接收面）在用，见
     // VPT_TRANSPARENT_HISTORY_FRAMES 处的说明：它是这份内容**唯一**的时域
     // 平均来源（RR 拿不到它的 G-buffer 记录），所以这里必须给足帧数。
-    float nextCount = min(oldCount + 1.0, VPT_TRANSPARENT_HISTORY_FRAMES);
+    //
+    // =====================================================
+    // 2026-10-24 第三轮补丁：运动自适应历史封顶（修"残影滞留"）
+    //
+    // 拖尾机制：静止时历史收敛、没有拖尾；相机移动时，位置判据的容差
+    // （抖动差 + 0.75px 邻像素余量，按接收面视深放大）会让"接收面缓慢漂移"
+    // 的每一帧都判通过 —— 于是长历史以**全权重**拖着几十帧前那个接收面的旧
+    // 光照走。以前 1spp 噪声大，拖尾被颗粒盖住；16 提案把噪底压干净之后
+    // 拖尾就显形了（用户报告的"残影滞留"）。
+    //
+    // 修法：用玻璃面点在**前后两帧投影的屏幕滑移**（像素）当运动信号，历史
+    // 封顶按滑移缩短 —— 走动（滑移大）时历史立刻掉到几帧，拖尾当场消失；
+    // 静止（滑移 ≈ 两帧 jitter 差 ≤ ~1px）时满历史不变，噪点收益不受损。
+    // 两帧投影各自带本帧/上帧 jitter，其差 ≤ ~1px，用 1.5px 死区吞掉，
+    // 不依赖 jitter 的符号约定。封顶平滑无阈值跳变：cap = 96 / (1 + 超出
+    // 死区的滑移 × 8)。alpha 随 cap 立即变大 ⇒ 旧值几帧内被冲掉；运动停止
+    // 后计数从 cap 重新爬回满。这同时修掉火萤钳制在"亮区入场"时的爬升慢：
+    // 运动中 alpha 变大，钳顶跟着历史均值快速让位。
+    // A/B：-DVPT_TRANSPARENT_MOTION_CAP=0 回到固定历史（有拖尾）。
+    // =====================================================
+#ifndef VPT_TRANSPARENT_MOTION_CAP
+#define VPT_TRANSPARENT_MOTION_CAP 1
+#endif
+    float historyCap = VPT_TRANSPARENT_HISTORY_FRAMES;
+#if VPT_TRANSPARENT_MOTION_CAP
+    mat4 slipPreviousWorldToClip =
+        inverse(cam.prevProjInverse) *
+        inverse(cam.prevViewInverse);
+    mat4 slipCurrentWorldToClip =
+        inverse(cam.projInverse) *
+        inverse(cam.viewInverse);
+    vec4 slipPreviousClip =
+        slipPreviousWorldToClip * vec4(matchPosition, 1.0);
+    vec4 slipCurrentClip =
+        slipCurrentWorldToClip * vec4(matchPosition, 1.0);
+    if(slipPreviousClip.w > 1.0e-5 && slipCurrentClip.w > 1.0e-5)
+    {
+        float slipPixels = length(
+            (slipCurrentClip.xy / slipCurrentClip.w -
+                slipPreviousClip.xy / slipPreviousClip.w) *
+            (0.5 * vec2(renderSize))
+        );
+        historyCap = VPT_TRANSPARENT_HISTORY_FRAMES /
+            (1.0 + max(slipPixels - 1.5, 0.0) * 8.0);
+    }
+#endif
+    float nextCount = min(oldCount + 1.0, historyCap);
     float alpha = 1.0 / nextCount;
     // 只有真的携带到历史（位置判据通过）时才混合；硬清零那一路保持"当帧即结果"。
     vec3 filteredRadiance = (oldCount > 0.0)
@@ -6294,7 +6546,7 @@ void traceDiffuseSer(vec3 origin, vec3 direction, uint bouncePhase)
         origin,
         0.001,
         direction,
-        10000.0,
+        perfGiTraceMaxDistance(10000.0),
         gl_RayFlagsNoneEXT,
         0xff,
         bouncePhase
@@ -6441,6 +6693,8 @@ vec3 traceVptLocalLightVisibility(
     hit.albedo = vec3(1.0);
     hit.parallaxRayTravel = 0.0;
     hit.glassAlpha = 0.0;
+    hit.lastGlassFaceT = -1.0;
+    hit.glassFaceBudget = 0.0;
     hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
 
     traceRayEXT(
@@ -11747,6 +12001,8 @@ for(
                 hit.parallaxRayTravel =
                     0.0;
 
+                hit.lastGlassFaceT = -1.0;
+                hit.glassFaceBudget = 0.0;
                 hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
                 // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
                 // 见 HANDOFF-2026-10-21-VERTEX-32B-TERRAIN.md §8。否则累乘起点是
@@ -12555,6 +12811,8 @@ vec3 evaluateSecondaryDiffuseLocalLights(
             hit.parallaxRayTravel =
                 0.0;
 
+            hit.lastGlassFaceT = -1.0;
+            hit.glassFaceBudget = 0.0;
             hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
             // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
             // 见 HANDOFF-2026-10-21-VERTEX-32B-TERRAIN.md §8。否则累乘起点是
@@ -14709,22 +14967,30 @@ vec3 localEntityIrradiance =
         //   语义相同且权威。某些路径下它可能是 vec3(0)（12998/13237 的初始化）
         //   ⇒ 下面的 0.02 下限会把它导向"比值很大 ⇒ 钳到 1 ⇒ 观感不变"，
         //   是安全退化，不会出 NaN。
-        float receiverAlbedoLuma =
-            max(
-                dot(
-                    clamp(
-                        transmissionInfo.receiverAlbedo,
-                        vec3(0.0),
-                        vec3(1.0)
-                    ),
-                    TINT_LUMA_WEIGHTS
-                ),
-                0.02
-            );
+        //
+        // =================================================
+        // 2026-10-24 第二轮：取光来源改为**确定性**量（与 GI 侧清玻璃分支
+        // GI_CLEAR_GLASS_GI_AS_AIR，2026-10-13 同源：evaluateVLIEmitterRadianceAtHit
+        // + getSurfaceAmbientRadiance）。
+        //
+        // 旧档拿 behindRadiance 的亮度当光量代理 —— 它含本地光 RIS 的时域残差，
+        // 而下面的除以 receiverAlbedoLuma 把残差按 1/albedo 放大：深色接收面
+        // （黑石/深色木框）上 litScale 被推到 1 饱和，恰好落在玻璃贴图的白色
+        // 边框纹素上 ⇒ 静止时沿玻璃行边界的一排饱和白点（用户截图里的点线）。
+        // 残差减半只让"刚饱和"的边缘点少一点，饱和点本身纹丝不动 —— 这就是
+        // 第二轮钳制"看不出变化"的原因。确定性来源没有估计残差，放大路径
+        // 整个消失。标定不变（reference 仍 1.0，GI 侧同值）。
+        // =================================================
+        vec3 glassLitProxyEnv =
+            evaluateVLIEmitterRadianceAtHit(
+                transmissionInfo.receiverWorldPos,
+                transmissionInfo.receiverNormal,
+                transmissionInfo.receiverAlbedo
+            ) +
+            getSurfaceAmbientRadiance();
 
         float receiverLightLuma =
-            dot(behindRadiance, TINT_LUMA_WEIGHTS) /
-            receiverAlbedoLuma;
+            dot(glassLitProxyEnv, TINT_LUMA_WEIGHTS);
 
         float litGlassTintScale =
             clamp(
@@ -17964,6 +18230,64 @@ bool dhFarNeighborPoint(
     return true;
 }
 
+// ============================================================================
+// 2026-10-24 半分辨率 GI 的编译期口径（只有 _deploy_stale_spv.py 里的
+// rt_test_gi_half 目标定义 GI_HALFRES=1；其余变体走下面的 0）。
+// ============================================================================
+#ifndef GI_HALFRES
+#define GI_HALFRES 0
+#endif
+
+#if !GI_HALFRES
+// ============================================================================
+// 3×3 深度感知上采样（HANDOFF-2026-10-24-GI-HALFRES.md §3）
+//
+// giHalfImage 的每个 texel 覆盖 2×2 个全分辨率像素，四帧轮转才把四个子像素各算一次
+// ⇒ 全分辨率像素拿到的往往是**同块内相邻子像素、最多 3 帧前**的辐照度。所以：
+//   · 权重 w = 1/(1e-3 + |z0 - z1|)：深度一致才接近双线性展开，跨物体边缘退化成
+//     最近邻（HANDOFF §6.4：宁可退化也不要跨玻璃/水面边缘漏光）；
+//   · 返回的是**辐照度**，乘回本像素自己的 brdfWeight 由调用点做（解调/再调制）。
+// 不做材质一致性判据：这张图只有 4 个通道，matId 无处可放；玻璃/水面与实体在
+// **深度**上就是两道不同的面，深度权重已经把它们挡住。
+// ============================================================================
+vec3 upsampleGiHalf(ivec2 fullCoord, float centerViewDepth)
+{
+    const ivec2 halfSize = imageSize(giHalfImage);
+    // 半图 texel 与全分辨率像素的映射：GI 变体写的是 texel = launchID，
+    // 对应全分辨率像素 launchID * 2 + phase ⇒ 反查就是 fullCoord / 2（整数截断）。
+    const ivec2 baseCoord = ivec2(fullCoord.x / 2, fullCoord.y / 2);
+    const ivec2 maxCoord = max(halfSize - ivec2(1), ivec2(0));
+
+    vec3 irradianceSum = vec3(0.0);
+    float weightSum = 0.0;
+
+    for(int tapY = -1; tapY <= 1; ++tapY)
+    {
+        for(int tapX = -1; tapX <= 1; ++tapX)
+        {
+            const ivec2 tapCoord = clamp(
+                baseCoord + ivec2(tapX, tapY),
+                ivec2(0),
+                maxCoord);
+
+            const vec4 tapGi = imageLoad(giHalfImage, tapCoord);
+            const float weight =
+                1.0 / (1.0e-3 + abs(centerViewDepth - tapGi.a));
+
+            irradianceSum += tapGi.rgb * weight;
+            weightSum += weight;
+        }
+    }
+
+    if(weightSum <= 0.0)
+    {
+        return vec3(0.0);
+    }
+
+    return irradianceSum / weightSum;
+}
+#endif
+
 void main() {
     ivec2 size = imageSize(image);
 
@@ -17985,8 +18309,21 @@ void main() {
     }
 
 
+#if GI_HALFRES
+    // 2026-10-24 半分辨率 GI 变体：dispatch 是 (w+1)/2 × (h+1)/2，每个 invocation
+    // 负责 2×2 块里的**一个**子像素；相位 (frameCount&1, frameCount>>1&1) 逐帧轮转，
+    // 四帧覆盖整个 2×2。
+    // ⚠ 这是本文件 pixelCoord 的**唯一来源**（HANDOFF §4 已核实全文件只有这一处派生），
+    //   所以只改这里就能把整条主射线 + 材质求值搬到一个子像素上。
+    ivec2 pixelCoord =
+        ivec2(gl_LaunchIDEXT.xy) * 2 +
+        ivec2(
+            int(cam.frameCount & 1u),
+            int((cam.frameCount >> 1u) & 1u));
+#else
     ivec2 pixelCoord =
         ivec2(gl_LaunchIDEXT.xy);
+#endif
 
 #if SHARC_UPDATE
     // ------------------------------------------------------------------------
@@ -18057,6 +18394,9 @@ void main() {
         // 本帧不负责这个像素：不写任何输出，上一帧的值原样留在各目标图里。
         return;
     }
+
+    // [0] 被统计的像素数（所有比率的分母）
+    perfRayStatAdd(0u, 1u);
 
     const int SAMPLES_PER_FRAME =
         max(1, int(rtUserSpp + 0.5));
@@ -18147,9 +18487,10 @@ vec3 rrStableGlassRadiance =
     for (int s = 0;
          s < SAMPLES_PER_FRAME;
          ++s) {
+// 2026-10-24：同上，用 pixelCoord 而不是 launchID —— 半分辨率变体里同一个
+// launchID 每四帧才轮到一次，用 launchID 播种会让四个子像素共用同一串随机数。
 seed =
-    gl_LaunchIDEXT.y * uint(size.x) +
-    gl_LaunchIDEXT.x +
+    uint(pixelCoord.y * int(size.x) + pixelCoord.x) +
     cam.frameCount * 97253u +
     uint(s * 19937u);
 
@@ -18158,15 +18499,21 @@ pcg_hash(seed);
 
 // Primary camera sampling 不再消耗 PCG。
 // 4 个 sample 使用相同的帧级 Halton jitter。
+// 2026-10-24：像素中心改用 pixelCoord，**不再直读 gl_LaunchIDEXT**。
+// 主变体里 pixelCoord == ivec2(gl_LaunchIDEXT.xy)，所以这一句是逐位等价的重写；
+// 半分辨率 GI 变体里 pixelCoord = launchID*2+phase ⇒ 这条射线才是本 invocation
+// 真正负责的那个全分辨率像素的射线（否则 GI 会把左上角四分之一的几何写进半图）。
+// 分母同理换成 imageSize(image)（全分辨率）：GI 变体的 gl_LaunchSizeEXT 是半分辨率，
+// 用它算 UV 会把整个视锥缩小一半。
 vec2 pixelCenter =
-    vec2(gl_LaunchIDEXT.xy) +
+    vec2(pixelCoord) +
     vec2(0.5) +
     frameJitter;
 
 
 vec2 inUV =
     pixelCenter /
-    vec2(gl_LaunchSizeEXT.xy);
+    vec2(size);
 
         vec2 d = inUV * 2.0 - 1.0;
         d.y = -d.y;
@@ -18619,6 +18966,11 @@ if(
 // Main shading and all ray origins remain untouched.
 // =====================================================
 
+#if !GI_HALFRES
+// 2026-10-24 半分辨率 GI 变体**不写** G-buffer（depthImage / dlssMotionImage）：
+// 它与主变体写的是同一批像素，而两条 dispatch 之间没有屏障 ⇒ 同址两写是未定义
+// 顺序，DLSS 可能吃到半分辨率变体那份（天空像素的 MV 还是按 launchID 算的）。
+// 主变体本来就对每个像素无条件写一遍，所以这里跳过不影响任何输出。
 if (s == 0)
 {
     // Minecraft 26.2 reversed-Z:
@@ -18865,6 +19217,7 @@ if (s == 0)
     // 调试图用（DBG_SHOW_MV）：把写出去的那个值留到最终 imageStore 处画出来。
     rtDebugPrimaryMotion = primaryMotionPixels;
 }
+#endif
 
 
 vec3 sampleColor =
@@ -18874,7 +19227,18 @@ vec3 sampleColor =
         // 步骤 2: ClosestHit 结果判定 (若未击中则输出天空)
         // ==========================================
 if (primaryHitDistance < 0.0) {
-
+#if GI_HALFRES
+    // 2026-10-24 半分辨率 GI 变体：天空像素没有间接光。写"零辐照度 + 极远深度"
+    // 的哨兵后**立即 return** —— 不能继续落到 24156 起的 RR guide 写入，那些由
+    // 主变体独占（两个 pass 同时写同一批 guide 是数据竞争，见 HANDOFF §6.6）。
+    // 60000 是 16F 能表示的大值；深度权重 1/(1e-3+60000) 让相邻命中像素几乎不吃它。
+    imageStore(
+        giHalfImage,
+        ivec2(gl_LaunchIDEXT.xy),
+        vec4(0.0, 0.0, 0.0, 60000.0)
+    );
+    return;
+#endif
 
     sampleColor =
         payload.albedo;
@@ -19833,6 +20197,12 @@ if(perfL10DisableRtao())
 aoSamples =
     min(aoSamples, perfL10AoSampleCap());
 
+// [8] 本像素是否跑 RTAO
+if(aoSamples > 0)
+{
+    perfRayStatAdd(8u, 1u);
+}
+
 float maxDist =
     5.5;
 
@@ -19869,6 +20239,9 @@ for(
     if(cam.perfSerAb.w == 0u)
 #endif
     {
+        // [9] 真实发出的 AO 射线（perfSerAb.w=1 时整条 trace 被跳过，不计）
+        perfRayStatAdd(9u, 1u);
+
         traceRayEXT(
             topLevelAS,
 
@@ -20196,6 +20569,8 @@ for (int si = 0;
     hit.glassAlpha =
         0.0;
 
+    hit.lastGlassFaceT = -1.0;
+    hit.glassFaceBudget = 0.0;
     hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
     // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
     // 见 HANDOFF-2026-10-21-VERTEX-32B-TERRAIN.md §8。否则累乘起点是
@@ -20347,6 +20722,8 @@ if(
     hit.glassAlpha =
         0.0;
 
+    hit.lastGlassFaceT = -1.0;
+    hit.glassFaceBudget = 0.0;
     hit.state =
         makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
     // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
@@ -20456,6 +20833,8 @@ if(
             hit.glassAlpha =
                 0.0;
 
+            hit.lastGlassFaceT = -1.0;
+            hit.glassFaceBudget = 0.0;
             hit.state =
                 makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
             // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
@@ -21763,6 +22142,16 @@ int giBounceLimit =
         ? min(MAX_DIFFUSE_BOUNCES, 1)
         : MAX_DIFFUSE_BOUNCES;
 
+// [10]/[11] 远场像素分布（GI 在 384 格外被压到 1/32，见 23347 行注释）
+if(rtLodDistance >= 384.0)
+{
+    perfRayStatAdd(11u, 1u);
+}
+else if(rtLodDistance >= 160.0)
+{
+    perfRayStatAdd(10u, 1u);
+}
+
 
 // =====================================================
 // Diffuse GI distance sampling
@@ -21778,9 +22167,35 @@ bool runDiffuseGI =
 float diffuseGILodWeight =
     rtLodDiffuseGiWeight;
 
-
+// ============================================================================
+// 2026-10-24 半分辨率 GI（HANDOFF-2026-10-24-GI-HALFRES.md）
+//
+// 整条 GI 回路（本行到下面"结束 GI while"那个闭括号）用**运行时** uniform 分支包住：
+//   cam.giHalfParams.x == 0 → 旧路径，逐语义等价于改动前（A/B 的基线臂）
+//   cam.giHalfParams.x != 0 → 跳过，改从 giHalfImage 做深度感知上采样（见下面）
+//
+// 为什么不用 #if 编译期删除：整个评估阶段只允许**一次冷编**（HANDOFF §7），旧路径
+// 必须能随时切回，否则做 A/B 要再等一次 15 分钟。代价是寄存器/occupancy 仍按
+// "含 GI 回路"算 ⇒ 收益会打折。先拿到上界；确认值得后第二次冷编再改成编译期删除
+// （那时已有数值记录，不再需要基线臂）。
+//
+// ⚠ 花括号**故意**从 diffuseGILodWeight 之后才开始：indirectLight（21855）、
+//   dbgLocalBounceAccum（21858）与 diffuseGILodWeight 本身在回路结束后仍被
+//   远场尾部读，必须留在外层作用域（2026-10-24 用声明扫描核实过，块内 depth-0
+//   声明共 17 个，只有这 3 个在块外有引用）。
+// ============================================================================
+#if !GI_HALFRES
+if (cam.giHalfParams.x == 0.0f)
+#endif
+{
 // 2026-10-11 5b-3：回路永远跑（主命中不再提前退出）。截断发生在**回路内部**的
 // 间接命中处 —— 见下面 "5b-3：SHaRC 查询" 段。
+// [1] 本像素是否跑 diffuse GI
+if(runDiffuseGI)
+{
+    perfRayStatAdd(1u, 1u);
+}
+
 while(
     runDiffuseGI &&
     diffuseBounceCount <
@@ -21821,13 +22236,23 @@ while(
                         // Uses a private RNG state so the main sampling stream is not
                         // perturbed and the stage stays comparable to the baseline.
                         {
-                            float rrLuminance = max(
+                            // 2026-10-23：变量旧名 rrLuminance 是**误名** —— 这里算的是
+                            // 最大分量 max(r,g,b)，不是亮度 0.2126r+0.7152g+0.0722b。
+                            // 用最大分量而非亮度是刻意的：按亮度度量会让饱和色（纯蓝、
+                            // 纯红）拿到偏低的生存率，颜色分量之间方差失衡。
+                            //
+                            // ⚠ 没有 etaScale（参考实现有 `× etaScale` 一项）：本工程玻璃
+                            // 走薄壁 pane 判据、不做体内折射，进/出界面 η 相消 ⇒ 净
+                            // etaScale ≡ 1。**不是"不需要"，是"恒等于 1"** —— 将来接厚
+                            // 介质时，要同时补 etaScale 的累积与它在下面的度量里的乘法。
+                            // 曲线对比与"为什么不照抄参考实现"见 docs/decisions/russian-roulette.md。
+                            float rrMaxComponent = max(
                                 max(currentThroughput.r, currentThroughput.g),
                                 currentThroughput.b
                             );
 
                             float rrLow = clamp(
-                                0.85 - sqrt(max(rrLuminance, 0.0)),
+                                0.85 - sqrt(max(rrMaxComponent, 0.0)),
                                 0.0,
                                 1.0
                             );
@@ -21869,11 +22294,24 @@ while(
 
                             if(rrRoll >= rrSurvival)
                             {
+                                // [6] 被轮盘终止、根本没发出去的射线
+                                perfRayStatAdd(6u, 1u);
                                 break;
                             }
 
                             currentThroughput /= rrSurvival;
                         }
+                    }
+
+                    // [2] GI 射线数；[3]/[4] 按弹射序号；[7] 水里发出的
+                    perfRayStatAdd(2u, 1u);
+                    perfRayStatAdd(
+                        diffuseBounceCount == 0 ? 3u : 4u,
+                        1u
+                    );
+                    if(currentInsideWater)
+                    {
+                        perfRayStatAdd(7u, 1u);
                     }
 
                     hit.hitDistance = 1.0;
@@ -21903,13 +22341,15 @@ while(
                     }
                     else
                     {
-                        traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, 0xff, 0, 0, 0, currentOrigin, 0.001, currentDir, 10000.0, 0);
+                        traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, 0xff, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
                     }
 #else
-                    traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, 0xff, 0, 0, 0, currentOrigin, 0.001, currentDir, 10000.0, 0);
+                    traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, 0xff, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
 #endif
 
 if (payload.hitDistance < 0.0) {
+    // [5] GI 未命中（打空 = 直接吃天空项）
+    perfRayStatAdd(5u, 1u);
 #if SHARC_UPDATE
     // 参考 Pathtracer.hlsl:470-483：未命中 ⇒ 把天空辐射度交给 SharcUpdateMiss，
     // 由它按每个**已记录顶点**的 sampleWeights 回填（这就是"到该顶点的入射辐射度"
@@ -22567,6 +23007,40 @@ vec3 nextUnifiedEmission =
         nextNormal,
         nextAlbedo
     );
+
+// =====================================================
+// 2026-10-24 R1：GI 命中处发光项的萤火虫钳制（对齐 DLSS-RR 输入口径）
+//
+// 病灶：GI 命中点的发光体没有 NEE（本工程只对太阳做 NEE），只能靠 BSDF 偶然
+// 命中发光方块；2026-09-30 的注释写着"经典 0.31 RIS 链在 GI 顶点**无条件**叠加
+// 该项"。单次命中即数十倍均值 ⇒ 落在 RR 时域核里既夹不掉、又会被它的
+// anti-firefly 削掉能量，表现为"孤立亮点 + 该亮的地方反而暗"。
+//
+// 为什么不动轮盘下限：rrSurvival = max(1 - rrTermination, 0.20)，而
+// rrTermination 由 0.85-sqrt(max(throughput)) 决定；albedo 0.15 时生存已是
+// 0.79（权重 1.27×），下限 0.20 只在 albedo<0.05 的近黑表面才夹住 —— 抬它是空操作。
+//
+// 钳制的是"发光项"（自发光 + VLI 辉光）合计，不是整条路径：经过 albedo/throughput
+// 调制的部分不动，所以背光面间接光不会整体变平。
+// A/B：-DGI_FIREFLY_EMISSION_MAX=0 关闭（逐位回到改动前）。
+// =====================================================
+#ifndef GI_FIREFLY_EMISSION_MAX
+#define GI_FIREFLY_EMISSION_MAX 4.0
+#endif
+
+    {
+        const float emissionMax =
+            float(GI_FIREFLY_EMISSION_MAX);
+
+        if(emissionMax > 0.0)
+        {
+            nextUnifiedEmission =
+                min(
+                    nextUnifiedEmission,
+                    vec3(emissionMax)
+                );
+        }
+    }
 // =====================================================
 // A3-2
 // Secondary hit PBR direct sun lighting
@@ -23255,8 +23729,51 @@ currentDir =
 
 // 结束 GI while
 }
-// 2026-10-11 5b-3：原 5b-2"命中缓存 ⇒ 跳过整条 GI"的 if 已撤（查询挪进回路）。
+}   // 结束 2026-10-24 的 giHalfParams.x 运行时分支（起点见 diffuseGILodWeight 之后）
 
+#if GI_HALFRES
+// ============================================================================
+// 2026-10-24 半分辨率 GI 变体：写 giHalfImage 后**立即 return**。
+// · rgb = 解调后的辐照度（÷brdfWeight）：全分辨率主变体乘回**自己的** brdfWeight，
+//   于是半分辨率的材质权重不会被当成全分辨率的（2×2 内材质跳变不会直接漏光）。
+//   下限 1e-3 只是防近黑表面把 16F 撑爆，量级上仍是"除以 brdfWeight"。
+// · a = 主命中视深度（米）：与主变体用**同一公式**算，两次深度可直接相减。
+// · 挂点在 `indirectLight *= diffuseGILodWeight` **之前**：远场 LOD 折扣是显示侧
+//   近似，留在主变体按全分辨率像素自己乘（HANDOFF §6.5）。
+// · ⚠ 必须在这里 return：24156 起的 RR guide 写入由主变体独占（§6.6）。
+// · perfRayStatAdd 的口径在这里变成"半分辨率射线"（约 1/4），统计会失真（§6.8）。
+// ============================================================================
+{
+    const float giHalfViewDepth =
+        -(viewMatrix * vec4(hitPos, 1.0)).z;
+
+    imageStore(
+        giHalfImage,
+        ivec2(gl_LaunchIDEXT.xy),
+        vec4(
+            // min() 只为防 16F 溢出成 Inf：brdfWeight 下限 1e-3 ⇒ 最多放大 1000 倍，
+            // 而 1spp 的 GI 本来就会出现尖峰。Inf 一旦落进半图，3×3 会把一个像素的
+            // 萤火虫扩散成一小片；夹到 60000 之后至少仍是有限值（RR 能按亮斑夹掉）。
+            min(
+                indirectLight / max(brdfWeight, vec3(1.0e-3)),
+                vec3(60000.0)),
+            giHalfViewDepth
+        )
+    );
+}
+return;
+#else
+// giHalfParams.x != 0：间接光来自半分辨率 GI 图，乘回本像素的 brdfWeight。
+// 远场尾部（下面的 diffuseGILodWeight / farSlopeOcclusion / 环境底）照旧乘在它上面。
+if (cam.giHalfParams.x != 0.0f)
+{
+    indirectLight =
+        upsampleGiHalf(
+            pixelCoord,
+            -(viewMatrix * vec4(hitPos, 1.0)).z) *
+        max(brdfWeight, vec3(1.0e-3));
+}
+#endif
 
 indirectLight *=
     diffuseGILodWeight;
@@ -23732,6 +24249,25 @@ imageStore(
     pixelCoord,
     vec4(
         rrSpecularHitDistance,
+        0.0,
+        0.0,
+        0.0
+    )
+);
+
+// 2026-10-23：RR TransparencyHint。判据复用采样循环外已声明的两个每像素量：
+//   rrDeltaCrossedFlag             1 = 内容来自"穿过玻璃"的路径
+//   rrTransparentReceiverGuideValid 透明接收面接管了正面 guide 记录
+// 任一为真 ⇒ 该像素的可见颜色不是主表面自身的颜色 ⇒ RR 不该按主表面历史平均。
+// 不新增状态、不改变任何现有 guide 的语义。
+imageStore(
+    rrTransparencyHintImage,
+    pixelCoord,
+    vec4(
+        max(
+            rrDeltaCrossedFlag,
+            rrTransparentReceiverGuideValid ? 1.0 : 0.0
+        ),
         0.0,
         0.0,
         0.0

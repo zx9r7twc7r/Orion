@@ -410,7 +410,7 @@ public final class RTXSettingsConfig {
     public static synchronized CloudMsSettings getCloudMsSettings() { return cloudMsSettings; }
     public static synchronized void setCloudMsSettings(CloudMsSettings settings) {
         cloudMsSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // 参考重构（2026-10-02）phi_fwd 四件套。与 HPVolumeCloud VolumetricClouds.hlsl
@@ -445,7 +445,7 @@ public final class RTXSettingsConfig {
     public static synchronized CloudPhiSettings getCloudPhiSettings() { return cloudPhiSettings; }
     public static synchronized void setCloudPhiSettings(CloudPhiSettings settings) {
         cloudPhiSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // 参考重构（2026-10-02）受光逻辑的三个尺度量。与 HPVolumeCloud
@@ -480,7 +480,7 @@ public final class RTXSettingsConfig {
     public static synchronized CloudLightSettings getCloudLightSettings() { return cloudLightSettings; }
     public static synchronized void setCloudLightSettings(CloudLightSettings settings) {
         cloudLightSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
  // 平面云。9 个分量对应 CameraUBO.highCloudParams
@@ -533,7 +533,7 @@ public final class RTXSettingsConfig {
     public static synchronized PlaneCloudSettings getPlaneCloudSettings() { return planeCloudSettings; }
     public static synchronized void setPlaneCloudSettings(PlaneCloudSettings settings) {
         planeCloudSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // 参考重构（2026-10-02）云底软化（形状）+ 两级步进阈值。与
@@ -562,7 +562,7 @@ public final class RTXSettingsConfig {
     public static synchronized CloudShapeSettings getCloudShapeSettings() { return cloudShapeSettings; }
     public static synchronized void setCloudShapeSettings(CloudShapeSettings settings) {
         cloudShapeSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // 参考重构（2026-10-02）物理月光项（CameraUBO.cloudMoonParams，偏移 1120）。
@@ -586,7 +586,7 @@ public final class RTXSettingsConfig {
     public static synchronized CloudMoonSettings getCloudMoonSettings() { return cloudMoonSettings; }
     public static synchronized void setCloudMoonSettings(CloudMoonSettings settings) {
         cloudMoonSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // 第四阶段（2026-10-02）细节/形状旋钮（CameraUBO.cloudShape2Params，偏移 1136）。
@@ -613,7 +613,7 @@ public final class RTXSettingsConfig {
     public static synchronized CloudShape2Settings getCloudShape2Settings() { return cloudShape2Settings; }
     public static synchronized void setCloudShape2Settings(CloudShape2Settings settings) {
         cloudShape2Settings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // =====================================================================
@@ -652,7 +652,7 @@ public final class RTXSettingsConfig {
     public static synchronized CloudAmbientSettings getCloudAmbientSettings() { return cloudAmbientSettings; }
     public static synchronized void setCloudAmbientSettings(CloudAmbientSettings settings) {
         cloudAmbientSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // 2026-10-14 日落天光修正（CameraUBO.cloudSkyHueParams，偏移 1472）。
@@ -701,7 +701,7 @@ public final class RTXSettingsConfig {
     public static synchronized CloudSkyHueSettings getCloudSkyHueSettings() { return cloudSkyHueSettings; }
     public static synchronized void setCloudSkyHueSettings(CloudSkyHueSettings settings) {
         cloudSkyHueSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // 2026-10-15 云地面反射与视觉回退参数（CameraUBO.cloudPhysicsParams，偏移 1488）。
@@ -731,7 +731,7 @@ public final class RTXSettingsConfig {
     public static synchronized CloudPhysicsSettings getCloudPhysicsSettings() { return cloudPhysicsSettings; }
     public static synchronized void setCloudPhysicsSettings(CloudPhysicsSettings settings) {
         cloudPhysicsSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // #6 散射染色 + MS 级联三参数（CameraUBO.cloudMsParams2）。参考 _ScatteringTint
@@ -768,7 +768,7 @@ public final class RTXSettingsConfig {
     public static synchronized CloudMs2Settings getCloudMs2Settings() { return cloudMs2Settings; }
     public static synchronized void setCloudMs2Settings(CloudMs2Settings settings) {
         cloudMs2Settings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // #5 光路太阳色 + #7 粉末口径（CameraUBO.cloudLightParams2）。参考
@@ -807,7 +807,7 @@ public final class RTXSettingsConfig {
     public static synchronized CloudLight2Settings getCloudLight2Settings() { return cloudLight2Settings; }
     public static synchronized void setCloudLight2Settings(CloudLight2Settings settings) {
         cloudLight2Settings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // #3 剖面云型（CameraUBO.cloudProfileParams，**密度场共享**）。参考
@@ -833,7 +833,7 @@ public final class RTXSettingsConfig {
     public static synchronized CloudProfileSettings getCloudProfileSettings() { return cloudProfileSettings; }
     public static synchronized void setCloudProfileSettings(CloudProfileSettings settings) {
         cloudProfileSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // #4 两族侵蚀（CameraUBO.cloudDetailParams，**密度场共享**）。参考
@@ -865,7 +865,7 @@ public final class RTXSettingsConfig {
     public static synchronized CloudDetailSettings getCloudDetailSettings() { return cloudDetailSettings; }
     public static synchronized void setCloudDetailSettings(CloudDetailSettings settings) {
         cloudDetailSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // 2026-10-23 **体积雾扩展四项**（CameraUBO.fogExtrasParams，偏移 1376）。
@@ -909,7 +909,7 @@ public final class RTXSettingsConfig {
     public static synchronized FogExtrasSettings getFogExtrasSettings() { return fogExtrasSettings; }
     public static synchronized void setFogExtrasSettings(FogExtrasSettings settings) {
         fogExtrasSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // 2026-10-23 雨天地面雾浪（rain-driven ground mist wisps）。
@@ -945,7 +945,7 @@ public final class RTXSettingsConfig {
     public static synchronized FogWispSettings getFogWispSettings() { return fogWispSettings; }
     public static synchronized void setFogWispSettings(FogWispSettings settings) {
         fogWispSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
  // 2026-10-10 **#3 天光自遮挡 / #4 时域速度抑制**
@@ -982,7 +982,7 @@ public final class RTXSettingsConfig {
     public static synchronized CloudTemporalSettings getCloudTemporalSettings() { return cloudTemporalSettings; }
     public static synchronized void setCloudTemporalSettings(CloudTemporalSettings settings) {
         cloudTemporalSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // 2026-10-10 借鉴 **#1 云后空气透视 / #2 地面遮挡衰减**
@@ -1013,7 +1013,7 @@ public final class RTXSettingsConfig {
     public static synchronized CloudAerialSettings getCloudAerialSettings() { return cloudAerialSettings; }
     public static synchronized void setCloudAerialSettings(CloudAerialSettings settings) {
         cloudAerialSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // 批次2（2026-10-02）步进旋钮。4 个分量写入 CameraUBO.cloudMarchParams[4]；
@@ -1054,7 +1054,7 @@ public final class RTXSettingsConfig {
     public static synchronized CloudMarchSettings getCloudMarchSettings() { return cloudMarchSettings; }
     public static synchronized void setCloudMarchSettings(CloudMarchSettings settings) {
         cloudMarchSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // 批次3（2026-10-02）水体观感四件套。4 个分量写入 CameraUBO.waterParams[4]
@@ -1133,7 +1133,7 @@ public final class RTXSettingsConfig {
     public static synchronized WaterWaveSettings getWaterWaveSettings() { return waterWaveSettings; }
     public static synchronized void setWaterWaveSettings(WaterWaveSettings settings) {
         waterWaveSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // 参考 HPWaterWaveEquation.compute 的四个量：
@@ -1188,7 +1188,7 @@ public final class RTXSettingsConfig {
     public static synchronized WaterSssSettings getWaterSssSettings() { return waterSssSettings; }
     public static synchronized void setWaterSssSettings(WaterSssSettings settings) {
         waterSssSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     private static WaterSimWaveSettings waterSimWaveSettings = new WaterSimWaveSettings(
@@ -1196,7 +1196,7 @@ public final class RTXSettingsConfig {
     public static synchronized WaterSimWaveSettings getWaterSimWaveSettings() { return waterSimWaveSettings; }
     public static synchronized void setWaterSimWaveSettings(WaterSimWaveSettings settings) {
         waterSimWaveSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // 2026-10-03 FFT 频谱海面（Tessendorf/Phillips 谱）：**全距离**水面形态。
@@ -1238,7 +1238,7 @@ public final class RTXSettingsConfig {
     public static synchronized WaterFftSettings getWaterFftSettings() { return waterFftSettings; }
     public static synchronized void setWaterFftSettings(WaterFftSettings settings) {
         waterFftSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // 2026-10-03 后处理（新「后处理」设置页）：色彩映射 + 曝光/对比/饱和/gamma。
@@ -1284,7 +1284,7 @@ public final class RTXSettingsConfig {
     public static synchronized PostProcessingSettings getPostProcessingSettings() { return postProcessingSettings; }
     public static synchronized void setPostProcessingSettings(PostProcessingSettings settings) {
         postProcessingSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // 2026-10-02 波形本体（CameraUBO.waterWaveShapeParams，偏移 1248）。
@@ -1320,7 +1320,7 @@ public final class RTXSettingsConfig {
     public static synchronized WaterWaveShapeSettings getWaterWaveShapeSettings() { return waterWaveShapeSettings; }
     public static synchronized void setWaterWaveShapeSettings(WaterWaveShapeSettings settings) {
         waterWaveShapeSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     // 2026-10-15 **ROUTE C**（陡剖面波列 + 逐层黄金角方位旋转，唯一自然波后端）
@@ -1377,13 +1377,13 @@ public final class RTXSettingsConfig {
     public static synchronized WaterWaveAflSettings getWaterWaveAflSettings() { return waterWaveAflSettings; }
     public static synchronized void setWaterWaveAflSettings(WaterWaveAflSettings settings) {
         waterWaveAflSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     public static synchronized WaterParamsSettings getWaterParamsSettings() { return waterParamsSettings; }
     public static synchronized void setWaterParamsSettings(WaterParamsSettings settings) {
         waterParamsSettings = java.util.Objects.requireNonNull(settings);
-        save();
+        markDirty();
     }
 
     /**
@@ -1887,7 +1887,7 @@ public final class RTXSettingsConfig {
 
         if (reflexMode != mode) {
             reflexMode = mode;
-            save();
+            markDirty();
         }
     }
 
@@ -1905,7 +1905,7 @@ public final class RTXSettingsConfig {
     ) {
         if (serEnabled != enabled) {
             serEnabled = enabled;
-            save();
+            markDirty();
         }
     }
 
@@ -1914,7 +1914,7 @@ public final class RTXSettingsConfig {
     ) {
         if (fgFrameSync != enabled) {
             fgFrameSync = enabled;
-            save();
+            markDirty();
         }
     }
 
@@ -1927,7 +1927,7 @@ public final class RTXSettingsConfig {
     ) {
         if (slDevPlugins != enabled) {
             slDevPlugins = enabled;
-            save();
+            markDirty();
         }
     }
 
@@ -1940,7 +1940,7 @@ public final class RTXSettingsConfig {
     ) {
         if (fgRefreshCap != enabled) {
             fgRefreshCap = enabled;
-            save();
+            markDirty();
         }
     }
 
@@ -1989,7 +1989,7 @@ public final class RTXSettingsConfig {
 
         if (fgBaseFrameLimit != fps) {
             fgBaseFrameLimit = fps;
-            save();
+            markDirty();
         }
     }
 
@@ -2005,7 +2005,7 @@ public final class RTXSettingsConfig {
     ) {
         if (entityArmorMetal != enabled) {
             entityArmorMetal = enabled;
-            save();
+            markDirty();
         }
     }
 
@@ -2018,7 +2018,7 @@ public final class RTXSettingsConfig {
     ) {
         if (cloudFadeFollowsRrMode != enabled) {
             cloudFadeFollowsRrMode = enabled;
-            save();
+            markDirty();
         }
     }
 
@@ -2034,7 +2034,7 @@ public final class RTXSettingsConfig {
     ) {
         if (cloudPostRrComposite != enabled) {
             cloudPostRrComposite = enabled;
-            save();
+            markDirty();
         }
     }
 
@@ -2048,7 +2048,7 @@ public final class RTXSettingsConfig {
         final int clamped = Math.max(0, Math.min(100, percent));
         if (cloudResFloorPercent != clamped) {
             cloudResFloorPercent = clamped;
-            save();
+            markDirty();
         }
     }
 
@@ -2063,7 +2063,7 @@ public final class RTXSettingsConfig {
         final int clamped = enabled == 0 ? 0 : 1;
         if (giRoulette != clamped) {
             giRoulette = clamped;
-            save();
+            markDirty();
         }
     }
 
@@ -2083,7 +2083,7 @@ public final class RTXSettingsConfig {
         final int clamped = (mode >= 0 && mode <= 2) ? mode : 0;
         if (motionDebugView != clamped) {
             motionDebugView = clamped;
-            save();
+            markDirty();
         }
     }
 
@@ -2108,7 +2108,7 @@ public final class RTXSettingsConfig {
         final int clamped = Math.max(0, Math.min(3, enabled));
         if (motionVectorsEnabled != clamped) {
             motionVectorsEnabled = clamped;
-            save();
+            markDirty();
         }
     }
 
@@ -2125,7 +2125,7 @@ public final class RTXSettingsConfig {
         final int clamped = Math.max(0, Math.min(256, blocks));
         if (sunMarchFarDistance != clamped) {
             sunMarchFarDistance = clamped;
-            save();
+            markDirty();
         }
     }
 
@@ -2142,7 +2142,7 @@ public final class RTXSettingsConfig {
                 : 0.10f;
         if (Float.compare(cloudFarStepDensity, clamped) != 0) {
             cloudFarStepDensity = clamped;
-            save();
+            markDirty();
         }
     }
 
@@ -2158,7 +2158,7 @@ public final class RTXSettingsConfig {
 
         if (fgMultiplier != multiplier) {
             fgMultiplier = multiplier;
-            save();
+            markDirty();
         }
     }
 
@@ -2174,7 +2174,7 @@ public final class RTXSettingsConfig {
         }
         if (!performanceSettings.equals(settings)) {
             performanceSettings = settings;
-            save();
+            markDirty();
         }
     }
 
@@ -2199,7 +2199,7 @@ public final class RTXSettingsConfig {
         }
         if(!waterStyleSettings.equals(settings)) {
             waterStyleSettings = settings;
-            save();
+            markDirty();
         }
     }
 
@@ -2212,7 +2212,7 @@ public final class RTXSettingsConfig {
         }
         if(!rainWallSettings.equals(settings)) {
             rainWallSettings = settings;
-            save();
+            markDirty();
         }
     }
 
@@ -2224,7 +2224,7 @@ public final class RTXSettingsConfig {
         }
         if (!rainSettings.equals(settings)) {
             rainSettings = settings;
-            save();
+            markDirty();
         }
     }
 
@@ -2244,7 +2244,7 @@ public final class RTXSettingsConfig {
         }
         if (!galaxySettings.equals(settings)) {
             galaxySettings = settings;
-            save();
+            markDirty();
         }
     }
 
@@ -2256,7 +2256,7 @@ public final class RTXSettingsConfig {
         }
         if (!snowSettings.equals(settings)) {
             snowSettings = settings;
-            save();
+            markDirty();
         }
     }
 
@@ -2269,7 +2269,7 @@ public final class RTXSettingsConfig {
         if(mode < 0 || mode > 1) throw new IllegalArgumentException("Invalid upscaler mode: " + mode);
         if (upscalerMode != mode) {
             upscalerMode = mode;
-            save();
+            markDirty();
         }
     }
     public static synchronized int getSRMode() { return srMode; }
@@ -2277,7 +2277,7 @@ public final class RTXSettingsConfig {
         if(mode < 0 || mode > 3) throw new IllegalArgumentException("Invalid SR mode: " + mode);
         if (srMode != mode) {
             srMode = mode;
-            save();
+            markDirty();
         }
     }
 
@@ -2297,7 +2297,7 @@ public final class RTXSettingsConfig {
 
         if (rrMode != mode) {
             rrMode = mode;
-            save();
+            markDirty();
         }
     }
 
@@ -2325,7 +2325,7 @@ public final class RTXSettingsConfig {
         float rounded = Math.round(value * 100.0f) / 100.0f;
         if (Float.compare(noDirectLightAmbient, rounded) != 0) {
             noDirectLightAmbient = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -2384,7 +2384,7 @@ public final class RTXSettingsConfig {
         float rounded = Math.round(value);
         if (Float.compare(localLightMaxDistance, rounded) != 0) {
             localLightMaxDistance = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -2413,7 +2413,7 @@ public final class RTXSettingsConfig {
 
         if (Float.compare(localLightIntensity, rounded) != 0) {
             localLightIntensity = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -2441,7 +2441,7 @@ public final class RTXSettingsConfig {
 
         if (Float.compare(dynamicLightIntensity, rounded) != 0) {
             dynamicLightIntensity = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -2469,7 +2469,7 @@ public final class RTXSettingsConfig {
 
         if (Float.compare(postBloomStrength, rounded) != 0) {
             postBloomStrength = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -2499,7 +2499,7 @@ public final class RTXSettingsConfig {
             postGainR = cr;
             postGainG = cg;
             postGainB = cb;
-            save();
+            markDirty();
         }
     }
 
@@ -2529,7 +2529,7 @@ public final class RTXSettingsConfig {
         }
         if(!volumetricFogSettings.equals(settings)) {
             volumetricFogSettings = settings;
-            save();
+            markDirty();
         }
     }
 
@@ -2545,7 +2545,7 @@ public final class RTXSettingsConfig {
         }
         if(!volumetricLightSettings.equals(settings)) {
             volumetricLightSettings = settings;
-            save();
+            markDirty();
         }
     }
 
@@ -2559,7 +2559,7 @@ public final class RTXSettingsConfig {
         }
         if(!sunVisualSettings.equals(settings)) {
             sunVisualSettings = settings;
-            save();
+            markDirty();
         }
     }
 
@@ -2573,7 +2573,7 @@ public final class RTXSettingsConfig {
         }
         if(!atmosphereSettings.equals(settings)) {
             atmosphereSettings = settings;
-            save();
+            markDirty();
         }
     }
 
@@ -2588,7 +2588,7 @@ public final class RTXSettingsConfig {
         float rounded = Math.round(value * 20.0f) / 20.0f;
         if(Float.compare(powderStrength, rounded) != 0) {
             powderStrength = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -2603,7 +2603,7 @@ public final class RTXSettingsConfig {
         float rounded = Math.round(value * 20.0f) / 20.0f;
         if(Float.compare(auroraBrightness, rounded) != 0) {
             auroraBrightness = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -2618,7 +2618,7 @@ public final class RTXSettingsConfig {
         float rounded = Math.round(value * 20.0f) / 20.0f;
         if(Float.compare(auroraFlowSpeed, rounded) != 0) {
             auroraFlowSpeed = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -2634,7 +2634,7 @@ public final class RTXSettingsConfig {
         float rounded = Math.round(value * 20.0f) / 20.0f;
         if(Float.compare(cloudSunForwardScattering, rounded) != 0) {
             cloudSunForwardScattering = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -2650,7 +2650,7 @@ public final class RTXSettingsConfig {
         float rounded = Math.round(value);
         if(Float.compare(cloudSunReddening, rounded) != 0) {
             cloudSunReddening = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -2666,7 +2666,7 @@ public final class RTXSettingsConfig {
         float rounded = Math.round(value * 20.0f) / 20.0f;
         if(Float.compare(cloudDetileStrength, rounded) != 0) {
             cloudDetileStrength = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -2681,7 +2681,7 @@ public final class RTXSettingsConfig {
         float rounded = Math.round(value * 100.0f) / 100.0f;
         if(Float.compare(cloudType, rounded) != 0) {
             cloudType = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -2704,7 +2704,7 @@ public final class RTXSettingsConfig {
         float rounded = Math.round(value * 100.0f) / 100.0f;
         if(Float.compare(cloudSilver, rounded) != 0) {
             cloudSilver = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -2716,7 +2716,7 @@ public final class RTXSettingsConfig {
         float rounded = Math.round(value * 100.0f) / 100.0f;
         if(Float.compare(cloudWeatherScale, rounded) != 0) {
             cloudWeatherScale = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -2731,7 +2731,7 @@ public final class RTXSettingsConfig {
         float rounded = Math.round(value / 1000.0f) * 1000.0f;
         if(Float.compare(cloudViewDistance, rounded) != 0) {
             cloudViewDistance = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -2742,7 +2742,7 @@ public final class RTXSettingsConfig {
         float rounded = Math.round(value * 20.0f) / 20.0f;
         if(Float.compare(cloudErosionScale, rounded) != 0) {
             cloudErosionScale = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -2758,7 +2758,7 @@ public final class RTXSettingsConfig {
         float rounded = Math.round(value);
         if(Float.compare(cloudTopStretch, rounded) != 0) {
             cloudTopStretch = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -2768,7 +2768,7 @@ public final class RTXSettingsConfig {
         }
         if(!cloudSettings.equals(settings)) {
             cloudSettings = settings;
-            save();
+            markDirty();
         }
     }
 
@@ -2790,7 +2790,7 @@ public final class RTXSettingsConfig {
         float rounded = Math.round(value * 100.0f) / 100.0f;
         if (Float.compare(pomDepth, rounded) != 0) {
             pomDepth = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -2800,7 +2800,7 @@ public final class RTXSettingsConfig {
     ) {
         if (pomSharp != value) {
             pomSharp = value;
-            save();
+            markDirty();
         }
     }
 
@@ -2815,7 +2815,7 @@ public final class RTXSettingsConfig {
         }
         if (ueCloud[index] != value) {
             ueCloud[index] = value;
-            save();
+            markDirty();
         }
     }
 
@@ -2825,7 +2825,7 @@ public final class RTXSettingsConfig {
     ) {
         if (trueSubsurfaceScattering != value) {
             trueSubsurfaceScattering = value;
-            save();
+            markDirty();
         }
     }
 
@@ -2840,7 +2840,7 @@ public final class RTXSettingsConfig {
     ) {
         if (hdrEnabled != enabled) {
             hdrEnabled = enabled;
-            save();
+            markDirty();
         }
     }
 
@@ -2855,7 +2855,7 @@ public final class RTXSettingsConfig {
     ) {
         if (autoExposureEnabled != enabled) {
             autoExposureEnabled = enabled;
-            save();
+            markDirty();
         }
     }
 
@@ -2883,7 +2883,7 @@ public final class RTXSettingsConfig {
         float rounded = Math.round(value * 10.0f) / 10.0f;
         if (Float.compare(autoExposureCompensation, rounded) != 0) {
             autoExposureCompensation = rounded;
-            save();
+            markDirty();
         }
     }
 
@@ -4057,6 +4057,35 @@ public final class RTXSettingsConfig {
     }
 
 
+    // =====================================================================
+    // 2026-10-23 写盘合并：一次「确认/应用」不再产生 80+ 次整文件重写
+    //
+    // 病灶：83 个 setXxx 里绝大多数都直接 save()，而 RTXSettingsScreen
+    // applyPendingSettings() 一次会调用 81 个 setter（UE 云八项还各调一次）⇒ 一次
+    // 点击 = 约 80 次 new Data() + Gson 全序列化 + Files.write 覆盖 + 一行 20+ 字段的
+    // println，而且全在渲染线程上。表现是日志被 [RTX CONFIG] 刷屏、SSD 突发小写入。
+    //
+    // 改法：setter 只置脏（markDirty），由调用方在一批改动结束时 flush() 一次。
+    // 全仓 setter 的调用点只有 RTXSettingsScreen（81 处），所以 flush 点也只有它的
+    // applyPendingSettings() 末尾。**新增调用方必须同样在结束时 flush()**，
+    // 否则改动只留在内存里：不会丢（同进程内仍生效），但重启后回退。
+    // =====================================================================
+    private static boolean settingsDirty = false;
+
+    /** setter 用：只记账，不落盘。 */
+    private static synchronized void markDirty() {
+        settingsDirty = true;
+    }
+
+    /** 把 markDirty() 攒下的改动一次性写盘；没有改动时直接返回。 */
+    public static synchronized void flush() {
+        if(!settingsDirty) {
+            return;
+        }
+        save();
+    }
+
+
     private static synchronized void save() {
 
         try {
@@ -4433,6 +4462,9 @@ public final class RTXSettingsConfig {
                             + " SER=" + serEnabled
                             + " Perf=" + performanceSettings
             );
+
+            // 写盘成功才清脏：IOException 时保持 true，下一次 flush() 会重试。
+            settingsDirty = false;
 
         } catch(IOException e) {
 

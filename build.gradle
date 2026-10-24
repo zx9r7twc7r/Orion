@@ -102,6 +102,11 @@ processResources {
 	// verifyBundledNatives 的 **/*.dll 白名单本来就不匹配它们，
 	// 这里同步把打包也排除掉。
 	exclude "**/*.bak_*"
+
+	// 2026-10-24 分发包：resources 根目录那份 rtx_backend.dll 是历史遗留副本，
+	// 与 natives/windows/rtx_backend.dll 重复（后者才是 NativeVulkan 抽取的原生目录，
+	// 见 verifyBundledNatives 的 backendDll 判定）。按"重复的 DLL 不分发"只留一份。
+	exclude "rtx_backend.dll"
 }
 
 tasks.withType(JavaCompile).configureEach {
@@ -212,6 +217,15 @@ tasks.register("verifyBundledNatives") {
 
 tasks.named("processResources") {
 	dependsOn tasks.named("verifyBundledNatives")
+}
+
+// 2026-10-24 分发包：processResources 的 exclude 只作用于 main 资源这一路，
+// loom 的 client 资源处理会把同一个目录再走一遍 ⇒ *.bak_* 与根目录那份重复的
+// rtx_backend.dll 仍会进 jar（实测 85MB 备份 DLL 被打进去）。
+// 在 jar 任务上再兜一层，保证分发物里只有 natives/windows 下的 18 个正式 DLL。
+tasks.named("jar") {
+	exclude "**/*.bak_*"
+	exclude "rtx_backend.dll"
 }
 
 def rtxRuntimeShaderFiles = [

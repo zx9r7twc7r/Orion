@@ -29,6 +29,15 @@ struct HitPayload {
     float prevOffsetX;
     float prevOffsetY;
     float prevOffsetZ;
+    // 2026-10-24（半透明接缝重置 + 穿层预算拆分，见
+    // HANDOFF-2026-10-24-GLASS-AIR-NOISE.md §2 与 TRANSLUCENT-SEAM §4/§5.2）：
+    // lastGlassFaceT 记录同一条射线上一个被接受半透明面的 gl_HitTEXT（-1 = 尚无），
+    // 面距 > 1.5 格 ⇒ 中间有整格面被裁 ⇒ 面序在新区域从 0 重计；
+    // glassFaceBudget 是穿层预算计数，**不随面序重置**（parallaxRayTravel 只剩
+    // 面序一个用途，双用途就此拆开）。仅 rahit 玻璃分支读写，rgen 的 6 处
+    // RT_PURPOSE_GLASS_VISIBILITY 播种点负责清零。
+    float lastGlassFaceT;
+    float glassFaceBudget;
 };
 
 #endif // HIT_PAYLOAD_GLSL

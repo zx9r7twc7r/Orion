@@ -3651,6 +3651,10 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                         ? "[RTX SETTINGS] Confirmed"
                         : "[RTX SETTINGS] Confirmed with native failure"
         );
+
+        // 2026-10-23：本方法里的 setter 只置脏，这里统一落盘一次
+        // （此前每个 setter 各自 save()，一次「确认」约 80 次整文件重写）。
+        RTXSettingsConfig.flush();
     }
 
     private static Component qualityLabel(int mode) {

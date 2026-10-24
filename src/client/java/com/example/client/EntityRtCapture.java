@@ -47,10 +47,16 @@ public final class EntityRtCapture {
     // entityPbrSettled[victim]=false ⇒ 下一次命中重跑 publishEntityPbrTexture() 的
     // JNI 重推（约 130ms/帧的渲染线程 CPU）。扩容后文字/实体贴图同时驻留，slotFor
     // 走命中路径，两个症状一起消失。native 侧同名的常量与描述符池已同步。
-    private static final int MAX_TEXTURE_SLOTS = 64;
-    // 最后一格留给本地玩家身体代理（它用 MAX_TEXTURE_SLOTS 当自己的槽号，
-    // 见 publishProxyTexture），普通实体纹理只用 1..31 —— 否则第 32 个纹理
-    // 会把代理的皮肤顶掉，主光线看到的自己就成了别人。
+    //
+    // 2026-10-24：64 → 128。同样的病灶又到顶了：63 个常规槽被城市图的实体纹理
+    // （旗帜图案 / 展示框物品 / 掉落物精灵 / 玩家皮肤 / 盔甲 / 地图）占满后 LRU
+    // 抢占本帧在用槽 ⇒ 串图（"旗帜图案错乱 / 掉落物贴图时不时错乱"），图集槽
+    // 被换人后几何采到透明区域被 alpha 裁切（"展示框物品不显示"）。描述符池
+    // （主 256→512、ring 128→512）与 shader 数组（64→128 case）已同步。
+    private static final int MAX_TEXTURE_SLOTS = 128;
+    // 最后一格（MAX_TEXTURE_SLOTS）留给本地玩家身体代理（它用 MAX_TEXTURE_SLOTS
+    // 当自己的槽号，见 publishProxyTexture），普通实体纹理用 1..MAX-1 ——
+    // 否则最后一个纹理会把代理的皮肤顶掉，主光线看到的自己就成了别人。
     private static final int MAX_REGULAR_TEXTURE_SLOTS = MAX_TEXTURE_SLOTS - 1;
     // Match the pre-existing global RT vertex ABI: 12 floats / 48 bytes.
     // pad2 carries the entity texture slot; translucent shader modules retain

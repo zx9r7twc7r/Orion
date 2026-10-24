@@ -11,6 +11,10 @@ public class ExampleModClient implements ClientModInitializer {
 		// 所有 DH 类型都隔离在 compat.dh 包内，这里只碰门面，不引入任何 DH 类引用。
 		DhBridge.install();
 
+		// 2026-10-24 相机路径录制/回放（-Dorion.campath.record / -Dorion.campath.play）。
+		// 只读系统属性，未设置时整个驱动保持 OFF（每帧一次 boolean 判空）。
+		com.example.client.bench.CameraPathDriver.install();
+
 		// 2026-10-03 实体可见性剔除（来源与授权见类注释）：
 		// 仅启动编排线程；判定失败/线程死亡 ⇒ 自动失效，回到"全部提交"的旧行为。
 		com.example.client.cull.EntityVisibilityCuller.install();
