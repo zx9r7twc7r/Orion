@@ -26,6 +26,18 @@ const uint RT_STATE_PROFILE_SHIFT      = 9u;
 // 2026-10-07：普通（未染色）玻璃标记，bit 12 —— 与 rt_test_translucent.rchit 同名同值。
 // 置位者见下方 t12IsGlass 分支，消费者见 rgen 的 isClearGlassHit()（"当空气处理"）。
 const uint RT_STATE_CLEAR_GLASS_BIT    = 1u << 12u;
+// 2026-10-24：粒子命中标记，bit 16 —— 与 rt_test.rgen 同名同值。置位者在
+// material_resolve.glsl（isParticleMaterial，makeHitState 之后）；消费者：
+// rgen 的 RR TransparencyHint（粒子像素降低 RR 历史信任，治残影）。
+const uint RT_STATE_PARTICLE_BIT       = 1u << 16u;
+
+// 2026-10-25 A/B：GI 射线跳过 POM（与 rt_test.rgen 的常量必须逐位一致）。
+const uint RT_STATE_GI_NO_POM_BIT      = 1u << 17u;
+
+// 本 invocation 是否为"跳过 POM 的 GI 射线"。在 main() 顶部由 payload.state 播种，
+// 由 getPOMDepthScale() 读取 —— 这样 traceParallax() / tracePOMSelfShadow() 里
+// 既有的 pomDepthScale<=1e-5 早退分支会原样接管，不需要在 march 中间加分支。
+bool g_giRaySkipPOM = false;
 // rgen 侧同名同值（rt_test.rgen:6053）。补在这里，供本 shader 的"按射线用途分级"
 // 快速路径识别 —— 与下面 RT_PURPOSE_DISTANCE_ONLY 的补法同源（见其上注释）。
 const uint RT_PURPOSE_FULL             = 0u;
@@ -1307,6 +1319,14 @@ vec2 snapPOMSpriteUVToTexelCenter(
 
 float getPOMDepthScale()
 {
+    // 2026-10-25 A/B：GI 射线跳过 POM。返回 0 会让 traceParallax() 与
+    // tracePOMSelfShadow() 走它们**既有**的 "POM off" 早退分支（见各自的
+    // pomDepthScale <= 1e-5 判定），所以这里不需要改 march 本身。
+    if(g_giRaySkipPOM)
+    {
+        return 0.0;
+    }
+
     // CameraUBO.historyParamsPadding0 -> historyParams.z
     return
         clamp(
@@ -1976,6 +1996,11 @@ vec3 materialRayDirection = vec3(0.0, 0.0, -1.0);
 
 void main()
 {
+    // 2026-10-25：GI 射线跳过 POM 的开关来自 rgen 播种的 state 位（bit 17）。
+    // 必须在 resolveHitMaterial() 之前播种 —— 材质解析里就会调 traceParallax()。
+    g_giRaySkipPOM =
+        (payload.state & RT_STATE_GI_NO_POM_BIT) != 0u;
+
     // 2026-10-21 根因修复（生产模式崩溃的真正原因）：
     // resolveHitMaterial() 的 miss 判定读 payload.hitDistance，取命中身份读
     // payload.normal.x/.y/.z 与 payload.roughness（见 material_resolve.glsl:41-63）。

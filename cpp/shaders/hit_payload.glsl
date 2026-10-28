@@ -38,6 +38,27 @@ struct HitPayload {
     // RT_PURPOSE_GLASS_VISIBILITY 播种点负责清零。
     float lastGlassFaceT;
     float glassFaceBudget;
+    // 2026-10-25 阶段 C：介质状态机（替换面序奇偶）。
+    // glassInside > 0.5 => 当前位于该半透明体内部；glassEntryT 是进入面的
+    // gl_HitTEXT（-1 = 尚无），用于「上一块的出射面被裁」的区间判据。
+    float glassInside;
+    float glassEntryT;
+    // 2026-10-25 阶段 D（Remix 同构的单条射线透射）：
+    // 主射线透射在遍历中把"相机打到的第一片之后"的每一片玻璃的薄片透射乘在这里。
+    // 只有 RT_PURPOSE_PRIMARY_TRANSMISSION 会写它，其余 purpose 保持 1.0。
+    vec3 transmittanceAccum;
+    // 2026-10-26（alpha blend 加性合成，对齐 RTX Remix alpha_blend_surface）：
+    //     sum_{i>=1} tint_i * a_i * PI_{j<i}(1 - a_j)
+    // 即"链内每一层自己的 alpha blend 贡献"。与 transmittanceAccum 一起构成
+    // Remix 那条合成的确定性等价值（推导见 glass_chain_common.glsl 顶部）。
+    // 只有 RT_PURPOSE_PRIMARY_TRANSMISSION 会写它，其余 purpose 保持 0。
+    vec3 glassSurfaceWeightAccum;
+    // 2026-10-26：alpha blend 的源 alpha，无条件 = 贴图 texel alpha x 顶点色 alpha
+    // （Remix-MC ATLAS_TRANSLUCENT_BLEND = textureTimesVertexColor(),
+    //   BlockTextureManager.java:64）。与 glassAlpha 分开：
+    //   glassAlpha 仍表示"玻璃覆盖率"，只在顶点 materialId 命中玻璃族时取贴图 alpha；
+    //   未打 marker 的玻璃面 glassAlpha 会是 1.0，但本字段恒为 texture x vertex。
+    float glassBlendAlpha;
 };
 
 #endif // HIT_PAYLOAD_GLSL

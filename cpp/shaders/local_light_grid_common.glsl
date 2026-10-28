@@ -187,10 +187,37 @@ float localLightIntensity()
 
 // 把 gatherPos 所在网格邻域（1 到 8 个 cell）里的灯收进固定数组。
 // posEmission[i].w = emission 等级（0..15，未缩放）。
+//
+// 2026-10-26：本函数改为**转调** fogGatherLocalLightsIndexed()（多输出全局灯索引），
+// 保持原签名不变 ⇒ 体积云 v2~v5 的调用点不需要改。索引版的存在理由见下方注释。
+// 前置声明：索引版定义在本文件末尾（转调者在前，GLSL 需要先见到原型）。
+int fogGatherLocalLightsIndexed(
+    vec3 gatherPos,
+    out vec4 posEmission[FOG_LIGHT_MAX],
+    out uint typeCode[FOG_LIGHT_MAX],
+    out uint globalIndex[FOG_LIGHT_MAX]);
+
 int fogGatherLocalLights(
     vec3 gatherPos,
     out vec4 posEmission[FOG_LIGHT_MAX],
     out uint typeCode[FOG_LIGHT_MAX])
+{
+    uint unusedGlobalIndex[FOG_LIGHT_MAX];
+
+    return fogGatherLocalLightsIndexed(gatherPos, posEmission, typeCode, unusedGlobalIndex);
+}
+
+// 与 fogGatherLocalLights 同序同口径，额外输出每盏灯在**灯表里的全局下标**。
+//
+// 为什么需要它：ReSTIR 的 reservoir 要跨帧（temporal）和跨 froxel（spatial）传递
+// 选中样本的身份。若只存"本次收集数组里的第几个"，那个下标只对产生它的 froxel
+// 有意义 —— 换一个 froxel 或换一帧就指向另一盏灯，合并结果无意义，integrate
+// 阶段也无法据此查回灯的辐亮度。全局下标是唯一稳定的身份。
+int fogGatherLocalLightsIndexed(
+    vec3 gatherPos,
+    out vec4 posEmission[FOG_LIGHT_MAX],
+    out uint typeCode[FOG_LIGHT_MAX],
+    out uint globalIndex[FOG_LIGHT_MAX])
 {
     uint lightCount = fogLightBuffer.header.x;
     if(lightCount == 0u || fogLightGrid.words[2] == 0u)
@@ -238,6 +265,7 @@ int fogGatherLocalLights(
                     LocalLightGPU candidate = fogLightBuffer.lights[lightIndex];
                     posEmission[gathered] = candidate.worldPosEmission;
                     typeCode[gathered] = candidate.meta.x;
+                    globalIndex[gathered] = lightIndex;
                     ++gathered;
                     if(gathered >= FOG_LIGHT_MAX)
                     {

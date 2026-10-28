@@ -27,8 +27,12 @@ import org.lwjgl.system.MemoryUtil;
  *   <li><b>第一人称手持发光物</b>：读玩家主手/副手的 {@link ItemStack}，方块物品直接问
  *       {@link BlockState#getLightEmission()}（火把 14、灯笼 15、萤石 15…），非方块物品
  *       查一张小表（岩浆桶等）。光源放在"手"的大致位置（眼位 + 视线方向 0.35 格 - 0.25 格）。
- *       注意：**不需要手部几何** —— 光源只是一条位置/强度/颜色记录，而第一人称手部的几何
- *       捕获链路在本工程里其实是断的（{@code beginHandPhase()} 无调用者）。</li>
+ *       注意：**不需要手部几何** —— 光源只是一条位置/强度/颜色记录。
+ *       2026-10-25 修正：第一人称手部几何其实**一直在被 Java 侧捕获**（EntityRtCapture
+ *       的 model/item 两条链），此前完全不参与光追的真实原因是帧窗口在手提交之前就
+ *       {@code endEntityFrame()} 了，上传被原生门禁静默丢弃（见
+ *       {@code EntityRtCapture.finishEntityFrame}）。与 {@code beginHandPhase()}
+ *       无关 —— 那个方法始终没有调用者，是死代码。</li>
  *   <li><b>自带发光的实体</b>：见 {@link #ENTITY_LIGHTS}。</li>
  * </ul>
  *

@@ -2032,6 +2032,19 @@ else
 }
 
 // =====================================================
+// 2026-10-24：粒子命中标记（bit 16）—— 必须写在 makeHitState 之后（它重建
+// 整个 state）。消费者：rt_test.rgen 的 RR TransparencyHint —— 粒子像素对该像素
+// 的可见颜色不是主表面（是会移动/生灭的 billboard），RR 不该按主表面历史平均。
+// 官方 DLSS-RR 现行方案是 TransparencyLayer + ColorBeforeTransparency（大工程，
+// 见 HANDOFF-2026-10-24-GLASS-AIR-NOISE.md 第五轮之后的跟进项）；本位是旧机制
+// kBufferTypeTransparencyHint 的最小接入。
+// =====================================================
+if(isParticleMaterial)
+{
+    payload.state |= RT_STATE_PARTICLE_BIT;
+}
+
+// =====================================================
 // 2026-10-05 宏观材质变化（#35）：低频值噪声（9 格格点，XZ + 高度偏移）
 // 缓慢调制 albedo 亮度（±6%）与粗糙度（±0.08）—— 大面积墙面出现缓慢
 // 变化的色差与粗糙度差，打破"一整面墙一个颜色"的均质感。

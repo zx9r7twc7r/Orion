@@ -121,10 +121,15 @@ SharcParameters sharcBuildParameters()
 SharcResolveParameters sharcBuildResolveParameters()
 {
     SharcResolveParameters resolveParameters;
+    // 2026-10-26（对齐 RTX Remix，重新应用；上次被误回滚）：
+    //   accumulationFrameNum = 10  —— rtx_spatially_hashed_radiance_cache.cpp:120
+    //   staleFrameNumMax     = 64  —— 同上 :121（SDK 头的 1024 只是 clamp 上界）
+    //   responsiveFrameNum   = 与 accumulation 相同 => 关闭 responsive lighting
+    //     （参考 sharc.slangh:38 明确关闭；SDK 用它做响应式缩短累积）
     resolveParameters.cameraPositionPrev = cam.prevViewInverse[3].xyz;
-    resolveParameters.accumulationFrameNum = 20u; // 参考默认（PathtracerUi.h:158，UI 1..120）
-    resolveParameters.responsiveFrameNum = 8u;
-    resolveParameters.staleFrameNumMax = SHARC_STALE_FRAME_NUM_MAX;
+    resolveParameters.accumulationFrameNum = 10u;
+    resolveParameters.responsiveFrameNum = 10u;
+    resolveParameters.staleFrameNumMax = 64u;
     resolveParameters.frameIndex = cam.frameCount;
     return resolveParameters;
 }

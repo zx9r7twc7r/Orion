@@ -2104,11 +2104,18 @@ enum PerfL10GpuBoundary : uint32_t
     // 2026-10-24 细分（见 patch_rt_scopes.py）：原来这三段把"管线创建 /
     // 远场阴影 / SHaRC update / 天空大气 / 主派发 / 近场阴影 / 高度场 / 云"
     // 混成了 sky / rt / cloud 三个数，导致 rt=12.5ms 无法归因。
+    // 2026-10-25 细分：原来 caus 段把"焦散 + 云/天空管线创建"混成一个数
+    // （实测 20.51ms，而焦散 pass 已被 kWATER_CAUSTIC_PASS_ENABLED=false 短路）。
+    PERF_L10_GPU_B_CLOUDPIPE,  // cloud + sky pipeline creation done
     PERF_L10_GPU_B_RTPIPE,     // cloud+sky pipeline creation done
     PERF_L10_GPU_B_SFAR,       // far sun shadow map done
     PERF_L10_GPU_B_SHARCUP,    // SHaRC update done
     PERF_L10_GPU_B_SKY,        // sky atmosphere done（scope = 绑定 + 天空大气）
-    PERF_L10_GPU_B_RT,         // main RayGen + SHaRC resolve done
+    // 2026-10-25 细分（rt 段内部）：原来 sky→rt 一个 scope 把"半分辨率 GI / 主 RayGen / SHaRC resolve"
+    // 混成一个数（实测 7~8ms），无法归因。三段之和与原 rt 相等。
+    PERF_L10_GPU_B_GI,         // half-res GI irradiance pass done
+    PERF_L10_GPU_B_TRACE,      // main raygen dispatch done
+    PERF_L10_GPU_B_RT,         // SHaRC resolve done（原 rt 段的尾端锚点）
     PERF_L10_GPU_B_SNEAR,      // near sun shadow map done（在 recordVolumetricClouds 内）
     PERF_L10_GPU_B_HEIGHT,     // terrain height field done（同上）
     PERF_L10_GPU_B_CLOUD,      // volumetric clouds done
@@ -2133,10 +2140,13 @@ constexpr const char* PERF_L10_GPU_SCOPE_NAMES[PERF_L10_GPU_SCOPE_COUNT] =
     "wfft",
     "wcaus",
     "caus",
+    "cloudpipe",
     "rtpipe",
     "sfar",
     "sharcup",
     "sky",
+    "gi",
+    "trace",
     "rt",
     "snear",
     "height",
@@ -2949,7 +2959,9 @@ static std::atomic<float> g_perfL10SppForLog{1.0f};
 // =====================================================
 // 2026-10-24 GI 光线距离截断（宿主侧档位）
 //
-// ORION_GI_MAX_DISTANCE=<格>      GI 射线 tMax 上限；未设/0 = 不截断（默认）
+// ORION_GI_MAX_DISTANCE=<格>      GI 射线 tMax 上限。
+//                                 未设 = 96（2026-10-24 项 4 起的默认值），
+//                                 显式设 0 = 不截断（旧行为）。
 // ORION_GI_MAX_DISTANCE_AB=1      同局交错：偶数窗不截断、奇数窗截断
 //
 // 车道用 CameraUBO.historyPadding0（宿主原本恒写 0，且**全仓无着色器读取**）。
@@ -2968,9 +2980,14 @@ static float giRayMaxDistanceConfigured()
     {
         const char* raw = std::getenv("ORION_GI_MAX_DISTANCE");
 
-        if(raw == nullptr)
+        // 2026-10-24 项 4：默认 96 格（原先未设 = 0 = 不截断）。
+        //
+        // 只有**显式设成 0** 才回到不截断；未设与空串一律取默认值 —— 空串会被
+        // atof 解析成 0.0，若不单独判掉，默认档会被静默关掉（和 DhFarFieldMode
+        // 那次"判据写成 >= 0 导致远场永不出现"是同一类错误）。
+        if(raw == nullptr || raw[0] == '\0')
         {
-            return 0.0f;
+            return 96.0f;
         }
 
         const float parsed = static_cast<float>(std::atof(raw));
@@ -4283,7 +4300,7 @@ struct CameraUBO {
     //   cloudAerialParams.x = 云层大气透视强度（#1；0 = 关 = 旧档）
     //                     .y = 地面大气透视强度（#2 载体；0 = 关 = 出厂 AP_BASE_EXTINCTION_SCALE）
     //                     .z = 地面大气透视遮挡衰减（#2；0 = 不衰减）
-    //                     .w = 保留（宿主写 0）
+    //                     .w = 保留（0；2026-10-26 泡沫读层 lane 已随泡沫回退作废）
     // ---------------------------------------------------------------------
     float fogExtrasParams[4];
     float cloudTemporalParams[4];
@@ -4356,7 +4373,7 @@ struct CameraUBO {
     // 不移动任何已读偏移。唯一消费者 rt_test.rchit（经 camera_ubo.glsl）。
     //   x = 0（默认 / 旧 DLL）＝ 平滑：双线性高度场
     //       > 0.5            ＝ 锐利：单纹素 texelFetch（MODE1）
-    //   yzw 保留。
+    //   yzw = 保留（0；2026-10-26 泡沫原点/纹素 lane 已随泡沫回退作废）
     // ---------------------------------------------------------------------
     float pomParams[4];
 
@@ -4401,6 +4418,42 @@ struct CameraUBO {
     // ⚠ 资源没建好 / giHalfEnabled() 关时必须写 0，否则主变体去读未写描述符。
     // ---------------------------------------------------------------------
     float giHalfParams[4];
+
+    // 2026-10-25 近场 GI 采样率（偏移 1584）：x = 0/1/2，yzw 保留。
+    float giRayParams[4];
+
+    // ---------------------------------------------------------------------
+    // 2026-10-25 v5（HPVolumeCloud 移植）的全参数尾块，偏移 1600..1712。
+    // 只被 volumetric_clouds_v5.comp 读（cloud_v5_core.glsl 的 HPCloudConfig）。
+    // 哨兵语义同 ueCloudA：**负值 = 未写入**，着色器回落 hpDefaultConfig 的出厂值，
+    // 这样旧 DLL / 旧存档都不会把 0 当成用户设定。
+    //
+    //   hpShapeA = detailStrengthCu / detailStrengthTcu / detailStrengthCb / bottomSmoothHeight
+    //   hpShapeB = wispyEdgeWidth / wispyReach / wispyTopHeight / wispyTopHardness
+    //   hpShapeC = wispyWeight / billowyWeight / loCoverTopMax / loCoverTopStr
+    //   hpShapeD = covMapScale / scWorleyStrength / scHeightScale / scCellThickStr
+    //   hpLightA = forwardEcc / backwardEcc / phiFwdIntensity / phiFwdDepthPow
+    //   hpLightB = phiFwdDepthBias / phiFwdCompress / scatterODScale / scatterCurvePow
+    //   hpMiscA  = msEccentricity / aoUpwardScale / fadeStart / powderIntensity(保留)
+    // ---------------------------------------------------------------------
+    float hpShapeA[4];
+    float hpShapeB[4];
+    float hpShapeC[4];
+    float hpShapeD[4];
+    float hpLightA[4];
+    float hpLightB[4];
+    float hpMiscA[4];
+
+    // ---------------------------------------------------------------------
+    // 2026-10-26 直接光模式 + 稀疏渲染（HANDOFF-2026-10-26-RTDI-SPARSE.md），
+    // 偏移 1712，尾追加不动任何已读偏移。与 camera_ubo.glsl 末尾的
+    // `vec4 sparseParams` 逐项对应：
+    //   x = 直接光模式（0 传统 RIS / 1 RTXDI 式时域 reservoir）
+    //   y = 稀疏渲染活跃采样率 %（0 = 关）
+    //   z = RTXDI×稀疏联动：非活跃像素仍做 reservoir 验证/老化（默认 1）
+    //   w = 保留（空间重用档位）
+    // ---------------------------------------------------------------------
+    float sparseParams[4];
 };
 
 // The shaders each re-declare `CameraProperties` as a std140 block.  A block
@@ -4571,9 +4624,21 @@ static_assert(offsetof(CameraUBO, giHalfParams) == 1568,
     "giHalfParams must start at 1568, immediately after ueCloudB: 2026-10-24 "
     "half-resolution GI switch lives in lane x and rt_test.rgen reads it "
     "through the shared camera_ubo.glsl block declaration");
-static_assert(sizeof(CameraUBO) == 1584,
+static_assert(offsetof(CameraUBO, giRayParams) == 1584,
+    "giRayParams must start at 1584, immediately after giHalfParams: 2026-10-25 "
+    "near-field GI sample-rate selector lives in lane x and rt_test.rgen reads "
+    "it through the shared camera_ubo.glsl block declaration");
+static_assert(offsetof(CameraUBO, sparseParams) == 1712,
+    "sparseParams must start at 1712, immediately after hpMiscA: 2026-10-26 "
+    "direct-light mode (RTDI temporal reservoir) lives in lane x and the "
+    "sparse-rendering active sampling rate in lane y; rt_test.rgen reads them "
+    "through the shared camera_ubo.glsl block declaration");
+static_assert(sizeof(CameraUBO) == 1728,
     "CameraUBO size must match the std140 size of the shaders' CameraProperties "
-    "block (1520 -> 1536 when 2026-10-19 sssParams "
+    "block (1712 -> 1728 when 2026-10-26 sparseParams (direct-light mode + "
+    "sparse rendering rate) was appended at the tail; 1600 -> 1712 when "
+    "2026-10-25 hpShapeA..hpMiscA (HPVolumeCloud v5 full parameter tail block) "
+    "were appended at the tail; 1520 -> 1536 when 2026-10-19 sssParams "
     "(foliage subsurface-scattering mode switch) was appended at the tail; "
     "1504 -> 1520 when 2026-10-18 pomParams "
     "(POM height-field smooth/sharp sampling switch) was appended at the tail; "
@@ -4647,7 +4712,34 @@ static constexpr uint32_t WATER_SIM_RESOLUTION = 512u;
 static constexpr float WATER_SIM_WORLD_SIZE = 48.0f;
 static constexpr float WATER_SIM_TEXEL_WORLD_SIZE =
     WATER_SIM_WORLD_SIZE / static_cast<float>(WATER_SIM_RESOLUTION);
-static constexpr float WATER_SIM_UPDATE_SECONDS = 1.0f / 30.0f;
+// 2026-10-25：默认 15 Hz（原 30 Hz）。512^2 单趟实测 12.47 ms，且风源常驻
+// 使其永不 idle ⇒ 每帧白付一半以上。风源是缓慢扰动，15 Hz 足够。
+// 出现积分不稳（波浪抖动/发散）时用 ORION_WATER_SIM_HZ=30 回退。
+static constexpr float WATER_SIM_UPDATE_SECONDS_DEFAULT = 1.0f / 15.0f;
+
+static float waterSimUpdateSeconds()
+{
+    static const float cached = []() -> float
+    {
+        const char* raw = std::getenv("ORION_WATER_SIM_HZ");
+
+        int hz = 15;
+
+        if(raw != nullptr)
+        {
+            const int parsed = std::atoi(raw);
+
+            if(parsed >= 15 && parsed <= 60)
+            {
+                hz = parsed;
+            }
+        }
+
+        return 1.0f / static_cast<float>(hz);
+    }();
+
+    return cached;
+}
 
 static VkImage g_waterSimImage = VK_NULL_HANDLE;
 static VkDeviceMemory g_waterSimMemory = VK_NULL_HANDLE;
@@ -4813,9 +4905,18 @@ static VkImageView g_cloudV4ShapeView = VK_NULL_HANDLE;
 static VkSampler g_cloudV4ShapeSampler = VK_NULL_HANDLE;
 static constexpr uint32_t CLOUD_V4_SHAPE_SIZE = 128u;
 // v4 专用 base 体积（binding 9）。与 shape 同分辨率：6000 格周期下 47 格/体素。
-static constexpr uint32_t CLOUD_V4_BASE_SIZE = 128u;
-static constexpr uint32_t CLOUD_V4_ATLAS_SIZE = 1024u;
+static constexpr uint32_t CLOUD_V4_BASE_SIZE = 128u;   // 2026-10-27: 256 -> 128（回退；256³ 显存 +134 MB 且观感无收益）
+// 2026-10-28：1024² → 512²（RGBA16F 8 MB → 2 MB，烘焙 4× 快）。天气图现在的职责
+// 只有"哪片区域有云"（云体形状完全由 3D base 噪声 + 常数阈值决定），512² 远远够用；
+// 烘焙器 hpRenderWeather 的最细倍频同步从 f=16 降到 f=8（否则 4 texel/格胞 ⇒ 方块）。
+static constexpr uint32_t CLOUD_V4_ATLAS_SIZE = 512u;
 static constexpr uint32_t CLOUD_V4_WORLEY_SIZE = 64u;   // 2026-10-18: 32->64，同世界尺度下体素减半，侵蚀细节不再靠 2 个体素撑
+// 3D 噪声的 mip 链级数（128³ → 128/64/32/16，64³ → 64/32/16/8）。
+// 为什么必须有：光步是云 pass 的大头（每命中点 8 步 × 3 次体积采样），参考靠
+// `max(noiseMipOffset, 0)` 把远光步换成粗层；本仓 mipLevels=1 时**那个参数一直空转**，
+// 光步永远按全分辨率付带宽。4 级对 RGBA16F 只多约 1/7 显存（≈ +2 MB）。
+static constexpr uint32_t CLOUD_V4_BASE_MIPS = 4u;
+static constexpr uint32_t CLOUD_V4_WORLEY_MIPS = 4u;
 // Primary-view clouds use a separate half-resolution target.  Keeping this
 // out of the RT descriptor set prevents its HQ march from affecting reflected
 // and GI sky rays.
@@ -4871,31 +4972,16 @@ static VkImageView g_volumetricCloudCompositeTargetView = VK_NULL_HANDLE;
 static VkPipelineLayout g_volumetricCloudRenderPipelineLayout = VK_NULL_HANDLE;
 static VkPipelineLayout g_volumetricCloudResolvePipelineLayout = VK_NULL_HANDLE;
 static VkPipelineLayout g_volumetricCloudCompositePipelineLayout = VK_NULL_HANDLE;
-static VkPipeline g_volumetricCloudRenderPipeline = VK_NULL_HANDLE;
 // 2026-10-17 体积云 v2。
 // 与 v1 共用同一个描述符集/管线布局，只有 shader 模块不同 ⇒ 切换零状态成本。
 // 开关是标记文件 run/cloud_v2.flag（沿用 godray_debug_vis.flag 的惯例）：
 // 存在即走 v2，删掉即回到 v1（逐位回退）。SPV 缺失时安静回退 v1。
-static VkPipeline g_volumetricCloudRenderPipelineV2 = VK_NULL_HANDLE;
 // 2026-10-17 体积云 v3。与 v1/v2 共用描述符集
 // 与管线布局；云形状/细节/curl/天气图四张纹理走 binding 1/2/10/11（见描述符写入处）。
 // 开关：run/cloud_v3.flag（优先于 cloud_v2.flag）。资产缺失时自动回退 v2。
 static VkPipeline g_volumetricCloudRenderPipelineV3 = VK_NULL_HANDLE;
 static VkPipeline g_volumetricCloudResolvePipeline = VK_NULL_HANDLE;
 static VkPipeline g_volumetricCloudCompositePipeline = VK_NULL_HANDLE;
-static bool volumetricCloudV2Requested()
-{
-    static const bool requested = [] {
-        std::ifstream marker(ResolveRTXRuntimePath("cloud_v2.flag"));
-        const bool enabled = marker.good();
-        if(enabled)
-        {
-            RTLog("[CLOUD V2] cloud_v2.flag present -> v2 cloud model");
-        }
-        return enabled;
-    }();
-    return requested;
-}
 static bool volumetricCloudV3Requested()
 {
     static const bool requested = [] {
@@ -4928,6 +5014,158 @@ static VkDescriptorSetLayout g_volumetricLightSetLayout = VK_NULL_HANDLE;
 static VkDescriptorSet g_volumetricLightSet = VK_NULL_HANDLE;
 static VkPipelineLayout g_volumetricLightPipelineLayout = VK_NULL_HANDLE;
 static VkPipeline g_volumetricLightPipeline = VK_NULL_HANDLE;
+
+// ============================================================================
+// 2026-10-26 体积光 froxel + ReSTIR（S1 骨架）
+//
+// 背景：旧空气体积光已于 2026-10-19 退役（见 g_godRayEnabled 处注释），
+// 现在 air god ray 是 0 成本。本模块是**新增**体积光，不改动旧
+// volumetric_light.comp（水下分支仍在用）。
+//
+// 架构参照 RTX Remix：5 个 dispatch（initial -> visibility -> temporal ->
+// spatial -> integrate），radiance/age/reservoir 三组 ping-pong 3D 图。
+//
+// S1 只建资源 + 提供开关，不 dispatch；S2 起逐个填空。
+//   ORION_VOL_RESTIR=1 启用
+// ============================================================================
+static std::atomic<uint32_t> g_volRestirEnabled{0u};
+// GUI 覆盖值：0xFFFFFFFF = 未设置（回落到 ORION_VOL_RESTIR 环境变量）。
+// 设置界面的「体积光 ReSTIR」开关写这里，下一次 updateCamera 之后生效。
+static std::atomic<uint32_t> g_volRestirGuiOverride{0xFFFFFFFFu};
+// 相机是否在水里（1 = 水下）。旧的光柱 pass 负责水下分支，我们的 ReSTIR 链
+// 没有水下介质，所以水下时本链整体跳过，把 g_godRayTargetImage 让给旧 pass。
+static std::atomic<uint32_t> g_cameraInWater{0u};
+// 2026-10-26 S4: forward declaration. The definition lives ~36000 lines below,
+// but the legacy god-ray dispatch guard (~41124) needs it first.
+static uint32_t volRestirEnabled();
+
+// 2026-10-27：诊断视图的两个前置声明（定义分别在 create* 与 createVolumeRestir3DImage 附近，
+// 都晚于 createGlassAlphaBlendImages 的调用点）。
+static uint32_t volDiagMode();
+static void createPlaceholder3DImage(VkFormat format, VkImage& image,
+    VkDeviceMemory& memory, VkImageView& view);
+
+static constexpr uint32_t VOL_RESTIR_DEPTH = 64u;
+static constexpr uint32_t VOL_FROXEL_DOWNSCALE = 8u;
+static constexpr uint32_t VOL_RESTIR_DOWNSCALE = 4u;
+
+static VkImage g_volRadianceImage[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+static VkDeviceMemory g_volRadianceMemory[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+static VkImageView g_volRadianceView[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+
+// 2026-10-27：radiance volume 的 SH 辐照度缓存（Remix AccumulatedRadianceY/CoCg）。
+// [0] = 本帧输出、[1] = 上一帧；age 复用下面的 g_volAge*（R8_UNORM，此前建了但没用）。
+static VkImage g_volShYImage[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+static VkDeviceMemory g_volShYMemory[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+static VkImageView g_volShYView[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+static VkImage g_volShCoCgImage[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+static VkDeviceMemory g_volShCoCgMemory[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+static VkImageView g_volShCoCgView[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+// 首帧 [1] 是未初始化显存，必须清一次（否则历史 Sh 会读到垃圾）。
+static bool g_volShNeedsInit = true;
+
+static VkImage g_volAgeImage[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+static VkDeviceMemory g_volAgeMemory[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+static VkImageView g_volAgeView[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+
+static VkImage g_volReservoirImage[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+static VkDeviceMemory g_volReservoirMemory[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+static VkImageView g_volReservoirView[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+// 2026-10-26：composite 采样场景深度用的 nearest + clamp sampler。
+// 缺它会以 COMBINED_IMAGE_SAMPLER 传 NULL sampler ⇒ 驱动 access violation。
+static VkSampler g_volDepthSampler = VK_NULL_HANDLE;
+
+static uint32_t g_volFroxelW = 0u;
+static uint32_t g_volFroxelH = 0u;
+static uint32_t g_volRestirW = 0u;
+static uint32_t g_volRestirH = 0u;
+static uint32_t g_volWriteIndex = 0u;
+
+// S2（2026-10-26）：INITIAL 阶段的管线与描述符。成组创建、成组销毁。
+static VkDescriptorSetLayout g_volRestirSetLayout = VK_NULL_HANDLE;
+static VkDescriptorPool g_volRestirDescriptorPool = VK_NULL_HANDLE;
+static VkDescriptorSet g_volRestirSet = VK_NULL_HANDLE;
+static VkPipelineLayout g_volRestirPipelineLayout = VK_NULL_HANDLE;
+static VkPipeline g_volRestirPipeline = VK_NULL_HANDLE;
+// loadSpv 对缺失文件抛 std::runtime_error（发行包白名单可能没带上这个 SPV）。
+// 失败一次就记住，避免每帧重试把日志刷爆。
+static bool g_volRestirPipelineFailed = false;
+// 两张 3D 写目标的布局状态：首帧 UNDEFINED -> GENERAL，之后只在 GENERAL 内同步。
+static bool g_volRestirLayoutReady = false;
+// 本地光表/网格的 buffer 会在灯数增长时被整块重建（destroyLocalLightGpuBuffer）。
+// 描述符里存的是 buffer 句柄，重建后必须重写，否则 dispatch 读已释放的内存。
+static VkBuffer g_volRestirBoundLightBuffer = VK_NULL_HANDLE;
+static VkBuffer g_volRestirBoundGridBuffer = VK_NULL_HANDLE;
+// 2026-10-28：同一个坑在 S3b（visibility）与 S4（integrate）上也有，而且更严重 ——
+//   · 12/13 灯表/网格：同上，灯数增长后整块重建；
+//   · binding 2 的 TLAS：g_tlas 在实例容量增长时被 parkTlasStorage() 换掉
+//     （VulkanCore.cpp:21054），旧句柄随后销毁。描述符留着旧句柄时，
+//     ray query 打的是一棵已释放的加速结构 ⇒ 遮挡判定整段失效
+//     ⇒ 火把隔着墙把室内雾照亮（2026-10-28 报告的漏光）。
+// 按句柄身份比较，变了就在录制时重写。销毁路径会把它们全部归零。
+static VkAccelerationStructureKHR g_volRestirBoundVisibilityTlas = VK_NULL_HANDLE;
+static VkBuffer g_volRestirBoundVisibilityLightBuffer = VK_NULL_HANDLE;
+static VkBuffer g_volRestirBoundVisibilityGridBuffer = VK_NULL_HANDLE;
+static VkBuffer g_volRestirBoundIntegrateLightBuffer = VK_NULL_HANDLE;
+static VkBuffer g_volRestirBoundIntegrateGridBuffer = VK_NULL_HANDLE;
+// 2026-10-28：integrate 的 binding 22 = 场景 TLAS（每 froxel 的 NEE 可见性）。
+// 与 visibility 的 binding 2 同一个坑：g_tlas 在实例容量增长时被换掉。
+static VkAccelerationStructureKHR g_volRestirBoundIntegrateTlas = VK_NULL_HANDLE;
+// S3（2026-10-26）：temporal / spatial 两套描述符与管线。
+// 两张 reservoir 图角色固定，不轮换：
+//   reservoir[0] = 当前帧（initial 写 → temporal 原地合并 → spatial 的输入）
+//   reservoir[1] = 上一帧最终结果（temporal 的 history → spatial 的输出）
+static VkDescriptorSetLayout g_volRestirTemporalSetLayout = VK_NULL_HANDLE;
+static VkDescriptorPool g_volRestirTemporalDescriptorPool = VK_NULL_HANDLE;
+static VkDescriptorSet g_volRestirTemporalSet = VK_NULL_HANDLE;
+static VkPipelineLayout g_volRestirTemporalPipelineLayout = VK_NULL_HANDLE;
+static VkPipeline g_volRestirTemporalPipeline = VK_NULL_HANDLE;
+
+static VkDescriptorSetLayout g_volRestirSpatialSetLayout = VK_NULL_HANDLE;
+static VkDescriptorPool g_volRestirSpatialDescriptorPool = VK_NULL_HANDLE;
+static VkDescriptorSet g_volRestirSpatialSet = VK_NULL_HANDLE;
+static VkPipelineLayout g_volRestirSpatialPipelineLayout = VK_NULL_HANDLE;
+static VkPipeline g_volRestirSpatialPipeline = VK_NULL_HANDLE;
+
+// S4（2026-10-26）：froxel 入散射（integrate）+ 屏幕积分（composite）。
+static VkDescriptorSetLayout g_volRestirIntegrateSetLayout = VK_NULL_HANDLE;
+static VkDescriptorPool g_volRestirIntegrateDescriptorPool = VK_NULL_HANDLE;
+static VkDescriptorSet g_volRestirIntegrateSet = VK_NULL_HANDLE;
+static VkPipelineLayout g_volRestirIntegratePipelineLayout = VK_NULL_HANDLE;
+static VkPipeline g_volRestirIntegratePipeline = VK_NULL_HANDLE;
+
+static VkDescriptorSetLayout g_volRestirCompositeSetLayout = VK_NULL_HANDLE;
+static VkDescriptorPool g_volRestirCompositeDescriptorPool = VK_NULL_HANDLE;
+static VkDescriptorSet g_volRestirCompositeSet = VK_NULL_HANDLE;
+static VkPipelineLayout g_volRestirCompositePipelineLayout = VK_NULL_HANDLE;
+static VkPipeline g_volRestirCompositePipeline = VK_NULL_HANDLE;
+
+// S3b：可见性 pass（spatial 之后、integrate 之前）。每个 restir texel 向选中灯
+// 发一条遮挡射线，被挡则清空样本。
+static VkDescriptorSetLayout g_volRestirVisibilitySetLayout = VK_NULL_HANDLE;
+static VkDescriptorPool g_volRestirVisibilityDescriptorPool = VK_NULL_HANDLE;
+static VkDescriptorSet g_volRestirVisibilitySet = VK_NULL_HANDLE;
+static VkPipelineLayout g_volRestirVisibilityPipelineLayout = VK_NULL_HANDLE;
+static VkPipeline g_volRestirVisibilityPipeline = VK_NULL_HANDLE;
+
+// 屏幕积分的步数：froxel 层数 / 4。16 步足以跨过 64 层（每步跨 4 层），
+// 再多的收益被 froxel 的线性插值吃掉。
+static constexpr uint32_t VOL_RESTIR_COMPOSITE_STEPS = 16u;
+// 介质的消光缩放。1.0 = 直接吃 fog_density_common.glsl 的 VFOG_DENSITY。
+static constexpr float VOL_RESTIR_EXTINCTION_SCALE = 1.0f;
+
+// 时间累积的样本数上限。无上限时权重会随帧数无限增长，相机一停就锁死在旧样本上，
+// 一动就是拖影；2 是 ReSTIR 在"每帧 32 样本"量级下的常规取值。
+static constexpr uint32_t VOL_RESTIR_MAX_SAMPLES = 2u;
+// chain 两个 pass 共用同一份 32 字节 push constant 范围（spatial 只用前 16 字节，
+// shader 侧声明更小的块是合法的）。
+static constexpr uint32_t VOL_RESTIR_CHAIN_PUSH_BYTES = 32u;
+
+// froxel 的最远覆盖距离（格）。Minecraft 的雾能到 96 格外，Remix 默认 20 不够。
+static constexpr float VOL_RESTIR_MAX_DISTANCE = 96.0f;
+// 深度切片的指数分布幂次（>1 = 近密远疏）。
+static constexpr float VOL_RESTIR_DEPTH_EXPONENT = 2.0f;
+
 
 // ---------------------------------------------------------------
 // 体积光 2026-10-04 重构（P1+P2+P3）：march + 时间重投影 + 深度感知合成。
@@ -5276,6 +5514,16 @@ static void createWaterCausticMapResources();
 static void recordWaterCausticMap(VkCommandBuffer cmd);
 static void destroyWaterCausticMapResources();
 static void updateWaterCausticMapRayDescriptor();
+
+// 2026-10-26 持久泡沫图（路线 B，Crest Ocean 移植）。
+// 2026-10-26 21:1x 用户定档不要泡沫 ⇒ 整条路线回退（源码屏蔽保留，见
+// 46756 起的泡沫模块）。要复活就同时打开本段、模块块与各调用点的 #if 0。
+#if 0
+static void createWaterFoamResources();
+static void recordWaterFoam(VkCommandBuffer cmd);
+static void destroyWaterFoamResources();
+static void updateWaterFoamRayDescriptor();
+#endif
 
 static void createWaterSimulationResources();
 static void createWaterSimulationPipeline();
@@ -6651,6 +6899,166 @@ static bool g_giHalfNeedsClear = false;
 // 描述符句柄缓存：图变了才重写（与 binding 71 的 rrHintBoundView 同一套做法）。
 static VkImageView g_giHalfBoundView = VK_NULL_HANDLE;
 
+
+// =====================================================
+// 2026-10-26 半透明 alpha blend 拆 pass
+//
+// 设计：docs/decisions/alpha-blend-pass-split.md（本轮按 §7.4 执行）
+// 目标链（用户指定）：RTX Remix 的 **RTXDI 关闭 + RR 降噪**
+//   primary raytrace -> alpha blend composite -> composite -> NRD/RR
+// 生产者：rt_test.rgen（binding 73/74/75，只写不合成）
+// 消费者：glass_alpha_blend.comp（邻居搜索 + 5x5 滤波 + 合成）
+//         glass_alpha_finish.comp（写回 rtOutput）
+//
+// 四张图都是**渲染分辨率**、RGBA16F、layout 全程 GENERAL，生命周期照
+// createRRGuideImage / destroyHistoryImage（分辨率变化时整张重建）。
+// 其中 73/74/75 由 raygen 写 ⇒ 必须挂进 RT 主 set；radiance 只有新 pass 用
+// ⇒ 只出现在新 pass 自己的 set 里。
+// =====================================================
+static VkImage g_alphaBlendGbufferImage = VK_NULL_HANDLE;
+static VkDeviceMemory g_alphaBlendGbufferMemory = VK_NULL_HANDLE;
+static VkImageView g_alphaBlendGbufferView = VK_NULL_HANDLE;
+static VkImageLayout g_alphaBlendGbufferLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+static VkImage g_alphaBlendMetaImage = VK_NULL_HANDLE;
+static VkDeviceMemory g_alphaBlendMetaMemory = VK_NULL_HANDLE;
+static VkImageView g_alphaBlendMetaView = VK_NULL_HANDLE;
+static VkImageLayout g_alphaBlendMetaLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+static VkImage g_alphaBlendLightImage = VK_NULL_HANDLE;
+static VkDeviceMemory g_alphaBlendLightMemory = VK_NULL_HANDLE;
+static VkImageView g_alphaBlendLightView = VK_NULL_HANDLE;
+static VkImageLayout g_alphaBlendLightLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+// 2026-10-27：radiance volume 兜底的等价数据源（见 updateGPU 注释）。
+// rgb = 体素面辐照度缓存换算出的 volumeRadiance（单位 albedo 的漫反射出射辐射），
+// a = 1 = 有效。rgen 写、blend pass 在邻居搜索失败时读。
+static VkImage g_alphaBlendVolumeImage = VK_NULL_HANDLE;
+static VkDeviceMemory g_alphaBlendVolumeMemory = VK_NULL_HANDLE;
+static VkImageView g_alphaBlendVolumeView = VK_NULL_HANDLE;
+static VkImageLayout g_alphaBlendVolumeLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+static VkImage g_alphaBlendRadianceImage = VK_NULL_HANDLE;
+static VkDeviceMemory g_alphaBlendRadianceMemory = VK_NULL_HANDLE;
+static VkImageView g_alphaBlendRadianceView = VK_NULL_HANDLE;
+static VkImageLayout g_alphaBlendRadianceLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+// 2026-10-27：SH 不可用时的 3D 占位图（1x1x1，rgba16f）。
+// blend 的 binding 11/12 是固定 layout 项，描述符必须始终有效。
+static VkImage g_alphaBlendPlaceholder3DImage = VK_NULL_HANDLE;
+static VkDeviceMemory g_alphaBlendPlaceholder3DMemory = VK_NULL_HANDLE;
+static VkImageView g_alphaBlendPlaceholder3DView = VK_NULL_HANDLE;
+
+// 2026-10-27：诊断视图（vol_diag.comp）与它需要的两种格式占位图。
+// storage image 的格式必须与 shader 声明一致，不能共用一张 rgba16f 占位图。
+static VkPipeline g_glassAlphaDiagPipeline = VK_NULL_HANDLE;
+static VkImage g_alphaBlendPlaceholderR8Image = VK_NULL_HANDLE;
+static VkDeviceMemory g_alphaBlendPlaceholderR8Memory = VK_NULL_HANDLE;
+static VkImageView g_alphaBlendPlaceholderR8View = VK_NULL_HANDLE;
+static VkImage g_alphaBlendPlaceholderUintImage = VK_NULL_HANDLE;
+static VkDeviceMemory g_alphaBlendPlaceholderUintMemory = VK_NULL_HANDLE;
+static VkImageView g_alphaBlendPlaceholderUintView = VK_NULL_HANDLE;
+
+static uint32_t g_alphaBlendWidth = 0u;
+static uint32_t g_alphaBlendHeight = 0u;
+
+static VkDescriptorSetLayout g_glassAlphaBlendSetLayout = VK_NULL_HANDLE;
+static VkDescriptorPool g_glassAlphaBlendPool = VK_NULL_HANDLE;
+static VkDescriptorSet g_glassAlphaBlendSet = VK_NULL_HANDLE;
+static VkPipelineLayout g_glassAlphaBlendPipelineLayout = VK_NULL_HANDLE;
+static VkPipeline g_glassAlphaBlendPipeline = VK_NULL_HANDLE;
+static VkPipeline g_glassAlphaFinishPipeline = VK_NULL_HANDLE;
+static bool g_glassAlphaBlendPipelineFailed = false;
+static uint32_t g_glassAlphaBlendFrameIndex = 0u;
+
+// 2026-10-27：Remix 的时空蓝噪声表（128x128x64，R8_UNORM）。
+// 原文用 texelFetch(BlueNoise, ...) 取单 texel ⇒ 这里等价地放进 storage buffer
+// 按字节索引（NEAREST 语义完全相同），避免 image + sampler + cmd 上传。
+static VkBuffer g_glassBlueNoiseBuffer = VK_NULL_HANDLE;
+static VkDeviceMemory g_glassBlueNoiseMemory = VK_NULL_HANDLE;
+static bool g_glassBlueNoiseReady = false;
+
+// 描述符重写判据（照 binding 71 / 72 的 BoundView 缓存）：初始化顺序上
+// g_dlssDepthView 等视图晚于本 pass 的图创建，所以写完必须能在录制时补写。
+static VkDescriptorSet g_glassAlphaBlendBoundSet = VK_NULL_HANDLE;
+static VkImageView g_glassAlphaBlendBoundRayGbuffer = VK_NULL_HANDLE;
+static VkImageView g_glassAlphaBlendBoundColor = VK_NULL_HANDLE;
+static VkImageView g_glassAlphaBlendBoundGbuffer = VK_NULL_HANDLE;
+static VkImageView g_glassAlphaBlendBoundMeta = VK_NULL_HANDLE;
+static VkImageView g_glassAlphaBlendBoundLight = VK_NULL_HANDLE;
+static VkImageView g_glassAlphaBlendBoundRadiance = VK_NULL_HANDLE;
+static VkImageView g_glassAlphaBlendBoundDepth = VK_NULL_HANDLE;
+static VkImageView g_glassAlphaBlendBoundNormal = VK_NULL_HANDLE;
+static VkImageView g_glassAlphaBlendBoundAlbedo = VK_NULL_HANDLE;
+static VkImageView g_glassAlphaBlendBoundShY = VK_NULL_HANDLE;
+
+// 必须与 glass_alpha_blend.comp / glass_alpha_finish.comp 的
+// push_constant 块**逐字节一致**（64 B）。
+struct GlassAlphaBlendPush
+{
+    uint32_t extentX;
+    uint32_t extentY;
+    uint32_t neighborIterations;
+    uint32_t frameIndex;
+    float neighborRadius;
+    float neighborExpand;
+    float normalThreshold;
+    float depthThreshold;
+    float coplanarThreshold;
+    // 原 transparencyBandwidth / distanceWeight / depthBandwidth 三个位置改作 SH 参数
+    // （2026-10-27：5x5 滤波在原文里不存在，见 docs/decisions/alpha-blend-pass-split.md）。
+    float shMaxDistance;      // VOL_RESTIR_MAX_DISTANCE
+    float shDepthExponent;    // VOL_RESTIR_DEPTH_EXPONENT
+    float shValid;            // 1 = SH 缓存可用（体积 ReSTIR 链在跑且有数据）
+    uint32_t neighborSearch;
+    uint32_t enableFilter;    // useRadianceVolume
+    uint32_t pad0;            // searchTheSameObject
+    uint32_t pad1;            // shareNeighbors
+    // SH froxel 网格（世界坐标 -> froxel 坐标要用）。
+    uint32_t shFroxelW;
+    uint32_t shFroxelH;
+    uint32_t shFroxelDepth;
+    uint32_t dbgMode;         // ORION_GLASS_ALPHA_BLEND_DBG=1 时为 1
+};
+
+static_assert(
+    sizeof(GlassAlphaBlendPush) == 80u,
+    "GlassAlphaBlendPush: shader push_constant block is 80 B");
+
+static bool glassAlphaBlendEnvFlag(const char* name)
+{
+    const char* raw = std::getenv(name);
+    return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+}
+
+// 邻居搜索 / 体积辐照度兜底的开关。
+//
+// 2026-10-26（第四轮，严格搬）：出厂值改成与原文一致 ——
+//   rtx_composite.h  stochasticAlphaBlendUseNeighborSearch = true
+//                    stochasticAlphaBlendUseRadianceVolume = true
+// 这两个环境变量现在只做 **A/B 关闭**（默认开），名字也改成 OFF 语义。
+//   ORION_GLASS_ALPHA_BLEND_NEIGHBOR=0          关邻居搜索（退回本像素兜底）
+//   ORION_GLASS_ALPHA_BLEND_RADIANCE_VOLUME=0   关体积辐照度兜底
+static bool glassAlphaBlendEnvDisabled(const char* name)
+{
+    const char* raw = std::getenv(name);
+    return raw != nullptr && raw[0] == '0' && raw[1] == '\0';
+}
+
+static bool glassAlphaBlendNeighborSearchEnabled()
+{
+    static const bool cached =
+        !glassAlphaBlendEnvDisabled("ORION_GLASS_ALPHA_BLEND_NEIGHBOR");
+    return cached;
+}
+
+static bool glassAlphaBlendRadianceVolumeEnabled()
+{
+    static const bool cached =
+        !glassAlphaBlendEnvDisabled("ORION_GLASS_ALPHA_BLEND_RADIANCE_VOLUME");
+    return cached;
+}
+
 // =====================================================
 // ORION_GI_HALF：半分辨率 GI 的**唯一**环境开关（默认关 = 逐位旧画面）。
 //
@@ -6659,6 +7067,208 @@ static VkImageView g_giHalfBoundView = VK_NULL_HANDLE;
 // 关掉时：宿主不建图、不建管线、不 dispatch，且往 UBO 写 0 ⇒ 主 raygen 走
 // 原来的全分辨率 GI 回路（那段代码仍在，只是被运行时分支跳过）。
 // =====================================================
+// ORION_GI_HALF_ROTATE：半图相位是否按帧轮转（默认关）。
+// 开 = 2×2 块内四个子像素四帧各算一次（HANDOFF §3 的原方案），但每个 texel 代表的
+// 世界位置每帧平移一个像素 ⇒ 时间抖动、RR 累积失效（2026-10-25 实测满屏闪点）。
+// 关 = texel (i,j) 固定代表像素 (2i,2j)，稳定但永久 2×2 模糊。
+static bool giHalfRotateEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_GI_HALF_ROTATE");
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+
+    return cached;
+}
+
+// ORION_GI_NO_POM：GI 射线跳过 POM（含 POM 自阴影）。见 rt_test.rgen 的
+// RT_STATE_GI_NO_POM_BIT 处注释。默认关 = 逐位当前行为。
+// 2026-10-25：设置界面下发值（-1 = 未覆盖，回落到环境变量 / 默认）。
+// UI 优先于 env，这样"看画面调"时不用重启客户端。
+static std::atomic<int> g_giNearRateOverride{-1};
+static std::atomic<int> g_glossyRoughLodOverride{-1};
+
+// ORION_GI_NEAR_RATE：近场 GI 的降速级（0 = 全速 / 1 = 半速 / 2 = 四分之一）。
+// 距离 LOD（rtLodDiffuseGiEnabled）只管 64 格以外；室内近场原本全速，这一项才是
+// 给近场用的。机制与光泽粗糙度分级同构：独立 bit 片 + 权重补偿 = 无偏的时间
+// 估计量，跳过的是 GI 信号而不是像素 ⇒ 不出锯齿。
+static int giNearRateLevel()
+{
+    // UI 覆盖优先（设置界面「GI 近场采样」）。
+    const int override = g_giNearRateOverride.load(std::memory_order_relaxed);
+    if(override >= 0)
+    {
+        return override;
+    }
+
+    static const int cached = []()
+    {
+        const char* raw = std::getenv("ORION_GI_NEAR_RATE");
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            // 2026-10-25 实测后改为默认 2（四分之一）：rt 18.04 -> 10.79，观感可接受。
+            // 显式给 0 仍可回到全速。
+            return 2;
+        }
+
+        const int parsed = std::atoi(raw);
+        if(parsed >= 2)
+        {
+            return 2;
+        }
+        return parsed >= 1 ? 1 : 0;
+    }();
+
+    return cached;
+}
+
+// ORION_GLOSSY_ROUGH_LOD：光泽反射按粗糙度降速（半速/四分之一），见
+// rt_test.rgen 的 glossySampleLevel 处注释。默认关 = 逐位旧行为。
+static bool glossyRoughLodEnabled()
+{
+    // UI 覆盖优先（设置界面「光泽采样」）。
+    const int override = g_glossyRoughLodOverride.load(std::memory_order_relaxed);
+    if(override >= 0)
+    {
+        return override != 0;
+    }
+
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_GLOSSY_ROUGH_LOD");
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            // 2026-10-25 实测后改为默认开：室内 noGlossy Δ 4.27 -> 2.50ms，观感可接受。
+            // 显式给 0 仍可关闭。
+            return true;
+        }
+        return raw[0] != '0';
+    }();
+
+    return cached;
+}
+
+static bool giNoPomEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_GI_NO_POM");
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+
+    return cached;
+}
+
+// =====================================================
+// 2026-10-26 直接光模式 + 稀疏渲染（HANDOFF-2026-10-26-RTDI-SPARSE.md）。
+// 两者都走「UI 覆盖原子量(-1=未覆盖) → 环境变量 → 出厂默认」的三级解析，
+// 与 giNearRateLevel 同构；默认值 0/0 = 逐位旧画面。
+// =====================================================
+static std::atomic<int> g_directLightModeOverride{-1};
+
+// 2026-10-28 间接光模式（对齐 Remix 的 IntegrateIndirectMode）：
+//   0 = GI（出厂，逐位等于改动前）
+//   1 = SHaRC：命中即截断 GI 路径（rgen:25493 本来就是 break 语义）
+// -1 = 未设（回落 env / 出厂 0）。
+// 与 Remix 的差别：Remix 把它做成与 ReSTIR GI / NRC 互斥的**替代**模式，并联动
+// GI 采样档位；这里只做模式入口，GI 回路不动（第 2 阶段才联动降采样）。
+static std::atomic<int> g_indirectModeOverride{-1};
+static std::atomic<int> g_sparseRatePercentOverride{-1};
+static std::atomic<int> g_rtxdiReuseInactiveOverride{-1};
+
+// 直接光采样模式：0 = 传统单帧 RIS（旧路径）；1 = RTXDI 式时域 reservoir
+// （重投影 + 灯身份验证 + WRS 合并 + 1 条可见性射线；见 rt_test.rgen 的
+// LOCAL_RIS_PRIMARY_TEMPORAL 运行时分支）。
+static int directLightMode()
+{
+    const int override =
+        g_directLightModeOverride.load(std::memory_order_relaxed);
+    if(override >= 0)
+    {
+        return override > 0 ? 1 : 0;
+    }
+
+    static const int cached = []()
+    {
+        const char* raw = std::getenv("ORION_DIRECT_LIGHT_MODE");
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return 0;
+        }
+        return std::atoi(raw) >= 1 ? 1 : 0;
+    }();
+
+    return cached;
+}
+
+// 稀疏渲染活跃采样率（%）：0 = 关（默认）；1..100 = 界面/env 的请求值。
+//
+// 2026-10-27 更正：这条注释此前写「官方 rtx-remix-minecraft 的量产档为
+// quality 0.3 ≈ 30~35%」，把另一套模组当成参考标注，属于错误归因。
+// RTX Remix 的实际参数在 rtx_sparse_rendering.h 的 Options 里：
+//   samplingRate = 0.357、enableAdaptiveSamplingRate = true、
+//   samplingRateResolutionExponent = 0.69、quality = 0.5、maxSamplingRate = 0.75。
+// 本函数只取「请求的百分比」；真正的有效采样率由 sparseSamplingRateEffective()
+// 按 Remix 的 calculateSamplingRate 计算（见该函数注释）。
+static int sparseRatePercent()
+{
+    const int override =
+        g_sparseRatePercentOverride.load(std::memory_order_relaxed);
+    if(override >= 0)
+    {
+        return std::min(100, std::max(0, override));
+    }
+
+    static const int cached = []()
+    {
+        const char* raw = std::getenv("ORION_SPARSE_RATE");
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return 0;
+        }
+        return std::min(100, std::max(0, std::atoi(raw)));
+    }();
+
+    return cached;
+}
+
+// RTXDI×稀疏联动：非活跃像素是否仍做廉价 reservoir 验证/老化（默认 1）。
+//
+// ⚠ 2026-10-27 自创标注：此前这里写「对齐官方
+// rtx.sparseRendering.enableRtxdiReuseForInactivePixels=true」，该选项名在
+// _ref/dxvk-remix 全仓库 0 命中。Remix 的 RTXDI initial / temporal / spatial
+// reuse 三个 pass 全部走 SparseRendering::dispatchCompactedConsumer
+// (rtx_rtxdi_rayquery.cpp:518 / 524 / 593)，非活跃像素根本没有线程，不存在
+// 「仍合并/老化 reservoir」这一行为。本开关是本工程的取舍（防再激活闪烁），
+// 不是移植；默认值 1 也不代表官方默认。
+static int rtxdiReuseInactiveEnabled()
+{
+    const int override =
+        g_rtxdiReuseInactiveOverride.load(std::memory_order_relaxed);
+    if(override >= 0)
+    {
+        return override > 0 ? 1 : 0;
+    }
+
+    static const int cached = []()
+    {
+        const char* raw = std::getenv("ORION_RTDI_REUSE_INACTIVE");
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            // 2026-10-27：默认从 1 改为 0。Remix 的 RTXDI initial/temporal/spatial
+            // reuse 三个 pass 全部走 dispatchCompactedConsumer
+            // (rtx_rtxdi_rayquery.cpp:518/524/593)，非活跃像素没有线程，
+            // 不存在"仍合并/老化 reservoir"这一行为；本开关是自创，
+            // 默认应保持关闭才与参考一致。需要旧行为时设 ORION_RTDI_REUSE_INACTIVE=1。
+            return 0;
+        }
+        return raw[0] != '0' ? 1 : 0;
+    }();
+
+    return cached;
+}
+
 static bool giHalfEnabled()
 {
     static const bool cached = []()
@@ -6673,9 +7283,16 @@ static bool giHalfEnabled()
 
 static bool rrTransparencyHintEnabled()
 {
+    // 2026-10-24：默认**启用**。10-23 的"默认关"理由（阶段 1 值未定义）已失效
+    // —— rgen 现在无条件写值（玻璃 delta/接收面 guide + 2026-10-24 的粒子像素，
+    // 见 rrParticlePixel）。机制：kBufferTypeTransparencyHint ⇒ RR 对这些像素
+    // 降低历史信任 —— 治玻璃透射与粒子（billboard 移动/生灭）的时域拖尾。
+    // 注意：本机制是否被当前 nvngx_dlssd 版本实际消费未经验证（现行官方指南
+    // 已改推 TransparencyLayer + ColorBeforeTransparency）；未被消费时本开关
+    // 无副作用。回退：ORION_RR_TRANSPARENCY_HINT=0。
     static const bool enabled = []() {
         const char* raw = std::getenv("ORION_RR_TRANSPARENCY_HINT");
-        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+        return raw == nullptr || raw[0] == '\0' || raw[0] != '0';
     }();
     return enabled;
 }
@@ -7117,6 +7734,80 @@ static VkResult FGDeviceWaitIdle(
 static bool g_dlssReady = false;
 static bool g_dlssRRSupported = false;
 static bool g_dlssRRReady = false;
+
+// =====================================================
+// 2026-10-27 稀疏渲染有效采样率。逐行照搬 RTX Remix：
+//   _ref/dxvk-remix/src/dxvk/rtx_render/rtx_sparse_rendering.cpp
+//     calculateSamplingRate()  :256-290
+//     isEnabled()              :147-190
+//
+// 逐项对应（不做自造变体）：
+//   · 界面百分比 = Remix 的 samplingRate（[0,1] 目标概率）。
+//     Remix 的 quality 默认 0.5 时 qualitySamplingRate == calculatedSamplingRate
+//     （对数插值在 |2*0.5-1| == 0 处退化），所以这里不引入 quality 维度。
+//   · enableAdaptiveSamplingRate = true（Remix 默认）：
+//       rate *= pow(kReferencePixelCount / pixels, 0.69)
+//     kReferencePixelCount = 2227 * 1238 = Remix 调参所用的 4K DLSS Auto 像素数。
+//   · clamp 到 [1/16, 1]（Remix samplingRate 的 min/max 边界）。
+//   · rate > maxSamplingRate（默认 0.75）⇒ Remix 直接关闭稀疏，而不是按 0.75 跑：
+//     那时画质损失已不抵性能收益。这里同样返回 0。
+//   · 没有 DLSS Ray Reconstruction ⇒ Remix 关闭稀疏（RR 是唯一被验证过能重建
+//     稀疏信号的降噪器）。这里同样返回 0。
+// =====================================================
+static std::atomic<bool> g_sparseRateHistoryReset{false};
+
+// 2026-10-27 阶段 3：稀疏历史是否已有有效内容。0 = 首帧或刚切档，
+// 此时 rgen 必须全写（g_rtOutputImage 每帧不清零，非活跃像素读到的是上帧值）。
+// 生命周期：updateCamera 写入 UBO 后置 true；采样率变化时置 false。
+static std::atomic<bool> g_sparseHistoryValid{false};
+
+static float sparseSamplingRateEffective()
+{
+    if(!g_dlssRRReady)
+    {
+        return 0.0f;
+    }
+
+    const int percent = sparseRatePercent();
+    if(percent <= 0)
+    {
+        return 0.0f;
+    }
+
+    constexpr float kReferencePixelCount = 2227.0f * 1238.0f;
+    constexpr float kSamplingRateResolutionExponent = 0.69f;
+    constexpr float kMinSamplingRate = 1.0f / 16.0f;
+    constexpr float kMaxSamplingRate = 0.75f;
+
+    const float pixelCount = static_cast<float>(
+        std::max(1u, g_rtOutputWidth) *
+        std::max(1u, g_rtOutputHeight));
+
+    float rate = static_cast<float>(percent) * 0.01f;
+    rate *= std::pow(
+        kReferencePixelCount / pixelCount,
+        kSamplingRateResolutionExponent);
+    rate = std::clamp(rate, kMinSamplingRate, 1.0f);
+
+    if(rate > kMaxSamplingRate)
+    {
+        rate = 0.0f;
+    }
+
+    // Remix rtx_context.cpp:415-420：采样率变化必须重置历史，否则新速率的
+    // 1/rate 归一化与旧速率累积的信号不匹配，画面会从错误历史收敛。
+    static float previousRate = 0.0f;
+    if(rate != previousRate)
+    {
+        previousRate = rate;
+        g_sparseRateHistoryReset.store(true, std::memory_order_relaxed);
+
+        // 新速率下旧的 image 内容是错误口径（旧 1/rate），当帧必须全写覆盖。
+        g_sparseHistoryValid.store(false, std::memory_order_relaxed);
+    }
+
+    return rate;
+}
 static bool g_dlssGSupported = false;
 static bool g_dlssGReady = false;
 // Streamline feature loading and function lookup are device-lifetime work.
@@ -7405,7 +8096,13 @@ static std::atomic<float> g_cloudFarFadeDistance{80000.0f};
 // +6000 格"以对齐绝对高度 10000。
 // ⚠ 观感**没有在游戏里验证过** —— 这是移植后的首次出厂，请以实机为准。
 // =====================================================
-static std::atomic<float> g_planeCloudEnabled{1.0f};
+// 2026-10-26 默认改为 **关**。这个原子量同时被 populateHighCloudParams 写进
+// highCloudParams[0]，而 v5 着色器把 highCloudParams0.x 当作"是否绘制 2D 高空云层"
+// 的开关 —— 于是遗留的 2D 平面云默认是开着的，和 v5 的体积低云层叠在一起：
+// 用户截图里那些小而均匀、在 27.5 km 高度上飞速平移的橘色团块就是它
+// （heightOffset 27500 / octaves 8 / speed 直接乘在 UV 上）。
+// 两套云共用一个 lane 是历史遗留；这里先把默认关掉，需要时在设置里显式打开。
+static std::atomic<float> g_planeCloudEnabled{0.0f};
 static std::atomic<float> g_planeCloudHeightOffset{6000.0f};
 static std::atomic<float> g_planeCloudScale{1.0f};
 static std::atomic<float> g_planeCloudSpeed{1.0f};
@@ -7600,6 +8297,37 @@ static std::atomic<float> g_cloudDetileStrength{10.0f};
 // 2026-10-18：v4 外形的两个旋钮（cloudParams5.x / .y，两个 lane 此前是 0 占位）
 static std::atomic<float> g_cloudType{0.8f};           // 0=层云 0.5=层积云 1=积云（出厂积云）
 static std::atomic<float> g_cloudErosionScale{1.0f};   // 云缘侵蚀幅度倍率
+// 2026-10-25 v5（HP）全参数：28 项，初值与 cloud_v5_core.glsl 的 hpDefaultConfig()
+// 逐项一致。Java 侧通过 setCloudHpParams(float[28]) 一次写入；
+// populate 时原样搬进 CameraUBO 的 hpShapeA..hpMiscA 七块。
+static std::atomic<float> g_hpDetailStrengthCu{0.55f};
+static std::atomic<float> g_hpDetailStrengthTcu{0.70f};
+static std::atomic<float> g_hpDetailStrengthCb{0.85f};
+static std::atomic<float> g_hpBottomSmoothHeight{0.08f};
+static std::atomic<float> g_hpWispyEdgeWidth{0.40f};
+static std::atomic<float> g_hpWispyReach{0.15f};
+static std::atomic<float> g_hpWispyTopHeight{0.75f};
+static std::atomic<float> g_hpWispyTopHardness{2.0f};
+static std::atomic<float> g_hpWispyWeight{0.45f};
+static std::atomic<float> g_hpBillowyWeight{0.45f};
+static std::atomic<float> g_hpLoCoverTopMax{2.2f};
+static std::atomic<float> g_hpLoCoverTopStr{1.0f};
+static std::atomic<float> g_hpCovMapScale{1.0f};
+static std::atomic<float> g_hpScWorleyStrength{0.25f};
+static std::atomic<float> g_hpScHeightScale{0.35f};
+static std::atomic<float> g_hpScCellThickStr{0.6f};
+static std::atomic<float> g_hpForwardEcc{0.85f};
+static std::atomic<float> g_hpBackwardEcc{0.30f};
+static std::atomic<float> g_hpPhiFwdIntensity{0.6f};
+static std::atomic<float> g_hpPhiFwdDepthPow{1.0f};
+static std::atomic<float> g_hpPhiFwdDepthBias{0.0f};
+static std::atomic<float> g_hpPhiFwdCompress{1.0f};
+static std::atomic<float> g_hpScatterOdScale{0.10f};
+static std::atomic<float> g_hpScatterCurvePow{1.0f};
+static std::atomic<float> g_hpMsEccentricity{0.5f};
+static std::atomic<float> g_hpAoUpwardScale{1.0f};
+static std::atomic<float> g_hpFadeStart{0.30f};
+static std::atomic<float> g_hpPowderIntensity{1.0f};
 // 2026-10-18：预览里已有的两个入口（天气图尺度 / 云视距）
 // 2026-10-19：该 lane 改为**远处淡出起点**（0~1 的 viewDistance 比例，出厂 0.75）。
 // 天气图尺度在 Hillaire 模型里已硬绑定 shapeScale×3.5，不再需要独立旋钮。
@@ -7917,10 +8645,6 @@ static void populateCloudParams(float* params)
     params[7] = g_cloudEnabled.load() ? 1.0f : 0.0f;
 
     const uint32_t quality = g_cloudQuality.load();
-    // 2026-10-17：v2（参考模型）在 1/2 云分辨率下可以把步数抬到参考的量级
-    // （32 步 ≈ 参考 1/4 分辨率 × 32 步的 2 倍精度、仍便宜 4×）；
-    // v1 保持原档位不动，删掉 cloud_v2.flag 后逐位回退。
-    const bool cloudV2 = volumetricCloudV2Requested();
  // 2026-10-18：密度模型是**锐利阈值**（remap），采样不足会直接走样成"泡沫"。
     // 原档位 16/20/28 步 × 层厚 1296 ⇒ 步长 65 格，而云缘过渡带只有 100~200 格，
     // 整条边缘只有 2~3 个采样点 —— 这就是游戏里"很糊很噪"的主因（预览是 96 步）。
@@ -7937,14 +8661,7 @@ static void populateCloudParams(float* params)
     // 2026-10-19 **严格对齐预览**（--game-save: 56 步 / 12 阴影步，实测 24.9 fps）。
     // detail 噪声周期 4400 格（detailScale 80 × 55），Nyquist 只要求步长 ≤2200 格，
     // 56 步（32 格/步）已经富余 8 倍 —— 更多步数纯属浪费。
-    if(cloudV2)
-    {
-        params[8] = quality == 0u ? 48.0f : (quality == 2u ? 72.0f : 56.0f);
-    }
-    else
-    {
-        params[8] = quality == 0u ? 48.0f : (quality == 2u ? 72.0f : 56.0f);
-    }
+    params[8] = quality == 0u ? 48.0f : (quality == 2u ? 72.0f : 56.0f);
     params[9] = quality == 0u ? 10.0f : (quality == 2u ? 16.0f : 12.0f);
     // 2026-10-19：params[10] 原来是硬编码 0.008（从未被读取），现改为**逆光银边强度**
     params[10] = g_cloudSilver.load();
@@ -8482,7 +9199,26 @@ static std::atomic<float> g_waterSimPropagationSpeed{1.0f};
 // 说的是**纯 afl 波面**、不是交互场 ⇒ 该改动超出本次范围，**已还原为 1.0f**
 // （真正的重复感根因是 afl 谱带太窄，见 water_wave_field.glsl 的 2026-10-14 注释）。
 // 若日后要临时关掉常驻风源做 A/B：把这行改 0.0f、重编 DLL 即可（纯源码，不动 spv）。
-constexpr float kWaterWindStrength = 1.0f;
+// 2026-10-25：风源默认 **关闭**（0）。
+// 水面视觉的波纹感由 FFT 斜率图（binding 59）承担；water_sim 只保留交互脉冲。
+// 这样无交互时 recordWaterSimulation 直接 idle，省掉实测 12.47 ms/帧。
+// 要恢复"常驻风源水面"：ORION_WATER_WIND=1
+static float waterWindStrength()
+{
+    static const float cached = []() -> float
+    {
+        const char* raw = std::getenv("ORION_WATER_WIND");
+
+        if(raw != nullptr && std::atoi(raw) != 0)
+        {
+            return 1.0f;
+        }
+
+        return 0.0f;
+    }();
+
+    return cached;
+}
 // 2026-10-03 薄层 SSS（CameraUBO.waterSssParams，偏移 1264，只有 rt_test.rgen 读）。
 // 出厂值 = 参考常量：非线性 0.5 / 补偿 2.0 / 相位 g 0.8 / 总强度 1.0。
 static std::atomic<float> g_waterSssNonlinear{0.5f};
@@ -10337,7 +11073,10 @@ static bool perfL10RayStatsEnabled()
 
     return s_enabled;
 }
-constexpr uint32_t PERF_L10_RAY_STAT_COUNT = 12u;
+// 2026-10-28: 12 -> 15。新增的三项（本地光可见性 / 太阳软影 / 光泽）此前完全
+// 没有口径 —— 而 alt 消融在同一局里给"本地光可见性射线"估到 4.5 ms，是单项最大。
+// 着色器侧的数组维度（rt_test.rgen 的 perfRayStatCount）必须同步，否则计数写越界。
+constexpr uint32_t PERF_L10_RAY_STAT_COUNT = 15u;
 // The staging ring must be deeper than the CPU/GPU lead, same rule as the
 // timestamp ring: a slot is read RING_SIZE frames after it was filled.
 constexpr uint32_t PERF_L10_RAY_STAT_RING_SIZE = 8u;
@@ -10357,7 +11096,13 @@ enum PerfL10RayStatIndex : uint32_t
     PERF_L10_RAY_STAT_AO_PIXELS,
     PERF_L10_RAY_STAT_AO_RAYS,
     PERF_L10_RAY_STAT_FAR_LOD_PIXELS,
-    PERF_L10_RAY_STAT_VERY_FAR_LOD_PIXELS
+    PERF_L10_RAY_STAT_VERY_FAR_LOD_PIXELS,
+    // 2026-10-28 append-only。口径是"求值次数"：本地光可见性函数每调用一次、
+    // 阴影循环每发一根、光泽每像素最多一次 —— 在这三处与"射线数"等价。
+    // 配合 [PERF L10 GPU] 的 trace 段即可算出 ns/射线。
+    PERF_L10_RAY_STAT_LOCAL_LIGHT_RAYS,
+    PERF_L10_RAY_STAT_SUN_SHADOW_RAYS,
+    PERF_L10_RAY_STAT_GLOSSY_RAYS
 };
 
 static VkBuffer g_perfL10RayStatsBuffer = VK_NULL_HANDLE;
@@ -10660,6 +11405,24 @@ static void logPerfL10RayStatsWindow()
                 g_perfL10RayStatsSums[
                     PERF_L10_RAY_STAT_VERY_FAR_LOD_PIXELS
                 ]
+            ) / instrumentedPixels
+        )
+        << " localPerPix="
+        << (
+            static_cast<double>(
+                g_perfL10RayStatsSums[PERF_L10_RAY_STAT_LOCAL_LIGHT_RAYS]
+            ) / instrumentedPixels
+        )
+        << " sunRayPerPix="
+        << (
+            static_cast<double>(
+                g_perfL10RayStatsSums[PERF_L10_RAY_STAT_SUN_SHADOW_RAYS]
+            ) / instrumentedPixels
+        )
+        << " glossyPerPix="
+        << (
+            static_cast<double>(
+                g_perfL10RayStatsSums[PERF_L10_RAY_STAT_GLOSSY_RAYS]
             ) / instrumentedPixels
         )
         << " zeroTpPctOfGiRays="
@@ -11448,6 +12211,34 @@ static VkDeviceAddress getBufferDeviceAddress(VkDevice d,VkBuffer b){
     return a;
 }
 
+// 2026-10-27：读取**非 SPIR-V** 的二进制资源（目前只有 128x128x64 的蓝噪声表）。
+// 不能复用 loadSpv：那里有 SPIR-V magic 校验，会把 1 MB 的 R8 数据当坏着色器拒掉
+// （实测日志："Invalid SPIR-V magic: ...blue_noise_128x128x64.r8"）。
+static std::vector<uint8_t> loadBinaryFile(const char* path)
+{
+    const std::string resolvedPath = ResolveRTXRuntimePath(path);
+
+    std::ifstream file(resolvedPath, std::ios::binary | std::ios::ate);
+
+    if(!file)
+    {
+        throw std::runtime_error(std::string("Failed to open: ") + resolvedPath);
+    }
+
+    const std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    std::vector<uint8_t> data(static_cast<size_t>(size > 0 ? size : 0));
+
+    if(size > 0 &&
+       !file.read(reinterpret_cast<char*>(data.data()), size))
+    {
+        throw std::runtime_error(std::string("Failed to read: ") + resolvedPath);
+    }
+
+    return data;
+}
+
 static std::vector<uint8_t> loadSpv(const char* path)
 {
     const std::string resolvedPath =
@@ -11744,7 +12535,11 @@ static bool mat4Invert(const float in[16], float out[16])
     return true;
 }
 
-// 8 × 4 字节 = 32：与着色器 PostPush 逐字对应（2026-10-23 追加 3 个色彩增益）
+// 32 × 4 字节 = 128：与着色器 PostPush 逐字对应。
+// 2026-10-23 追加 3 个色彩增益（lane 5..7）；
+// 2026-10-26 追加「色彩分级」24 lane（lane 8..31）—— 128 字节正好是 Vulkan 对
+// push constant 的**保底上限**（maxPushConstantsSize >= 128），所以到此为止，
+// 再加参数必须换 UBO，不要再往这里塞。
 struct PostProcessingPush
 {
     int32_t tonemapMode;
@@ -11755,9 +12550,35 @@ struct PostProcessingPush
     float gainR;
     float gainG;
     float gainB;
+
+    // ===== 2026-10-26 色彩分级（顺序必须与 rr_sdr_post.comp 的 PostPush 一致）=====
+    float manualEV;
+    float blackPoint;
+    float whitePoint;
+    float gradeContrast;
+    float gradePivot;
+    float liftR;
+    float liftG;
+    float liftB;
+    float gradeGammaR;
+    float gradeGammaG;
+    float gradeGammaB;
+    float gradeGainR;
+    float gradeGainG;
+    float gradeGainB;
+    float shadowHue;
+    float shadowStrength;
+    float highlightHue;
+    float highlightStrength;
+    float vibrance;
+    float fade;
+    float vignette;
+    float vignetteRadius;
+    float hueRotate;
+    float tintGreen;
 };
-static_assert(sizeof(PostProcessingPush) == 32u,
-    "PostProcessingPush must match the GLSL PostPush layout");
+static_assert(sizeof(PostProcessingPush) == 128u,
+    "PostProcessingPush must match the GLSL PostPush layout (32 lanes)");
 
 // 泛光强度（设置页「泛光强度」滑条）。0 = 关。
 // 由 setPostProcessingParams 的第 9 个 lane 写入；消费点是 recordBloom 的 push constant，
@@ -11825,6 +12646,107 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setPostProcessin
         paramCount >= 12
             ? std::min(std::max(static_cast<float>(values[11]), 0.25f), 2.5f)
             : 1.0f);
+    return JNI_TRUE;
+}
+
+// =====================================================
+// 2026-10-26 色彩分级（设置页「色彩映射与调色」）的 24 个 lane
+//
+// 走**独立**的 JNI（setColorGradeParams, 24 个 float），不再往
+// setPostProcessingParams 里加 —— 那个数组已经被泛光/剔除/增益挤到 12 个，
+// 再加 24 个就变成"改一个旋钮要同时改 C++ / Java / 两个 JNI 签名"。
+//
+// 每条 lane 的出厂值都是**中性值**（0 / 1）：rr_sdr_post.comp 里整块有
+// "全中性就跳过"的判断，所以没调过的人画面逐位不变。
+// 范围必须与 Java 侧 RTXSettingsConfig.COLOR_GRADE_RANGES 逐项一致。
+// =====================================================
+//   manualEV  手动曝光（档）（-4.00f .. 4.00f；出厂 0.00f）
+//   blackPoint  黑点（0.00f .. 0.30f；出厂 0.00f）
+//   whitePoint  白点（0.70f .. 1.50f；出厂 1.00f）
+//   gradeContrast  显示域对比（0.50f .. 2.00f；出厂 1.00f）
+//   gradePivot  对比支点（0.05f .. 0.95f；出厂 0.18f）
+//   liftR  Lift R（-0.15f .. 0.15f；出厂 0.00f）
+//   liftG  Lift G（-0.15f .. 0.15f；出厂 0.00f）
+//   liftB  Lift B（-0.15f .. 0.15f；出厂 0.00f）
+//   gradeGammaR  Gamma R（0.50f .. 2.00f；出厂 1.00f）
+//   gradeGammaG  Gamma G（0.50f .. 2.00f；出厂 1.00f）
+//   gradeGammaB  Gamma B（0.50f .. 2.00f；出厂 1.00f）
+//   gradeGainR  Gain R（0.50f .. 2.00f；出厂 1.00f）
+//   gradeGainG  Gain G（0.50f .. 2.00f；出厂 1.00f）
+//   gradeGainB  Gain B（0.50f .. 2.00f；出厂 1.00f）
+//   shadowHue  阴影色相（0.00f .. 360.00f；出厂 200.00f）
+//   shadowStrength  阴影着色（0.00f .. 1.00f；出厂 0.00f）
+//   highlightHue  高光色相（0.00f .. 360.00f；出厂 45.00f）
+//   highlightStrength  高光着色（0.00f .. 1.00f；出厂 0.00f）
+//   vibrance  自然饱和度（-1.00f .. 1.00f；出厂 0.00f）
+//   fade  褪色（0.00f .. 1.00f；出厂 0.00f）
+//   vignette  暗角强度（0.00f .. 1.00f；出厂 0.00f）
+//   vignetteRadius  暗角半径（0.10f .. 1.20f；出厂 0.60f）
+//   hueRotate  色相旋转（-180.00f .. 180.00f；出厂 0.00f）
+//   tintGreen  绿/品红（-1.00f .. 1.00f；出厂 0.00f）
+static std::atomic<float> g_cgExposureEV{0.00f};
+static std::atomic<float> g_cgBlackPoint{0.00f};
+static std::atomic<float> g_cgWhitePoint{1.00f};
+static std::atomic<float> g_cgContrast{1.00f};
+static std::atomic<float> g_cgPivot{0.18f};
+static std::atomic<float> g_cgLiftR{0.00f};
+static std::atomic<float> g_cgLiftG{0.00f};
+static std::atomic<float> g_cgLiftB{0.00f};
+static std::atomic<float> g_cgGammaR{1.00f};
+static std::atomic<float> g_cgGammaG{1.00f};
+static std::atomic<float> g_cgGammaB{1.00f};
+static std::atomic<float> g_cgGainR{1.00f};
+static std::atomic<float> g_cgGainG{1.00f};
+static std::atomic<float> g_cgGainB{1.00f};
+static std::atomic<float> g_cgShadowHue{200.00f};
+static std::atomic<float> g_cgShadowStrength{0.00f};
+static std::atomic<float> g_cgHighlightHue{45.00f};
+static std::atomic<float> g_cgHighlightStrength{0.00f};
+static std::atomic<float> g_cgVibrance{0.00f};
+static std::atomic<float> g_cgFade{0.00f};
+static std::atomic<float> g_cgVignette{0.00f};
+static std::atomic<float> g_cgVignetteRadius{0.60f};
+static std::atomic<float> g_cgHueRotate{0.00f};
+static std::atomic<float> g_cgTintGreen{0.00f};
+
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setColorGradeParams(
+    JNIEnv* env, jclass, jfloatArray params)
+{
+    const jsize laneCount = env->GetArrayLength(params);
+    if(laneCount != 24) return JNI_FALSE;
+
+    jfloat values[24] = {};
+    env->GetFloatArrayRegion(params, 0, 24, values);
+    for(int i = 0; i < 24; ++i)
+    {
+        if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
+    }
+
+    g_cgExposureEV.store(std::min(std::max(static_cast<float>(values[0]), -4.00f), 4.00f));
+    g_cgBlackPoint.store(std::min(std::max(static_cast<float>(values[1]), 0.00f), 0.30f));
+    g_cgWhitePoint.store(std::min(std::max(static_cast<float>(values[2]), 0.70f), 1.50f));
+    g_cgContrast.store(std::min(std::max(static_cast<float>(values[3]), 0.50f), 2.00f));
+    g_cgPivot.store(std::min(std::max(static_cast<float>(values[4]), 0.05f), 0.95f));
+    g_cgLiftR.store(std::min(std::max(static_cast<float>(values[5]), -0.15f), 0.15f));
+    g_cgLiftG.store(std::min(std::max(static_cast<float>(values[6]), -0.15f), 0.15f));
+    g_cgLiftB.store(std::min(std::max(static_cast<float>(values[7]), -0.15f), 0.15f));
+    g_cgGammaR.store(std::min(std::max(static_cast<float>(values[8]), 0.50f), 2.00f));
+    g_cgGammaG.store(std::min(std::max(static_cast<float>(values[9]), 0.50f), 2.00f));
+    g_cgGammaB.store(std::min(std::max(static_cast<float>(values[10]), 0.50f), 2.00f));
+    g_cgGainR.store(std::min(std::max(static_cast<float>(values[11]), 0.50f), 2.00f));
+    g_cgGainG.store(std::min(std::max(static_cast<float>(values[12]), 0.50f), 2.00f));
+    g_cgGainB.store(std::min(std::max(static_cast<float>(values[13]), 0.50f), 2.00f));
+    g_cgShadowHue.store(std::min(std::max(static_cast<float>(values[14]), 0.00f), 360.00f));
+    g_cgShadowStrength.store(std::min(std::max(static_cast<float>(values[15]), 0.00f), 1.00f));
+    g_cgHighlightHue.store(std::min(std::max(static_cast<float>(values[16]), 0.00f), 360.00f));
+    g_cgHighlightStrength.store(std::min(std::max(static_cast<float>(values[17]), 0.00f), 1.00f));
+    g_cgVibrance.store(std::min(std::max(static_cast<float>(values[18]), -1.00f), 1.00f));
+    g_cgFade.store(std::min(std::max(static_cast<float>(values[19]), 0.00f), 1.00f));
+    g_cgVignette.store(std::min(std::max(static_cast<float>(values[20]), 0.00f), 1.00f));
+    g_cgVignetteRadius.store(std::min(std::max(static_cast<float>(values[21]), 0.10f), 1.20f));
+    g_cgHueRotate.store(std::min(std::max(static_cast<float>(values[22]), -180.00f), 180.00f));
+    g_cgTintGreen.store(std::min(std::max(static_cast<float>(values[23]), -1.00f), 1.00f));
     return JNI_TRUE;
 }
 
@@ -15588,6 +16510,49 @@ static bool sameVertexPayload(
 static constexpr uint64_t SPATIAL_SECTION_KEY_MASK =
     (1ull << 60ull) - 1ull;
 
+// =====================================================
+// 2026-10-24 TLAS 主射线掩码剔除（项 1：原版可见性图）
+//
+// 数据源：Java 侧每帧把 LevelRenderer.visibleSections()（26.3 源码 :1289）
+// 的 Section 坐标推下来。那份表由 LevelExtractor.applyFrustum（:472）经
+// SectionOcclusionGraph.addSectionsInFrustum 的 Octree 遍历填充，只含"从相机
+// 出发可达"的 Section ⇒ 它排除的 Section 不可能成为主射线的 first hit。
+//
+// 只清 mask 的 bit0（主射线），实例保留在 TLAS 里 ⇒ 反射/GI/阴影/体积光/
+// 雨探针（0xff / 0x04 / 0x08）的行为逐位不变。这是整个改动的安全前提：
+// 被剔的几何对次级射线仍然存在，不会漏光、不会漏反射。
+//
+// 模式（环境变量 ORION_VIS_CULL）：
+//   0 = 关（逐位回到改动前）
+//   1 = 只统计（默认）：日志里的 visCand= 就是"若开启会清掉多少实例"
+//   2 = 生效
+// 默认取 1 而不是 2：「可见性图与本后端的几何集合是否一致」这一条还没有实机
+// 数据（原版图只覆盖原版 raster 会画的 Section），先让数字说话，确认后再切 2。
+// =====================================================
+static int visibleSectionCullMode()
+{
+    static const int mode = []()
+    {
+        const char* raw = std::getenv("ORION_VIS_CULL");
+
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return 1;
+        }
+
+        return std::atoi(raw);
+    }();
+
+    return mode;
+}
+
+static std::mutex g_visibleSectionKeysMutex;
+
+// 升序 spatialKey（= packSectionKey(x,y,z,0)，层号已剥掉）。
+static std::vector<uint64_t> g_visibleSectionKeys;
+
+static std::atomic<uint32_t> g_visibleSectionKeyCount{0u};
+
 // The upper four bits are free after the spatial key was extracted.  Water
 // owns one physical BLAS/TLAS partition; every non-water translucent material
 // owns another.  Their hit-group routing is therefore independent.
@@ -16643,15 +17608,45 @@ static size_t
 //   ORION_SHARC_SCALE=12     体素尺度（HashGridParameters::sceneScale，默认 12）
 //   ORION_SHARC_ENTRIES=21   元素数的 2 的幂指数（默认 22 = 4M；21 = 2M/88MB）
 // 这些开关后续会镜像到设置界面（RTXSettingsConfig → NativeVulkan → UBO）。
-static bool sharcEnabled()
+// 2026-10-28：从"只读一次的 getenv 缓存"改成三级解析，与 directLightMode 同构：
+//   ORION_SHARC 显式 1 → 强制开；显式 0 → 强制关（保留实验/回退入口）；
+//   未设 → 跟设置页的「间接光模式」（g_indirectModeOverride == 1）。
+// 之所以必须能读到设置项：SHaRC 模式下要 update + query + 缓冲一起开。
+// ⚠ 仍**不是热切换**：四块缓冲（176MB）与第二条 RT 管线在 native init 时创建。
+//   运行时切到 1 只会让 shader 拿到 sharcMode()==0，查询不生效；不会崩，
+//   因为所有缓存访问都与 sharcMode() 同源门控（见 rgen:25484 的教训）。
+static int sharcEnvState()
 {
-    static const bool cached = []()
+    static const int cached = []() -> int
     {
         const char* raw = std::getenv("ORION_SHARC");
-        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return 0;   // 未设
+        }
+
+        return raw[0] != '0' ? 1 : 2;   // 1 = 强制开，2 = 强制关
     }();
 
     return cached;
+}
+
+static bool sharcEnabled()
+{
+    const int env = sharcEnvState();
+
+    if(env == 1)
+    {
+        return true;
+    }
+
+    if(env == 2)
+    {
+        return false;
+    }
+
+    return g_indirectModeOverride.load(std::memory_order_relaxed) == 1;
 }
 
 static float sharcSceneScale()
@@ -17178,7 +18173,9 @@ static uint32_t
 // VPT-2.2 - screen-space temporal history for the primary
 // voxel DDA candidate.  Self-contained: it has its own
 // representation, independent of any local-DI reservoir.
-// Three std430 vec4 lanes = 48 bytes per render-resolution pixel.
+// Four std430 vec4 lanes = 64 bytes per render-resolution pixel.
+// Lane 3 (reservoirX..) backs the RTXDI-style WRS direct-light reservoir;
+// the EMA path leaves it untouched.
 // =====================================================
 struct VPTDirectHistoryGPU
 {
@@ -17196,11 +18193,16 @@ struct VPTDirectHistoryGPU
     float normalY;
     float normalZ;
     float padding;
+
+    float reservoirX;
+    float reservoirY;
+    float reservoirZ;
+    float reservoirW;
 };
 
 static_assert(
-    sizeof(VPTDirectHistoryGPU) == 48,
-    "VPTDirectHistoryGPU must remain exactly three std430 vec4 lanes"
+    sizeof(VPTDirectHistoryGPU) == 64,
+    "VPTDirectHistoryGPU must remain exactly four std430 vec4 lanes"
 );
 
 static VkBuffer g_vptDirectHistoryBuffers[2] =
@@ -18080,6 +19082,41 @@ static void createBLAS()
 }
 
 // === 新增：创建 Camera UBO ===
+// 2026-10-26：28 个 HP 参数（CameraUBO 尾块 hpShapeA..hpMiscA）的**唯一**写入点。
+// 必须逐帧调用 —— 原来这段只写在 createCameraUBO() 里（启动时执行一次），
+// 于是面板里 28 条 HP 滑条全部失效（改的只是原子量，UBO 永远停在初值）。
+static void populateHpParams(CameraUBO* ubo)
+{
+    ubo->hpShapeA[0] = g_hpDetailStrengthCu.load();
+    ubo->hpShapeA[1] = g_hpDetailStrengthTcu.load();
+    ubo->hpShapeA[2] = g_hpDetailStrengthCb.load();
+    ubo->hpShapeA[3] = g_hpBottomSmoothHeight.load();
+    ubo->hpShapeB[0] = g_hpWispyEdgeWidth.load();
+    ubo->hpShapeB[1] = g_hpWispyReach.load();
+    ubo->hpShapeB[2] = g_hpWispyTopHeight.load();
+    ubo->hpShapeB[3] = g_hpWispyTopHardness.load();
+    ubo->hpShapeC[0] = g_hpWispyWeight.load();
+    ubo->hpShapeC[1] = g_hpBillowyWeight.load();
+    ubo->hpShapeC[2] = g_hpLoCoverTopMax.load();
+    ubo->hpShapeC[3] = g_hpLoCoverTopStr.load();
+    ubo->hpShapeD[0] = g_hpCovMapScale.load();
+    ubo->hpShapeD[1] = g_hpScWorleyStrength.load();
+    ubo->hpShapeD[2] = g_hpScHeightScale.load();
+    ubo->hpShapeD[3] = g_hpScCellThickStr.load();
+    ubo->hpLightA[0] = g_hpForwardEcc.load();
+    ubo->hpLightA[1] = g_hpBackwardEcc.load();
+    ubo->hpLightA[2] = g_hpPhiFwdIntensity.load();
+    ubo->hpLightA[3] = g_hpPhiFwdDepthPow.load();
+    ubo->hpLightB[0] = g_hpPhiFwdDepthBias.load();
+    ubo->hpLightB[1] = g_hpPhiFwdCompress.load();
+    ubo->hpLightB[2] = g_hpScatterOdScale.load();
+    ubo->hpLightB[3] = g_hpScatterCurvePow.load();
+    ubo->hpMiscA[0] = g_hpMsEccentricity.load();
+    ubo->hpMiscA[1] = g_hpAoUpwardScale.load();
+    ubo->hpMiscA[2] = g_hpFadeStart.load();
+    ubo->hpMiscA[3] = g_hpPowderIntensity.load();
+}
+
 static void createCameraUBO() {
     createBuffer(
         g_device,
@@ -18154,6 +19191,23 @@ static void createCameraUBO() {
     ubo->giHalfParams[2] = 0.0f;
     ubo->giHalfParams[3] = 0.0f;
 
+    // 2026-10-25 近场 GI 采样率（CameraUBO.giRayParams.x）。初值 0 = 全速。
+    ubo->giRayParams[0] = 0.0f;
+    ubo->giRayParams[1] = 0.0f;
+    ubo->giRayParams[2] = 0.0f;
+    ubo->giRayParams[3] = 0.0f;
+
+    // 2026-10-26 直接光模式 + 稀疏渲染（CameraUBO.sparseParams）。
+    // 初值 0/0/1/0 = 传统 RIS + 稀疏关 + 联动开（逐位旧画面）。
+    ubo->sparseParams[0] = 0.0f;
+    ubo->sparseParams[1] = 0.0f;
+    ubo->sparseParams[2] = 1.0f;
+    ubo->sparseParams[3] = 0.0f;
+
+    // 2026-10-25 v5（HP）全参数尾块，顺序见 CameraUBO 里那七块的注释。
+    populateHpParams(ubo);
+    // （这里只是初值；逐帧写入在 updateCameraUBO 里，见 populateHpParams 注释）
+
     ubo->playerX = 0.0f;
     ubo->playerY = 0.0f;
     ubo->playerZ = 0.0f;
@@ -18219,6 +19273,7 @@ static void createCameraUBO() {
     populateFogExtrasParams(ubo->fogExtrasParams);
     populateCloudTemporalParams(ubo->cloudTemporalParams);
     populateCloudAerialParams(ubo->cloudAerialParams);
+
     populateCloudSkyHueParams(ubo->cloudSkyHueParams);
     populateCloudPhysicsParams(ubo->cloudPhysicsParams);
     populateUeCloudParams(ubo->ueCloudA, ubo->ueCloudB);
@@ -22172,7 +23227,12 @@ static VkDescriptorSetLayout createRTDescriptorSetLayout(){
     // 2026-10-09 运动矢量：63 项（binding 0..62）。
     // 2026-10-09 实体 LabPBR：65 项（binding 0..64，新增 63 法线 / 64 高光）。
     // ⚠ 数组长度与 static_assert 必须同步改，见下面 2026-09-28「进世界就崩」的复盘。
-    VkDescriptorSetLayoutBinding b[73]{}; // 73 entries, binding numbers 0..72
+    // 2026-10-26：73 -> 76（半透明 alpha blend 的三张旁路图占 73/74/75，
+    // 见 docs/decisions/alpha-blend-pass-split.md §7.1）。73/74 原先属于水泡沫，
+    // 同日泡沫回退后在 #if 0 里 ⇒ 这三格是真空位，其余 72 个编号一个都没动。
+    // 2026-10-27：78 -> 79。binding 78 = 稀疏渲染的活跃像素掩码
+    // （R8_UINT，4x2 像素块打包成一个 uint；照 Remix active_pixel_mask）。
+    VkDescriptorSetLayoutBinding b[79]{}; // 79 entries, binding numbers 0..78
     // (50-53 are NRD-1, 54 RR stable radiance, 55 NRD-1 IN_MV,
     //  56 NRD-1 OUT_VALIDATION, 57 MV read-back probe, 58 远场太阳阴影图)
 
@@ -22877,6 +23937,84 @@ static VkDescriptorSetLayout createRTDescriptorSetLayout(){
     b[72].descriptorCount = 1;
     b[72].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
 
+    // =====================================================
+    // 2026-10-26：bindings 73/74 —— 持久泡沫图（路线 B，Crest 移植）
+    //
+    // 73 = 512² RGBA16F 泡沫图（2 层乒乓 · 6 级 mip），rgen 只读一次 .r；
+    // 74 = 同尺寸 R32_UINT 岸线覆盖率注入图，rgen 的折射分支用
+    // imageAtomicMax 写，宿主 water_foam.comp 每 tick 读走并清零。
+    //
+    // 安全阀：CameraUBO.pomParams.w = 泡沫纹素世界尺寸（0 = 未就绪/关闭）。
+    // 模块创建失败或世界切换中它恒 0 ⇒ 着色端**绝不访问**这两个未写描述符；
+    // 与 binding 59 / 69 的契约相同（见 camera_ubo.glsl 的 pomParams 注释）。
+    //
+    // 2026-10-26 21:1x 用户不要泡沫 ⇒ 回退：数组缩回 b[73]（0..72），下面两项
+    // 与对应资源一起屏蔽保留。复活时把本段、b[] 长度与 static_assert 一并改回。
+    // =====================================================
+#if 0
+    b[73].binding = 73;
+    b[73].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b[73].descriptorCount = 1;
+    b[73].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
+    b[74].binding = 74;
+    b[74].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[74].descriptorCount = 1;
+    b[74].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+#endif
+
+    // 2026-10-26 半透明 alpha blend 的旁路图（rt_test.rgen binding 73/74/75）。
+    // 三张都是全屏 RGBA16F，raygen 写、后续 compute pass 读：
+    //   73 gbuffer(rgb=表面权重和, a=a_0) / 74 meta(rgb=链透射率, a=玻璃面距离)
+    //   75 light(rgb=E_bg, a=有效位)
+    // stageFlags 只给 RAYGEN：compute 侧走本 pass 自己的 descriptor set（见
+    // g_glassAlphaBlendSetLayout），所以不需要在 RT 主 set 上开 COMPUTE 位。
+    // 2026-10-26（第四轮，严格搬）：stageFlags 必须含 ANY_HIT。
+    // 原文把 AlphaBlendSurface 存在**每像素 GBuffer** 里，由几何求值侧做
+    // load -> update -> store（_ref/dxvk-remix .../geometry_resolver.slangh:2196-2199）；
+    // 本引擎对应的"几何求值侧"就是两个 any-hit 着色器，所以这三张图
+    // 由 raygen 与 any-hit 共同读写。
+    b[73].binding = 73;
+    b[73].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[73].descriptorCount = 1;
+    b[73].stageFlags =
+        VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
+
+    b[74].binding = 74;
+    b[74].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[74].descriptorCount = 1;
+    b[74].stageFlags =
+        VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
+
+    b[75].binding = 75;
+    b[75].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[75].descriptorCount = 1;
+    b[75].stageFlags =
+        VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
+
+    // 2026-10-27：Remix 的时空蓝噪声表（utility/noise.slangh:240 的 texelFetch
+    // 目标）。128x128x64 的 R8 数据放在 storage buffer 里，raygen 用它算
+    // AlphaBlendSurface.randomThreshold（geometry_resolver.slangh:3238）。
+    b[76].binding = 76;
+    b[76].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[76].descriptorCount = 1;
+    b[76].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
+    // 2026-10-27：radiance volume 兜底（体素面辐照度缓存换算值）。raygen 写。
+    b[77].binding = 77;
+    b[77].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[77].descriptorCount = 1;
+    b[77].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
+    // 2026-10-27：binding 78 —— 稀疏渲染的活跃像素掩码（R8_UINT）。
+    // 生产者是 sparse_active_mask.comp，raygen 只读（Remix 的 isActivePixelFromMask）。
+    // 同时开 COMPUTE：调试/后续消费者可能在同一 set 之外读它，这里先给 RA 与 CS。
+    b[78].binding = 78;
+    b[78].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[78].descriptorCount = 1;
+    b[78].stageFlags =
+        VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
+
     // 2026-09-28 崩溃复盘（我引入又撤回的一处）：
     // 这里一度加过 binding 57/58，但数组是 `b[57]`（下标 0..56），于是既越界写栈、
     // 又让 vkCreateDescriptorSetLayout 按 bindingCount=59 读数组外的数据 —— 表现为
@@ -22897,8 +24035,13 @@ static VkDescriptorSetLayout createRTDescriptorSetLayout(){
     // 一起改，否则就是 2026-09-28 那次"进世界就崩"（越界写栈 + 布局按错长度读数组）。
     // 2026-10-19：69 → 70（新增折射焦散图 binding 69）；70 → 71（反射层 binding 70）。
     // 2026-10-23：71 → 72（新增 DLSS RR 的 TransparencyHint binding 71）。
+    // 2026-10-24：72 → 73（新增半分辨率 GI 辐照度图 binding 72）。
+    // 2026-10-26：73 → 75（新增持久泡沫图 binding 73 / 岸线注入 binding 74）；
+    // 同日 21:1x 泡沫回退 ⇒ 75 → 73。
+    // 2026-10-26：73 -> 76（半透明 alpha blend 的 binding 73/74/75）。
+    // 2026-10-27：76 -> 79（77 radiance volume，78 sparse active mask）。
     static_assert(
-        sizeof(b) / sizeof(b[0]) == 73u,
+        sizeof(b) / sizeof(b[0]) == 79u,
         "RT descriptor set layout: update this assert together with b[]"
     );
     ci.bindingCount = static_cast<uint32_t>(sizeof(b) / sizeof(b[0]));
@@ -23652,6 +24795,1725 @@ static void createGiHalfImage(uint32_t width, uint32_t height)
               << " (render " << width << "x" << height << ")" << std::endl;
 }
 
+
+// =====================================================
+// 2026-10-26 半透明 alpha blend 拆 pass（docs/decisions/alpha-blend-pass-split.md）
+//
+// 图的内容口径（三处必须逐字一致）：
+//   rt_test.rgen 的 storeGlassAlphaBlendDeferred()  写 73/74/75
+//   glass_alpha_blend.comp                         读 73/74/75 + rtOutput，写 radiance
+//   glass_alpha_finish.comp                        把 radiance 拷回 rtOutput
+// 本文件只负责容量、描述符、barrier 与 dispatch，不参与数值口径。
+// =====================================================
+
+// 把这些图（连同被新 pass 只读的三张 RR guide）一次性转到 GENERAL。
+// 与 prepareRRGuideForRayGen 同一套做法，区别是这里的图都由我自己管理布局，
+// 所以判据用各自的 layout 变量，转完就地更新（幂等，不需要每帧重跑）。
+static void prepareGlassAlphaBlendImages(VkCommandBuffer cmd)
+{
+    VkImage images[8] =
+    {
+        g_alphaBlendGbufferImage,
+        g_alphaBlendMetaImage,
+        g_alphaBlendLightImage,
+        g_alphaBlendRadianceImage,
+        g_alphaBlendVolumeImage,
+        g_dlssDepthImage,
+        g_rrNormalRoughnessImage,
+        g_rrDiffuseAlbedoImage
+    };
+
+    VkImageLayout* layouts[8] =
+    {
+        &g_alphaBlendGbufferLayout,
+        &g_alphaBlendMetaLayout,
+        &g_alphaBlendLightLayout,
+        &g_alphaBlendRadianceLayout,
+        &g_alphaBlendVolumeLayout,
+        &g_dlssDepthLayout,
+        &g_rrNormalRoughnessLayout,
+        &g_rrDiffuseAlbedoLayout
+    };
+
+    VkImageMemoryBarrier barriers[8]{};
+    uint32_t count = 0u;
+
+    for(uint32_t i = 0u; i < 8u; ++i)
+    {
+        if(images[i] == VK_NULL_HANDLE ||
+           *layouts[i] == VK_IMAGE_LAYOUT_GENERAL)
+        {
+            continue;
+        }
+
+        VkImageMemoryBarrier& barrier = barriers[count];
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = *layouts[i];
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.srcAccessMask = 0u;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.image = images[i];
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = 0u;
+        barrier.subresourceRange.levelCount = 1u;
+        barrier.subresourceRange.baseArrayLayer = 0u;
+        barrier.subresourceRange.layerCount = 1u;
+
+        ++count;
+    }
+
+    if(count == 0u)
+    {
+        return;
+    }
+
+    // dstStage 必须带 TRANSFER：紧随其后的 vkCmdClearColorImage（清 74 号图）
+    // 是 TRANSFER 阶段的操作。少了这一位，首帧的 UNDEFINED -> GENERAL 对那次
+    // clear 不可见 —— 典型 SYNC-HAZARD-WRITE-AFTER-WRITE，且只在第一帧发生，
+    // 之后 layout 已是 GENERAL 就再也看不到了（最容易漏的一种）。
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0u,
+        0u, nullptr,
+        0u, nullptr,
+        count, barriers);
+
+    for(uint32_t i = 0u; i < 8u; ++i)
+    {
+        if(images[i] != VK_NULL_HANDLE)
+        {
+            *layouts[i] = VK_IMAGE_LAYOUT_GENERAL;
+        }
+    }
+}
+
+// 2026-10-27：Remix 的时空蓝噪声（128x128x64 R8）。
+//
+// 数据来源：_ref/dxvk-remix/src/util/util_blueNoise_128x128x64.h（MIT），
+// 已原样导出为 shaders/blue_noise_128x128x64.r8（1,048,576 字节 =
+// 64 layer x 128 x 128）。文件缺失时用确定性哈希填一份，保证描述符永远有效
+// （宁可分布退化，也不能给 raygen 一个空的 storage buffer）。
+static void createGlassBlueNoiseBuffer()
+{
+    if(g_glassBlueNoiseBuffer != VK_NULL_HANDLE || g_glassBlueNoiseReady)
+    {
+        return;
+    }
+
+    constexpr size_t kBlueNoiseBytes = 64u * 128u * 128u;
+    std::vector<uint8_t> data;
+
+    try
+    {
+        // 必须用不校验 SPIR-V magic 的读取器，见 loadBinaryFile 的注释。
+        data = loadBinaryFile("shaders/blue_noise_128x128x64.r8");
+    }
+    catch(const std::exception& error)
+    {
+        RTLog(std::string("[GLASS ALPHA BLEND] blue noise missing, hashed placeholder: ") +
+              error.what());
+    }
+
+    if(data.size() != kBlueNoiseBytes)
+    {
+        if(!data.empty())
+        {
+            RTLog("[GLASS ALPHA BLEND] blue noise size mismatch, hashed placeholder");
+        }
+
+        data.resize(kBlueNoiseBytes);
+
+        uint32_t state = 0x9E3779B9u;
+        for(size_t i = 0u; i < kBlueNoiseBytes; ++i)
+        {
+            state ^= state >> 16u;
+            state *= 0x7FEB352Du;
+            state ^= state >> 15u;
+            state *= 0x846CA68Bu;
+            state ^= state >> 16u;
+            data[i] = static_cast<uint8_t>(state & 0xFFu);
+        }
+    }
+
+    createBuffer(
+        g_device,
+        g_physicalDevice,
+        static_cast<VkDeviceSize>(kBlueNoiseBytes),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        g_glassBlueNoiseBuffer,
+        g_glassBlueNoiseMemory,
+        true);
+
+    void* mapped = nullptr;
+    check(
+        vkMapMemory(
+            g_device, g_glassBlueNoiseMemory, 0u,
+            static_cast<VkDeviceSize>(kBlueNoiseBytes), 0u, &mapped),
+        "map blue noise buffer failed");
+
+    std::memcpy(mapped, data.data(), kBlueNoiseBytes);
+    vkUnmapMemory(g_device, g_glassBlueNoiseMemory);
+
+    g_glassBlueNoiseReady = true;
+
+    RTLog("[GLASS ALPHA BLEND] blue noise 128x128x64 uploaded");
+}
+
+// =====================================================
+// 2026-10-27 稀疏渲染活跃像素掩码（R8_UINT）。
+//
+// 照搬 RTX Remix：
+//   _ref/.../sparse_rendering/active_pixel_mask.comp.slang
+//   _ref/.../sparse_rendering/active_pixel_mask_binding_indices.h
+//     threadgroup = 8x8，block = 4x2（一个 uint 的低 8 位，bit = y*4 + x）
+//   _ref/.../sparse_rendering/per_pixel_rate.slangh（蓝噪声阈值 + threshold <= rate）
+//
+// 生产者：sparse_active_mask.comp（本文件下方 recordSparseActiveMask）
+// 消费者：rt_test.rgen 的 vptSparsePixelIsActive（binding 78）
+//
+// 图的首帧内容是"全 1"（清 255）：即使 pass 建失败，rgen 读到的也是全活跃，
+// 稀疏静默失效而不是全屏变黑。
+// =====================================================
+// updateCamera 写、recordSparseActiveMask 读；跨 JNI/渲染线程，用原子量。
+static std::atomic<uint32_t> g_sparseEffectiveFrameIndex{0u};
+static std::atomic<float> g_sparseEffectiveRate{0.0f};
+
+static VkImage g_sparseActiveMaskImage = VK_NULL_HANDLE;
+static VkDeviceMemory g_sparseActiveMaskMemory = VK_NULL_HANDLE;
+static VkImageView g_sparseActiveMaskView = VK_NULL_HANDLE;
+static VkImageLayout g_sparseActiveMaskLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+static uint32_t g_sparseActiveMaskWidth = 0u;
+static uint32_t g_sparseActiveMaskHeight = 0u;
+static bool g_sparseActiveMaskNeedsClear = true;
+
+static VkShaderModule g_sparseActiveMaskShader = VK_NULL_HANDLE;
+static VkDescriptorSetLayout g_sparseActiveMaskSetLayout = VK_NULL_HANDLE;
+static VkDescriptorPool g_sparseActiveMaskPool = VK_NULL_HANDLE;
+static VkDescriptorSet g_sparseActiveMaskSet = VK_NULL_HANDLE;
+static VkPipelineLayout g_sparseActiveMaskPipelineLayout = VK_NULL_HANDLE;
+static VkPipeline g_sparseActiveMaskPipeline = VK_NULL_HANDLE;
+static bool g_sparseActiveMaskPipelineFailed = false;
+
+struct SparseActiveMaskPush
+{
+    uint32_t width;
+    uint32_t height;
+    uint32_t frameIndex;
+    uint32_t maskWidth;
+    float samplingRate;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+};
+
+static void destroySparseActiveMaskImage()
+{
+    if(g_sparseActiveMaskView)
+    {
+        vkDestroyImageView(g_device, g_sparseActiveMaskView, nullptr);
+        g_sparseActiveMaskView = VK_NULL_HANDLE;
+    }
+
+    if(g_sparseActiveMaskImage)
+    {
+        vkDestroyImage(g_device, g_sparseActiveMaskImage, nullptr);
+        g_sparseActiveMaskImage = VK_NULL_HANDLE;
+    }
+
+    if(g_sparseActiveMaskMemory)
+    {
+        vkFreeMemory(g_device, g_sparseActiveMaskMemory, nullptr);
+        g_sparseActiveMaskMemory = VK_NULL_HANDLE;
+    }
+
+    g_sparseActiveMaskLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    g_sparseActiveMaskWidth = 0u;
+    g_sparseActiveMaskHeight = 0u;
+    g_sparseActiveMaskNeedsClear = true;
+}
+
+static bool ensureSparseActiveMaskImage(uint32_t renderWidth, uint32_t renderHeight)
+{
+    const uint32_t maskWidth = (renderWidth + 3u) / 4u;
+    const uint32_t maskHeight = (renderHeight + 1u) / 2u;
+
+    if(g_sparseActiveMaskImage != VK_NULL_HANDLE &&
+       g_sparseActiveMaskWidth == maskWidth &&
+       g_sparseActiveMaskHeight == maskHeight)
+    {
+        return true;
+    }
+
+    if(g_sparseActiveMaskImage != VK_NULL_HANDLE)
+    {
+        if(FGDeviceWaitIdle(g_device) != VK_SUCCESS)
+        {
+            return false;
+        }
+
+        destroySparseActiveMaskImage();
+    }
+
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = VK_FORMAT_R8_UINT;
+    info.extent = { maskWidth, maskHeight, 1u };
+    info.mipLevels = 1u;
+    info.arrayLayers = 1u;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    if(vkCreateImage(g_device, &info, nullptr, &g_sparseActiveMaskImage) != VK_SUCCESS)
+    {
+        g_sparseActiveMaskImage = VK_NULL_HANDLE;
+        return false;
+    }
+
+    VkMemoryRequirements requirements{};
+    vkGetImageMemoryRequirements(g_device, g_sparseActiveMaskImage, &requirements);
+
+    VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = findMemoryType(
+        g_physicalDevice,
+        requirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    if(vkAllocateMemory(g_device, &allocate, nullptr, &g_sparseActiveMaskMemory) != VK_SUCCESS)
+    {
+        destroySparseActiveMaskImage();
+        return false;
+    }
+
+    if(vkBindImageMemory(
+           g_device,
+           g_sparseActiveMaskImage,
+           g_sparseActiveMaskMemory,
+           0u) != VK_SUCCESS)
+    {
+        destroySparseActiveMaskImage();
+        return false;
+    }
+
+    VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    viewInfo.image = g_sparseActiveMaskImage;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_R8_UINT;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.levelCount = 1u;
+    viewInfo.subresourceRange.layerCount = 1u;
+
+    if(vkCreateImageView(g_device, &viewInfo, nullptr, &g_sparseActiveMaskView) != VK_SUCCESS)
+    {
+        destroySparseActiveMaskImage();
+        return false;
+    }
+
+    g_sparseActiveMaskLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    g_sparseActiveMaskWidth = maskWidth;
+    g_sparseActiveMaskHeight = maskHeight;
+    g_sparseActiveMaskNeedsClear = true;
+
+    RTLog("[SPARSE MASK] created " + std::to_string(maskWidth) + "x" +
+          std::to_string(maskHeight) + " (4x2 blocks)");
+
+    return true;
+}
+
+static bool ensureSparseActiveMaskPipeline()
+{
+    if(g_sparseActiveMaskPipeline != VK_NULL_HANDLE)
+    {
+        return true;
+    }
+
+    if(g_sparseActiveMaskPipelineFailed)
+    {
+        return false;
+    }
+
+    std::vector<uint8_t> code;
+
+    try
+    {
+        code = loadSpv("shaders/sparse_active_mask.comp.spv");
+    }
+    catch(const std::exception& error)
+    {
+        RTLog(std::string("[SPARSE MASK] missing shader: ") + error.what());
+        g_sparseActiveMaskPipelineFailed = true;
+        return false;
+    }
+
+    VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    moduleInfo.codeSize = code.size();
+    moduleInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
+
+    if(vkCreateShaderModule(g_device, &moduleInfo, nullptr, &g_sparseActiveMaskShader) != VK_SUCCESS)
+    {
+        g_sparseActiveMaskPipelineFailed = true;
+        return false;
+    }
+
+    VkDescriptorSetLayoutBinding bindings[2]{};
+
+    bindings[0].binding = 0u;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[0].descriptorCount = 1u;
+    bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    bindings[1].binding = 1u;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[1].descriptorCount = 1u;
+    bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorSetLayoutCreateInfo setLayoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    setLayoutInfo.bindingCount = 2u;
+    setLayoutInfo.pBindings = bindings;
+
+    if(vkCreateDescriptorSetLayout(g_device, &setLayoutInfo, nullptr, &g_sparseActiveMaskSetLayout) != VK_SUCCESS)
+    {
+        g_sparseActiveMaskPipelineFailed = true;
+        return false;
+    }
+
+    VkDescriptorPoolSize poolSize{};
+    poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    poolSize.descriptorCount = 1u;
+
+    VkDescriptorPoolSize poolSizeBuffer{};
+    poolSizeBuffer.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    poolSizeBuffer.descriptorCount = 1u;
+
+    VkDescriptorPoolSize poolSizes[2] = { poolSize, poolSizeBuffer };
+
+    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.maxSets = 1u;
+    poolInfo.poolSizeCount = 2u;
+    poolInfo.pPoolSizes = poolSizes;
+
+    if(vkCreateDescriptorPool(g_device, &poolInfo, nullptr, &g_sparseActiveMaskPool) != VK_SUCCESS)
+    {
+        g_sparseActiveMaskPipelineFailed = true;
+        return false;
+    }
+
+    VkDescriptorSetAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocateInfo.descriptorPool = g_sparseActiveMaskPool;
+    allocateInfo.descriptorSetCount = 1u;
+    allocateInfo.pSetLayouts = &g_sparseActiveMaskSetLayout;
+
+    if(vkAllocateDescriptorSets(g_device, &allocateInfo, &g_sparseActiveMaskSet) != VK_SUCCESS)
+    {
+        g_sparseActiveMaskPipelineFailed = true;
+        return false;
+    }
+
+    VkPushConstantRange pushRange{};
+    pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushRange.offset = 0u;
+    pushRange.size = sizeof(SparseActiveMaskPush);
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pipelineLayoutInfo.setLayoutCount = 1u;
+    pipelineLayoutInfo.pSetLayouts = &g_sparseActiveMaskSetLayout;
+    pipelineLayoutInfo.pushConstantRangeCount = 1u;
+    pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+
+    if(vkCreatePipelineLayout(g_device, &pipelineLayoutInfo, nullptr, &g_sparseActiveMaskPipelineLayout) != VK_SUCCESS)
+    {
+        g_sparseActiveMaskPipelineFailed = true;
+        return false;
+    }
+
+    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipelineInfo.stage.module = g_sparseActiveMaskShader;
+    pipelineInfo.stage.pName = "main";
+    pipelineInfo.layout = g_sparseActiveMaskPipelineLayout;
+
+    if(vkCreateComputePipelines(
+           g_device,
+           VK_NULL_HANDLE,
+           1u,
+           &pipelineInfo,
+           nullptr,
+           &g_sparseActiveMaskPipeline) != VK_SUCCESS)
+    {
+        RTLog("[SPARSE MASK] pipeline create failed");
+        g_sparseActiveMaskPipelineFailed = true;
+        return false;
+    }
+
+    return true;
+}
+
+// 把 mask 同时写进 mask pass 自己的 set 与 RT 主 set 的 binding 78。
+static void updateSparseActiveMaskDescriptors()
+{
+    if(g_sparseActiveMaskView == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    if(g_sparseActiveMaskSet != VK_NULL_HANDLE)
+    {
+        VkDescriptorImageInfo maskInfo{};
+        maskInfo.imageView = g_sparseActiveMaskView;
+        maskInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorBufferInfo noiseInfo{};
+        noiseInfo.buffer = g_glassBlueNoiseBuffer;
+        noiseInfo.offset = 0u;
+        noiseInfo.range = VK_WHOLE_SIZE;
+
+        VkWriteDescriptorSet writes[2]{};
+
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = g_sparseActiveMaskSet;
+        writes[0].dstBinding = 0u;
+        writes[0].descriptorCount = 1u;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[0].pImageInfo = &maskInfo;
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = g_sparseActiveMaskSet;
+        writes[1].dstBinding = 1u;
+        writes[1].descriptorCount = 1u;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].pBufferInfo = &noiseInfo;
+
+        vkUpdateDescriptorSets(g_device, 2u, writes, 0u, nullptr);
+    }
+
+    if(g_rayTracingDescriptorSet != VK_NULL_HANDLE)
+    {
+        VkDescriptorImageInfo maskInfo{};
+        maskInfo.imageView = g_sparseActiveMaskView;
+        maskInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = g_rayTracingDescriptorSet;
+        write.dstBinding = 78u;
+        write.descriptorCount = 1u;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        write.pImageInfo = &maskInfo;
+
+        vkUpdateDescriptorSets(g_device, 1u, &write, 0u, nullptr);
+    }
+}
+
+// 每帧在 RT trace 之前调用：清首帧 → dispatch → 转到可读。
+static void recordSparseActiveMask(
+    VkCommandBuffer cmd,
+    uint32_t renderWidth,
+    uint32_t renderHeight)
+{
+    if(cmd == VK_NULL_HANDLE ||
+       renderWidth == 0u ||
+       renderHeight == 0u)
+    {
+        return;
+    }
+
+    if(!ensureSparseActiveMaskImage(renderWidth, renderHeight))
+    {
+        return;
+    }
+
+    if(!g_glassBlueNoiseReady)
+    {
+        createGlassBlueNoiseBuffer();
+    }
+
+    if(!ensureSparseActiveMaskPipeline())
+    {
+        return;
+    }
+
+    updateSparseActiveMaskDescriptors();
+
+    VkImageSubresourceRange range{};
+    range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    range.baseMipLevel = 0u;
+    range.levelCount = 1u;
+    range.baseArrayLayer = 0u;
+    range.layerCount = 1u;
+
+    if(g_sparseActiveMaskNeedsClear)
+    {
+        VkImageMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toTransfer.srcAccessMask = 0u;
+        toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toTransfer.oldLayout = g_sparseActiveMaskLayout;
+        toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransfer.image = g_sparseActiveMaskImage;
+        toTransfer.subresourceRange = range;
+
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0u, 0u, nullptr, 0u, nullptr, 1u, &toTransfer);
+
+        // 全 1 = 全活跃：pass 失败时宁可稀疏失效，也不要全屏黑。
+        VkClearColorValue clear{};
+        clear.uint32[0] = 255u;
+
+        vkCmdClearColorImage(
+            cmd,
+            g_sparseActiveMaskImage,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            &clear,
+            1u,
+            &range);
+
+        VkImageMemoryBarrier toGeneral{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toGeneral.image = g_sparseActiveMaskImage;
+        toGeneral.subresourceRange = range;
+
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0u, 0u, nullptr, 0u, nullptr, 1u, &toGeneral);
+
+        g_sparseActiveMaskLayout = VK_IMAGE_LAYOUT_GENERAL;
+        g_sparseActiveMaskNeedsClear = false;
+    }
+
+    // 上一帧 raygen 读 → 本帧 compute 写（WAR）。两张 layout 都是 GENERAL，
+    // 但 access 变了，不能只靠 layout 相同就省掉。
+    {
+        VkImageMemoryBarrier beforeWrite{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        beforeWrite.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        beforeWrite.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        beforeWrite.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        beforeWrite.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        beforeWrite.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        beforeWrite.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        beforeWrite.image = g_sparseActiveMaskImage;
+        beforeWrite.subresourceRange = range;
+
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0u, 0u, nullptr, 0u, nullptr, 1u, &beforeWrite);
+    }
+
+    SparseActiveMaskPush push{};
+    push.width = renderWidth;
+    push.height = renderHeight;
+    push.frameIndex = static_cast<uint32_t>(g_sparseEffectiveFrameIndex);
+    push.maskWidth = (renderWidth + 3u) / 4u;
+    push.samplingRate = g_sparseEffectiveRate;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_sparseActiveMaskPipeline);
+    vkCmdBindDescriptorSets(
+        cmd,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_sparseActiveMaskPipelineLayout,
+        0u, 1u, &g_sparseActiveMaskSet, 0u, nullptr);
+    vkCmdPushConstants(
+        cmd,
+        g_sparseActiveMaskPipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0u,
+        sizeof(push),
+        &push);
+
+    vkCmdDispatch(
+        cmd,
+        (push.maskWidth + 7u) / 8u,
+        (g_sparseActiveMaskHeight + 7u) / 8u,
+        1u);
+
+    VkImageMemoryBarrier toRead{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toRead.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    toRead.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    toRead.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    toRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toRead.image = g_sparseActiveMaskImage;
+    toRead.subresourceRange = range;
+
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        0u, 0u, nullptr, 0u, nullptr, 1u, &toRead);
+}
+
+// RT 主 set 的 73/74/75（raygen 写）。
+static void updateGlassAlphaBlendRayDescriptors()
+{
+    // 2026-10-27：binding 76（128x128x64 蓝噪声）现在有两个消费者：
+    //   1) 玻璃 alpha blend 的 randomThreshold；
+    //   2) 稀疏渲染的 per-pixel rate 判定（rt_test.rgen 的
+    //      vptSparseBlueNoiseThreshold，照 Remix 的 BlueNoise128x128x64x8 分支）。
+    // 它只依赖蓝噪声 buffer 本身，因此必须在这四个玻璃 view 的判据**之前**写：
+    // 否则玻璃图还没建好时 76 保持未写入，稀疏判定读到的是 UB（多数驱动返回 0
+    // ⇒ threshold = 0 <= rate ⇒ 恒全活跃，稀疏静默失效）。
+    if(!g_glassBlueNoiseReady)
+    {
+        createGlassBlueNoiseBuffer();
+    }
+
+    if(g_rayTracingDescriptorSet != VK_NULL_HANDLE &&
+       g_glassBlueNoiseBuffer != VK_NULL_HANDLE)
+    {
+        VkDescriptorBufferInfo sparseBlueNoiseInfo{};
+        sparseBlueNoiseInfo.buffer = g_glassBlueNoiseBuffer;
+        sparseBlueNoiseInfo.offset = 0u;
+        sparseBlueNoiseInfo.range = VK_WHOLE_SIZE;
+
+        VkWriteDescriptorSet sparseBlueNoiseWrite{};
+        sparseBlueNoiseWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        sparseBlueNoiseWrite.dstSet = g_rayTracingDescriptorSet;
+        sparseBlueNoiseWrite.dstBinding = 76u;
+        sparseBlueNoiseWrite.descriptorCount = 1u;
+        sparseBlueNoiseWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        sparseBlueNoiseWrite.pBufferInfo = &sparseBlueNoiseInfo;
+
+        vkUpdateDescriptorSets(g_device, 1u, &sparseBlueNoiseWrite, 0u, nullptr);
+    }
+
+    if(g_rayTracingDescriptorSet == VK_NULL_HANDLE ||
+       g_alphaBlendGbufferView == VK_NULL_HANDLE ||
+       g_alphaBlendMetaView == VK_NULL_HANDLE ||
+       g_alphaBlendLightView == VK_NULL_HANDLE ||
+       g_alphaBlendVolumeView == VK_NULL_HANDLE ||
+       g_glassBlueNoiseBuffer == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkDescriptorImageInfo infos[4]{};
+    infos[0].imageView = g_alphaBlendGbufferView;
+    infos[1].imageView = g_alphaBlendMetaView;
+    infos[2].imageView = g_alphaBlendLightView;
+    infos[3].imageView = g_alphaBlendVolumeView;
+
+    for(uint32_t i = 0u; i < 4u; ++i)
+    {
+        infos[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+
+    const uint32_t bindings[4] = { 73u, 74u, 75u, 77u };
+    VkWriteDescriptorSet writes[5]{};
+
+    for(uint32_t i = 0u; i < 4u; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = g_rayTracingDescriptorSet;
+        writes[i].dstBinding = bindings[i];
+        writes[i].descriptorCount = 1u;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[i].pImageInfo = &infos[i];
+    }
+
+    // binding 76：蓝噪声表（raygen 的 randomThreshold）。
+    VkDescriptorBufferInfo blueNoiseInfo{};
+    blueNoiseInfo.buffer = g_glassBlueNoiseBuffer;
+    blueNoiseInfo.offset = 0u;
+    blueNoiseInfo.range = VK_WHOLE_SIZE;
+
+    writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[4].dstSet = g_rayTracingDescriptorSet;
+    writes[4].dstBinding = 76u;
+    writes[4].descriptorCount = 1u;
+    writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[4].pBufferInfo = &blueNoiseInfo;
+
+    vkUpdateDescriptorSets(g_device, 5u, writes, 0u, nullptr);
+
+    g_glassAlphaBlendBoundSet = g_rayTracingDescriptorSet;
+    g_glassAlphaBlendBoundRayGbuffer = g_alphaBlendGbufferView;
+}
+
+// 新 pass 自己的 set（8 张 storage image，独立于 RT 主 set）。
+static void updateGlassAlphaBlendPassDescriptors()
+{
+    if(g_glassAlphaBlendSet == VK_NULL_HANDLE ||
+       g_rtOutputView == VK_NULL_HANDLE ||
+       g_alphaBlendGbufferView == VK_NULL_HANDLE ||
+       g_alphaBlendMetaView == VK_NULL_HANDLE ||
+       g_alphaBlendLightView == VK_NULL_HANDLE ||
+       g_alphaBlendRadianceView == VK_NULL_HANDLE ||
+       g_dlssDepthView == VK_NULL_HANDLE ||
+       g_rrNormalRoughnessView == VK_NULL_HANDLE ||
+       g_rrDiffuseAlbedoView == VK_NULL_HANDLE ||
+       g_cameraUboBuffer == VK_NULL_HANDLE ||
+       g_alphaBlendVolumeView == VK_NULL_HANDLE ||
+       g_alphaBlendPlaceholder3DView == VK_NULL_HANDLE ||
+       g_glassBlueNoiseBuffer == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    // 顺序必须与两个 shader 的 binding 号一致。
+    VkDescriptorImageInfo infos[8]{};
+    infos[0].imageView = g_rtOutputView;
+    infos[1].imageView = g_alphaBlendGbufferView;
+    infos[2].imageView = g_alphaBlendMetaView;
+    infos[3].imageView = g_alphaBlendLightView;
+    infos[4].imageView = g_alphaBlendRadianceView;
+    infos[5].imageView = g_dlssDepthView;
+    infos[6].imageView = g_rrNormalRoughnessView;
+    infos[7].imageView = g_rrDiffuseAlbedoView;
+
+    for(uint32_t i = 0u; i < 8u; ++i)
+    {
+        infos[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+
+    VkWriteDescriptorSet writes[16]{};
+
+    for(uint32_t i = 0u; i < 8u; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = g_glassAlphaBlendSet;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1u;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[i].pImageInfo = &infos[i];
+    }
+
+    // binding 8：相机 UBO（邻居搜索的世界位置重建，见 set layout 处说明）。
+    VkDescriptorBufferInfo cameraInfo{};
+    cameraInfo.buffer = g_cameraUboBuffer;
+    cameraInfo.offset = 0u;
+    cameraInfo.range = VK_WHOLE_SIZE;
+
+    writes[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[8].dstSet = g_glassAlphaBlendSet;
+    writes[8].dstBinding = 8u;
+    writes[8].descriptorCount = 1u;
+    writes[8].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[8].pBufferInfo = &cameraInfo;
+
+    // binding 9：蓝噪声表。
+    VkDescriptorBufferInfo blueNoiseInfo{};
+    blueNoiseInfo.buffer = g_glassBlueNoiseBuffer;
+    blueNoiseInfo.offset = 0u;
+    blueNoiseInfo.range = VK_WHOLE_SIZE;
+
+    writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[9].dstSet = g_glassAlphaBlendSet;
+    writes[9].dstBinding = 9u;
+    writes[9].descriptorCount = 1u;
+    writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[9].pBufferInfo = &blueNoiseInfo;
+
+    VkDescriptorImageInfo volumeInfo{};
+    volumeInfo.imageView = g_alphaBlendVolumeView;
+    volumeInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[10].dstSet = g_glassAlphaBlendSet;
+    writes[10].dstBinding = 10u;
+    writes[10].descriptorCount = 1u;
+    writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[10].pImageInfo = &volumeInfo;
+
+    // binding 11/12：SH 辐照度缓存（体积 ReSTIR integrate 写出的 [0]）。
+    // SH 不可用（体积 ReSTIR 链关着）时绑 3D 占位图：描述符必须始终有效，
+    // 着色器靠 push.shValid = 0 跳过读取。
+    const bool shVolumeAvailable =
+        g_volShYView[0] != VK_NULL_HANDLE && g_volShCoCgView[0] != VK_NULL_HANDLE;
+
+    VkDescriptorImageInfo shYInfo{};
+    shYInfo.imageView = shVolumeAvailable
+        ? g_volShYView[0]
+        : g_alphaBlendPlaceholder3DView;
+    shYInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorImageInfo shCoCgInfo{};
+    shCoCgInfo.imageView = shVolumeAvailable
+        ? g_volShCoCgView[0]
+        : g_alphaBlendPlaceholder3DView;
+    shCoCgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    writes[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[11].dstSet = g_glassAlphaBlendSet;
+    writes[11].dstBinding = 11u;
+    writes[11].descriptorCount = 1u;
+    writes[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[11].pImageInfo = &shYInfo;
+
+    writes[12].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[12].dstSet = g_glassAlphaBlendSet;
+    writes[12].dstBinding = 12u;
+    writes[12].descriptorCount = 1u;
+    writes[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[12].pImageInfo = &shCoCgInfo;
+
+    // 诊断视图的三张输入（体积 ReSTIR 关着时绑同格式占位图）。
+    VkDescriptorImageInfo diagRadianceInfo{};
+    diagRadianceInfo.imageView =
+        g_volRadianceView[0] != VK_NULL_HANDLE ? g_volRadianceView[0]
+                                              : g_alphaBlendPlaceholder3DView;
+    diagRadianceInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorImageInfo diagAgeInfo{};
+    diagAgeInfo.imageView =
+        g_volAgeView[0] != VK_NULL_HANDLE ? g_volAgeView[0]
+                                          : g_alphaBlendPlaceholderR8View;
+    diagAgeInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorImageInfo diagReservoirInfo{};
+    diagReservoirInfo.imageView =
+        g_volReservoirView[0] != VK_NULL_HANDLE ? g_volReservoirView[0]
+                                               : g_alphaBlendPlaceholderUintView;
+    diagReservoirInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    writes[13].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[13].dstSet = g_glassAlphaBlendSet;
+    writes[13].dstBinding = 13u;
+    writes[13].descriptorCount = 1u;
+    writes[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[13].pImageInfo = &diagRadianceInfo;
+
+    writes[14].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[14].dstSet = g_glassAlphaBlendSet;
+    writes[14].dstBinding = 14u;
+    writes[14].descriptorCount = 1u;
+    writes[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[14].pImageInfo = &diagAgeInfo;
+
+    writes[15].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[15].dstSet = g_glassAlphaBlendSet;
+    writes[15].dstBinding = 15u;
+    writes[15].descriptorCount = 1u;
+    writes[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[15].pImageInfo = &diagReservoirInfo;
+
+    vkUpdateDescriptorSets(g_device, 16u, writes, 0u, nullptr);
+
+    g_glassAlphaBlendBoundColor = g_rtOutputView;
+    g_glassAlphaBlendBoundGbuffer = g_alphaBlendGbufferView;
+    g_glassAlphaBlendBoundMeta = g_alphaBlendMetaView;
+    g_glassAlphaBlendBoundLight = g_alphaBlendLightView;
+    g_glassAlphaBlendBoundRadiance = g_alphaBlendRadianceView;
+    g_glassAlphaBlendBoundDepth = g_dlssDepthView;
+    g_glassAlphaBlendBoundNormal = g_rrNormalRoughnessView;
+    g_glassAlphaBlendBoundAlbedo = g_rrDiffuseAlbedoView;
+    g_glassAlphaBlendBoundShY = shVolumeAvailable
+        ? g_volShYView[0]
+        : g_alphaBlendPlaceholder3DView;
+}
+
+// set layout + pool + pipeline layout + 两个 compute pipeline。
+// 失败一次就置 failed，不再重试（照 g_volRestirPipelineFailed 的做法）。
+static void ensureGlassAlphaBlendPipelines()
+{
+    if(g_glassAlphaBlendPipeline != VK_NULL_HANDLE &&
+       g_glassAlphaFinishPipeline != VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    if(g_glassAlphaBlendPipelineFailed)
+    {
+        return;
+    }
+
+    try
+    {
+        if(g_glassAlphaBlendSetLayout == VK_NULL_HANDLE)
+        {
+            // 0..7 storage image，8 = camera UBO，9 = 蓝噪声表（storage buffer），
+            // 10 = radiance volume 兜底图（storage image）。
+            // camera UBO 是**照抄必需**的：原文的邻居搜索要算
+            //   neighborPosition = cameraPosition + neighborDistance * worldDirection
+            //   positionDiff = neighborPosition - surfacePosition
+            // （composite_alpha_blend.comp.slang:168-172），而邻居距离要从
+            // PrimaryLinearViewZ 反算 —— 本引擎没有那张线性视深图，用
+            // projInverse 从 reverse-Z 深度反算（与 god_ray_composite.comp 同一手法）。
+            // 11/12 = SH 辐照度缓存 Y / CoCg（2026-10-27，见 docs §10.3）。
+            VkDescriptorSetLayoutBinding bindings[16]{};
+
+            for(uint32_t i = 0u; i < 8u; ++i)
+            {
+                bindings[i].binding = i;
+                bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                bindings[i].descriptorCount = 1u;
+                bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            }
+
+            bindings[8].binding = 8u;
+            bindings[8].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            bindings[8].descriptorCount = 1u;
+            bindings[8].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            // 9：蓝噪声表（与 raygen 同一份数据，见 createGlassBlueNoiseBuffer）。
+            bindings[9].binding = 9u;
+            bindings[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[9].descriptorCount = 1u;
+            bindings[9].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            // 10：radiance volume 兜底图（binding 77 的同一张，见 rgen）。
+            bindings[10].binding = 10u;
+            bindings[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            bindings[10].descriptorCount = 1u;
+            bindings[10].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            // 11/12：SH 辐照度缓存（Remix AccumulatedRadianceY / CoCg）。
+            // 世界坐标 -> froxel 坐标后手工三线性采样，见 glass_alpha_blend.comp。
+            bindings[11].binding = 11u;
+            bindings[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            bindings[11].descriptorCount = 1u;
+            bindings[11].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            bindings[12].binding = 12u;
+            bindings[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            bindings[12].descriptorCount = 1u;
+            bindings[12].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            // 13/14/15：只给诊断视图（vol_diag.comp）用。
+            //   radiance(rgba16f) / age(r8) / reservoir(rgba32ui)
+            bindings[13].binding = 13u;
+            bindings[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            bindings[13].descriptorCount = 1u;
+            bindings[13].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            bindings[14].binding = 14u;
+            bindings[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            bindings[14].descriptorCount = 1u;
+            bindings[14].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            bindings[15].binding = 15u;
+            bindings[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            bindings[15].descriptorCount = 1u;
+            bindings[15].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            VkDescriptorSetLayoutCreateInfo layoutInfo{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+            };
+            layoutInfo.bindingCount = 16u;
+            layoutInfo.pBindings = bindings;
+
+            check(
+                vkCreateDescriptorSetLayout(
+                    g_device, &layoutInfo, nullptr, &g_glassAlphaBlendSetLayout),
+                "glass alpha blend set layout failed");
+        }
+
+        if(g_glassAlphaBlendPool == VK_NULL_HANDLE)
+        {
+            VkDescriptorPoolSize poolSizes[3] = {
+                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 14u },
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u },
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u }
+            };
+            VkDescriptorPoolCreateInfo poolInfo{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+            };
+            poolInfo.maxSets = 1u;
+            poolInfo.poolSizeCount = 3u;
+            poolInfo.pPoolSizes = poolSizes;
+
+            check(
+                vkCreateDescriptorPool(
+                    g_device, &poolInfo, nullptr, &g_glassAlphaBlendPool),
+                "glass alpha blend descriptor pool failed");
+        }
+
+        if(g_glassAlphaBlendSet == VK_NULL_HANDLE)
+        {
+            VkDescriptorSetAllocateInfo allocateInfo{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+            };
+            allocateInfo.descriptorPool = g_glassAlphaBlendPool;
+            allocateInfo.descriptorSetCount = 1u;
+            allocateInfo.pSetLayouts = &g_glassAlphaBlendSetLayout;
+
+            check(
+                vkAllocateDescriptorSets(
+                    g_device, &allocateInfo, &g_glassAlphaBlendSet),
+                "glass alpha blend descriptor set failed");
+        }
+
+        if(g_glassAlphaBlendPipelineLayout == VK_NULL_HANDLE)
+        {
+            VkPushConstantRange pushRange{};
+            pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            pushRange.offset = 0u;
+            pushRange.size = sizeof(GlassAlphaBlendPush);
+
+            VkPipelineLayoutCreateInfo pipelineLayoutInfo{
+                VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+            };
+            pipelineLayoutInfo.setLayoutCount = 1u;
+            pipelineLayoutInfo.pSetLayouts = &g_glassAlphaBlendSetLayout;
+            pipelineLayoutInfo.pushConstantRangeCount = 1u;
+            pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+
+            check(
+                vkCreatePipelineLayout(
+                    g_device, &pipelineLayoutInfo, nullptr,
+                    &g_glassAlphaBlendPipelineLayout),
+                "glass alpha blend pipeline layout failed");
+        }
+
+        const struct
+        {
+            const char* path;
+            VkPipeline* pipeline;
+        } stages[3] =
+        {
+            { "shaders/glass_alpha_blend.comp.spv", &g_glassAlphaBlendPipeline },
+            { "shaders/glass_alpha_finish.comp.spv", &g_glassAlphaFinishPipeline },
+            { "shaders/vol_diag.comp.spv", &g_glassAlphaDiagPipeline }
+        };
+
+        for(uint32_t i = 0u; i < 3u; ++i)
+        {
+            if(*stages[i].pipeline != VK_NULL_HANDLE)
+            {
+                continue;
+            }
+
+            std::vector<uint8_t> stageCode = loadSpv(stages[i].path);
+
+            // 2026-10-28：把字节数打进日志。SPV 与源码不同步过一次（rgen 618900 vs
+            // 619200），从此加载处必须留下可核对的指纹。
+            RTLog(
+                "[GLASS ALPHA BLEND] loaded " + std::string(stages[i].path) +
+                " bytes=" + std::to_string(stageCode.size()));
+
+            VkShaderModule module =
+                createShaderModule(g_device, stageCode);
+
+            VkPipelineShaderStageCreateInfo stage{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+            };
+            stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            stage.module = module;
+            stage.pName = "main";
+
+            VkComputePipelineCreateInfo pipelineInfo{
+                VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+            };
+            pipelineInfo.stage = stage;
+            pipelineInfo.layout = g_glassAlphaBlendPipelineLayout;
+
+            const VkResult result = vkCreateComputePipelines(
+                g_device, getSharedPipelineCache(), 1u, &pipelineInfo, nullptr,
+                stages[i].pipeline);
+
+            vkDestroyShaderModule(g_device, module, nullptr);
+
+            check(result, "glass alpha blend pipeline failed");
+        }
+
+        RTLog("[GLASS ALPHA BLEND] composite + finish pipelines ready");
+    }
+    catch(const std::exception& error)
+    {
+        g_glassAlphaBlendPipelineFailed = true;
+        RTLog(std::string("[GLASS ALPHA BLEND] unavailable: ") + error.what());
+    }
+}
+
+// 每帧建图（渲染分辨率）。alreadyValid 判据照 createRRGBufferImages：
+// 句柄齐全且尺寸一致就直接返回；否则等设备空闲后整张重建。
+static void createGlassAlphaBlendImages(uint32_t width, uint32_t height)
+{
+    if(g_alphaBlendGbufferImage != VK_NULL_HANDLE &&
+       g_alphaBlendMetaImage != VK_NULL_HANDLE &&
+       g_alphaBlendLightImage != VK_NULL_HANDLE &&
+       g_alphaBlendVolumeImage != VK_NULL_HANDLE &&
+       g_alphaBlendRadianceImage != VK_NULL_HANDLE &&
+       g_alphaBlendWidth == width &&
+       g_alphaBlendHeight == height)
+    {
+        return;
+    }
+
+    if(g_alphaBlendGbufferImage != VK_NULL_HANDLE)
+    {
+        check(
+            FGDeviceWaitIdle(g_device),
+            "wait device before glass alpha blend recreate failed");
+    }
+
+    destroyHistoryImage(
+        g_alphaBlendGbufferImage,
+        g_alphaBlendGbufferMemory,
+        g_alphaBlendGbufferView,
+        g_alphaBlendGbufferLayout);
+
+    destroyHistoryImage(
+        g_alphaBlendMetaImage,
+        g_alphaBlendMetaMemory,
+        g_alphaBlendMetaView,
+        g_alphaBlendMetaLayout);
+
+    destroyHistoryImage(
+        g_alphaBlendLightImage,
+        g_alphaBlendLightMemory,
+        g_alphaBlendLightView,
+        g_alphaBlendLightLayout);
+
+    destroyHistoryImage(
+        g_alphaBlendVolumeImage,
+        g_alphaBlendVolumeMemory,
+        g_alphaBlendVolumeView,
+        g_alphaBlendVolumeLayout);
+
+    destroyHistoryImage(
+        g_alphaBlendRadianceImage,
+        g_alphaBlendRadianceMemory,
+        g_alphaBlendRadianceView,
+        g_alphaBlendRadianceLayout);
+
+    createRRGuideImage(
+        width, height, VK_FORMAT_R16G16B16A16_SFLOAT,
+        g_alphaBlendGbufferImage,
+        g_alphaBlendGbufferMemory,
+        g_alphaBlendGbufferView,
+        g_alphaBlendGbufferLayout);
+
+    createRRGuideImage(
+        width, height, VK_FORMAT_R16G16B16A16_SFLOAT,
+        g_alphaBlendMetaImage,
+        g_alphaBlendMetaMemory,
+        g_alphaBlendMetaView,
+        g_alphaBlendMetaLayout);
+
+    createRRGuideImage(
+        width, height, VK_FORMAT_R16G16B16A16_SFLOAT,
+        g_alphaBlendLightImage,
+        g_alphaBlendLightMemory,
+        g_alphaBlendLightView,
+        g_alphaBlendLightLayout);
+
+    // radiance volume 兜底（binding 77）。
+    // 3D 占位图（一次即可，与分辨率无关）。
+    // 诊断视图要读 radiance(rgba16f) / age(r8) / reservoir(rgba32ui) 三种格式，
+    // storage image 的格式必须与 shader 声明一致 ⇒ 各建一张 1x1x1。
+    createPlaceholder3DImage(VK_FORMAT_R8_UNORM,
+        g_alphaBlendPlaceholderR8Image, g_alphaBlendPlaceholderR8Memory,
+        g_alphaBlendPlaceholderR8View);
+    createPlaceholder3DImage(VK_FORMAT_R32G32B32A32_UINT,
+        g_alphaBlendPlaceholderUintImage, g_alphaBlendPlaceholderUintMemory,
+        g_alphaBlendPlaceholderUintView);
+
+    if(g_alphaBlendPlaceholder3DImage == VK_NULL_HANDLE)
+    {
+        VkImageCreateInfo placeholderInfo{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        placeholderInfo.imageType = VK_IMAGE_TYPE_3D;
+        placeholderInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        placeholderInfo.extent = { 1u, 1u, 1u };
+        placeholderInfo.mipLevels = 1u;
+        placeholderInfo.arrayLayers = 1u;
+        placeholderInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        placeholderInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        placeholderInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+        placeholderInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+        check(vkCreateImage(g_device, &placeholderInfo, nullptr,
+            &g_alphaBlendPlaceholder3DImage), "placeholder 3D image failed");
+
+        VkMemoryRequirements placeholderRequirements{};
+        vkGetImageMemoryRequirements(g_device, g_alphaBlendPlaceholder3DImage,
+            &placeholderRequirements);
+
+        VkMemoryAllocateInfo placeholderAllocate{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        placeholderAllocate.allocationSize = placeholderRequirements.size;
+        placeholderAllocate.memoryTypeIndex = findMemoryType(
+            g_physicalDevice, placeholderRequirements.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        check(vkAllocateMemory(g_device, &placeholderAllocate, nullptr,
+            &g_alphaBlendPlaceholder3DMemory), "placeholder 3D memory failed");
+        check(vkBindImageMemory(g_device, g_alphaBlendPlaceholder3DImage,
+            g_alphaBlendPlaceholder3DMemory, 0u), "placeholder 3D bind failed");
+
+        VkImageViewCreateInfo placeholderView{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        placeholderView.image = g_alphaBlendPlaceholder3DImage;
+        placeholderView.viewType = VK_IMAGE_VIEW_TYPE_3D;
+        placeholderView.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        placeholderView.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        placeholderView.subresourceRange.levelCount = 1u;
+        placeholderView.subresourceRange.layerCount = 1u;
+
+        check(vkCreateImageView(g_device, &placeholderView, nullptr,
+            &g_alphaBlendPlaceholder3DView), "placeholder 3D view failed");
+    }
+
+    createRRGuideImage(
+        width, height, VK_FORMAT_R16G16B16A16_SFLOAT,
+        g_alphaBlendVolumeImage,
+        g_alphaBlendVolumeMemory,
+        g_alphaBlendVolumeView,
+        g_alphaBlendVolumeLayout);
+
+    createRRGuideImage(
+        width, height, VK_FORMAT_R16G16B16A16_SFLOAT,
+        g_alphaBlendRadianceImage,
+        g_alphaBlendRadianceMemory,
+        g_alphaBlendRadianceView,
+        g_alphaBlendRadianceLayout);
+
+    g_alphaBlendWidth = width;
+    g_alphaBlendHeight = height;
+
+    // 图换了 ⇒ 两个 set 的绑定都要重写（旧视图已销毁）。
+    g_glassAlphaBlendBoundSet = VK_NULL_HANDLE;
+    g_glassAlphaBlendBoundGbuffer = VK_NULL_HANDLE;
+
+    updateGlassAlphaBlendRayDescriptors();
+    updateGlassAlphaBlendPassDescriptors();
+
+    std::cerr << "[GLASS ALPHA BLEND] images created "
+              << width << "x" << height << std::endl;
+}
+
+// trace 之前：把图转到 GENERAL，并把 74 号图清 0。
+//
+// 清 0 是**正确性**要求，不是优化：74 号图的 a 通道是"这一格本帧有没有半透明面"
+// 的唯一判据。rgen 只给真正的半透明像素写它，剩下的必须读成 0，否则上一帧的
+// 玻璃像素在这一帧被当成玻璃重新合成一遍（画面里会留下随相机移动的鬼影矩形）。
+// 只清这一张（另一张 radiance 每帧被全量覆盖到有半透明像素的格子）。
+static void recordGlassAlphaBlendPrepare(VkCommandBuffer cmd)
+{
+    if(cmd == VK_NULL_HANDLE ||
+       g_alphaBlendMetaImage == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    prepareGlassAlphaBlendImages(cmd);
+
+    VkImageSubresourceRange range{};
+    range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    range.baseMipLevel = 0u;
+    range.levelCount = 1u;
+    range.baseArrayLayer = 0u;
+    range.layerCount = 1u;
+
+    // 清成 AlphaBlendSurface::createEmpty() 的初值（alpha_blend_surface.slangh:76-86）：
+    //   x = backgroundTransparency = 1.0
+    //   y = hitT = 0.0            （isValid() == hitT > 0，:95-98 ⇒ 空槽无效）
+    //   z = randomThreshold       （由 raygen 每条链重置时写蓝噪声）
+    //   w = geometryHash
+    // 注意不能清 0：bgT = 0 会让第一层的
+    //   `randomThreshold >= 1.0 - backgroundTransparency`（:144）恒假 ⇒ setOpaque，
+    //   整块玻璃变成不透明。
+    VkClearColorValue clearColor{};
+    clearColor.float32[0] = 1.0f;
+    clearColor.float32[1] = 0.0f;
+    clearColor.float32[2] = 0.0f;
+    clearColor.float32[3] = 0.0f;
+
+    vkCmdClearColorImage(
+        cmd,
+        g_alphaBlendMetaImage,
+        VK_IMAGE_LAYOUT_GENERAL,
+        &clearColor,
+        1u,
+        &range);
+
+    // 清写 -> raygen 写/读 的排序（同一批 texel，必须显式排）。
+    VkImageMemoryBarrier clearBarrier{};
+    clearBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    clearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    clearBarrier.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    clearBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    clearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    clearBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    clearBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    clearBarrier.image = g_alphaBlendMetaImage;
+    clearBarrier.subresourceRange = range;
+
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0u,
+        0u, nullptr,
+        0u, nullptr,
+        1u, &clearBarrier);
+}
+
+// trace 之后：[2] 邻居搜索 + 滤波 + 合成 -> radiance；[3] 写回 rtOutput。
+// 两个 dispatch 之间必须有一次 compute->compute 屏障：finish 读 radiance，
+// 而 radiance 是 blend 写的（跨 invocation，不能靠"同像素自己读自己"糊过去）。
+static void recordGlassAlphaBlend(
+    VkCommandBuffer cmd,
+    uint32_t width,
+    uint32_t height)
+{
+    if(cmd == VK_NULL_HANDLE ||
+       g_alphaBlendRadianceImage == VK_NULL_HANDLE ||
+       g_rtOutputImage == VK_NULL_HANDLE ||
+       g_rayTracingDescriptorSet == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    // 蓝噪声表：一次性建（与分辨率无关）。必须在描述符写入之前建好，
+    // 否则 raygen 的 binding 76 会拿到空 buffer。
+    if(!g_glassBlueNoiseReady)
+    {
+        createGlassBlueNoiseBuffer();
+    }
+
+    ensureGlassAlphaBlendPipelines();
+
+    if(g_glassAlphaBlendPipeline == VK_NULL_HANDLE ||
+       g_glassAlphaFinishPipeline == VK_NULL_HANDLE ||
+       g_glassAlphaBlendSet == VK_NULL_HANDLE ||
+       g_glassAlphaBlendPipelineLayout == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    if(g_glassAlphaBlendBoundRayGbuffer != g_alphaBlendGbufferView ||
+       g_glassAlphaBlendBoundSet != g_rayTracingDescriptorSet)
+    {
+        updateGlassAlphaBlendRayDescriptors();
+    }
+
+    if(g_glassAlphaBlendBoundColor != g_rtOutputView ||
+       g_glassAlphaBlendBoundGbuffer != g_alphaBlendGbufferView ||
+       g_glassAlphaBlendBoundMeta != g_alphaBlendMetaView ||
+       g_glassAlphaBlendBoundLight != g_alphaBlendLightView ||
+       g_glassAlphaBlendBoundRadiance != g_alphaBlendRadianceView ||
+       g_glassAlphaBlendBoundDepth != g_dlssDepthView ||
+       g_glassAlphaBlendBoundNormal != g_rrNormalRoughnessView ||
+       g_glassAlphaBlendBoundAlbedo != g_rrDiffuseAlbedoView ||
+       g_glassAlphaBlendBoundShY != (g_volShYView[0] != VK_NULL_HANDLE
+            ? g_volShYView[0]
+            : g_alphaBlendPlaceholder3DView))
+    {
+        updateGlassAlphaBlendPassDescriptors();
+    }
+
+    VkImageSubresourceRange range{};
+    range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    range.baseMipLevel = 0u;
+    range.levelCount = 1u;
+    range.baseArrayLayer = 0u;
+    range.layerCount = 1u;
+
+    // raygen 写（73/74/75 + rtOutput）-> compute 读。
+    {
+        // 8 张：前 5 张是本 pass 与 rgen 直接共享的，后 3 张是邻居搜索要读的
+        // RR guide（sceneDepth / sceneNormalRoughness / sceneDiffuseAlbedo）。
+        // 后三者也由 rgen 在 RT 阶段写，漏掉它们就等于让 compute 读未完成的写
+        // —— 2026-10-26 复核时补齐（原来只列了 5 张）。
+        VkImageMemoryBarrier barriers[8]{};
+
+        VkImage barrierImages[8] =
+        {
+            g_alphaBlendGbufferImage,
+            g_alphaBlendMetaImage,
+            g_alphaBlendLightImage,
+            g_rtOutputImage,
+            g_alphaBlendRadianceImage,
+            g_dlssDepthImage,
+            g_rrNormalRoughnessImage,
+            g_rrDiffuseAlbedoImage
+        };
+
+        for(uint32_t i = 0u; i < 8u; ++i)
+        {
+            barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            barriers[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[i].image = barrierImages[i];
+            barriers[i].subresourceRange = range;
+        }
+
+        // radiance 上一帧被 finish 读过（上一帧的 compute），本帧第一次写。
+        barriers[4].srcAccessMask =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barriers[4].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0u,
+            0u, nullptr,
+            0u, nullptr,
+            8u, barriers);
+    }
+
+    GlassAlphaBlendPush push{};
+    push.extentX = width;
+    push.extentY = height;
+    // 邻居搜索参数：**原文默认值**（rtx_composite.h:110-118），
+    // 6 次迭代 / 初始半径 10.0 / 失败时 ×1.6 / 法线 0.9 / 深度 0.1 / 共面 0.2。
+    push.neighborIterations = 6u;
+    push.frameIndex = g_glassAlphaBlendFrameIndex++;
+    push.neighborRadius = 10.0f;
+    push.neighborExpand = 1.6f;
+    push.normalThreshold = 0.9f;
+    push.depthThreshold = 0.1f;
+    push.coplanarThreshold = 0.2f;
+    // radiance volume（SH 辐照度缓存）的坐标参数。
+    // 5x5 滤波在原文里不存在（FilteredRadiance 就是 AccumulatedRadiance），
+    // 这三个 lane 改作 SH 用料。
+    push.shMaxDistance = VOL_RESTIR_MAX_DISTANCE;
+    push.shDepthExponent = VOL_RESTIR_DEPTH_EXPONENT;
+    push.shValid =
+        (g_volShYView[0] != VK_NULL_HANDLE && g_volShCoCgView[0] != VK_NULL_HANDLE)
+            ? 1.0f : 0.0f;
+    // 与原文 rtx_composite.h 的默认值逐项一致（第四轮严格搬）：
+    //   UseNeighborSearch / UseRadianceVolume / SearchTheSameObject / ShareNeighbors
+    // 全部 true；AverageSearchMatches 原文是 false，我们也没有实现平均分支。
+    push.neighborSearch = glassAlphaBlendNeighborSearchEnabled() ? 1u : 0u;   // useNeighborSearch
+    push.enableFilter = glassAlphaBlendRadianceVolumeEnabled() ? 1u : 0u;     // useRadianceVolume
+    push.pad0 = 1u;                                                          // searchTheSameObject
+    push.pad1 = 1u;                                                          // shareNeighbors
+    push.shFroxelW = g_volFroxelW;
+    push.shFroxelH = g_volFroxelH;
+    push.shFroxelDepth = VOL_RESTIR_DEPTH;
+    // 诊断开关（默认关）：
+    //   1              = 玻璃层诊断（R=bgT、G=选中层 alpha、B=候选层数/8）
+    //   2..5           = 体积诊断视图（ORION_VOL_DIAG=1..4，由 vol_diag.comp 执行）
+    // ORION_GLASS_ALPHA_BLEND_DBG 现在**取数值**：
+    //   1 = 玻璃层诊断色   6 = 只输出透射背景（surface 归零）
+    {
+        const char* raw = std::getenv("ORION_GLASS_ALPHA_BLEND_DBG");
+        const uint32_t glassDbg = (raw != nullptr && raw[0] != '\0')
+            ? static_cast<uint32_t>(std::atoi(raw)) : 0u;
+
+        // 2026-10-28：逐项排查档的**标记文件**入口（免改 IDE 环境变量）。
+        // 建 run/glass_dbg_<n>.flag（n = 9..13）⇒ push.dbgMode = n，删掉即恢复。
+        // 读一次并缓存：切档本来就要重启客户端，不值得每帧五次 ifstream。
+        static const uint32_t markerDbg = [] {
+            static const uint32_t candidates[] = {1u, 6u, 9u, 10u, 11u, 12u, 13u, 14u};
+
+            for(uint32_t value : candidates)
+            {
+                const std::string name =
+                    "glass_dbg_" + std::to_string(value) + ".flag";
+                std::ifstream marker(ResolveRTXRuntimePath(name.c_str()));
+
+                if(marker.good())
+                {
+                    RTLog("[GLASS DBG] 标记文件 " + name +
+                          " => dbgMode=" + std::to_string(value));
+                    return value;
+                }
+            }
+
+            return 0u;
+        }();
+
+        const uint32_t diagMode = volDiagMode();
+
+        if(glassDbg != 0u)
+        {
+            push.dbgMode = glassDbg;
+        }
+        else if(markerDbg != 0u)
+        {
+            push.dbgMode = markerDbg;
+        }
+        else
+        {
+            push.dbgMode = diagMode != 0u ? 1u + diagMode : 0u;
+        }
+    }
+
+    vkCmdBindPipeline(
+        cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_glassAlphaBlendPipeline);
+    vkCmdBindDescriptorSets(
+        cmd,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_glassAlphaBlendPipelineLayout,
+        0u,
+        1u,
+        &g_glassAlphaBlendSet,
+        0u,
+        nullptr);
+    vkCmdPushConstants(
+        cmd,
+        g_glassAlphaBlendPipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0u,
+        sizeof(push),
+        &push);
+    vkCmdDispatch(cmd, (width + 7u) / 8u, (height + 7u) / 8u, 1u);
+
+    // blend 写 radiance -> finish 读 radiance（跨 invocation）。
+    {
+        VkImageMemoryBarrier radianceBarrier{};
+        radianceBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        radianceBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        radianceBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        radianceBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        radianceBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        radianceBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        radianceBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        radianceBarrier.image = g_alphaBlendRadianceImage;
+        radianceBarrier.subresourceRange = range;
+
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0u,
+            0u, nullptr,
+            0u, nullptr,
+            1u, &radianceBarrier);
+    }
+
+    vkCmdBindPipeline(
+        cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_glassAlphaFinishPipeline);
+    vkCmdBindDescriptorSets(
+        cmd,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_glassAlphaBlendPipelineLayout,
+        0u,
+        1u,
+        &g_glassAlphaBlendSet,
+        0u,
+        nullptr);
+    vkCmdPushConstants(
+        cmd,
+        g_glassAlphaBlendPipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0u,
+        sizeof(push),
+        &push);
+    vkCmdDispatch(cmd, (width + 7u) / 8u, (height + 7u) / 8u, 1u);
+
+    // 2026-10-27：诊断视图（ORION_VOL_DIAG=1..4）在 finish 之后覆盖 rtOutput。
+    // 它复用同一个 set layout / push constant，只是换个 pipeline。
+    // 只有 2..5 是 vol_diag 的模式；6 是玻璃的「只透射」实验，不能让它抢整屏。
+    if(g_glassAlphaDiagPipeline != VK_NULL_HANDLE &&
+       push.dbgMode >= 2u && push.dbgMode <= 5u)
+    {
+        VkImageMemoryBarrier diagBarrier{};
+        diagBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        diagBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        diagBarrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        diagBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        diagBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        diagBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        diagBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        diagBarrier.image = g_rtOutputImage;
+        diagBarrier.subresourceRange = range;
+
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+            0u, nullptr, 0u, nullptr, 1u, &diagBarrier);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_glassAlphaDiagPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            g_glassAlphaBlendPipelineLayout, 0u, 1u, &g_glassAlphaBlendSet, 0u, nullptr);
+        vkCmdPushConstants(cmd, g_glassAlphaBlendPipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(push), &push);
+        vkCmdDispatch(cmd, (width + 7u) / 8u, (height + 7u) / 8u, 1u);
+    }
+
+    // finish 写 rtOutput -> 后续消费者（云合成 / RR / 显示）读。
+    {
+        VkImageMemoryBarrier finishBarrier{};
+        finishBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        finishBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        finishBarrier.dstAccessMask =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        finishBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        finishBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        finishBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        finishBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        finishBarrier.image = g_rtOutputImage;
+        finishBarrier.subresourceRange = range;
+
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0u,
+            0u, nullptr,
+            0u, nullptr,
+            1u, &finishBarrier);
+    }
+}
+
+
+// 2026-10-27：1x1x1 的 3D 占位图（storage image 的格式必须与 shader 声明一致）。
+static void createPlaceholder3DImage(
+    VkFormat format,
+    VkImage& image,
+    VkDeviceMemory& memory,
+    VkImageView& view)
+{
+    if(image != VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkImageCreateInfo info{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    info.imageType = VK_IMAGE_TYPE_3D;
+    info.format = format;
+    info.extent = { 1u, 1u, 1u };
+    info.mipLevels = 1u;
+    info.arrayLayers = 1u;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    check(vkCreateImage(g_device, &info, nullptr, &image), "placeholder 3D image failed");
+
+    VkMemoryRequirements requirements{};
+    vkGetImageMemoryRequirements(g_device, image, &requirements);
+
+    VkMemoryAllocateInfo allocate{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = findMemoryType(
+        g_physicalDevice, requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    check(vkAllocateMemory(g_device, &allocate, nullptr, &memory), "placeholder 3D memory failed");
+    check(vkBindImageMemory(g_device, image, memory, 0u), "placeholder 3D bind failed");
+
+    VkImageViewCreateInfo viewInfo{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    viewInfo.image = image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_3D;
+    viewInfo.format = format;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.levelCount = 1u;
+    viewInfo.subresourceRange.layerCount = 1u;
+    check(vkCreateImageView(g_device, &viewInfo, nullptr, &view), "placeholder 3D view failed");
+}
 
 // 首次使用前的清零。放在帧命令里而不是建图时（建图路径没有现成的 cmd）。
 // 三件事必须按顺序：UNDEFINED→TRANSFER_DST（丢内容）→ clear → TRANSFER_DST→GENERAL。
@@ -26598,11 +29460,35 @@ static void recordSharcUpdate(VkCommandBuffer cmd, uint32_t width, uint32_t heig
         return;
     }
 
-    // 满分辨率 dispatch；shader 内按 5×5 块选像素（4%，与参考
+    // 块级 dispatch（2026-10-25）：每 5x5 块一个线程，块内像素由 shader 哈希选出。
     // sharcDownscaleFactor=5 同一密度）。未选中像素在 shader 里直接退出。
+    // 2026-10-25（对齐 Remix 的 SHaRC 口径）：update 只发**块级**线程。
+    // 旧口径是满渲染分辨率 + shader 内 5x5 选 1（96% 线程空跑，实测 5.35ms 净亏）。
+    // 块大小必须与 rt_test.rgen 的 SHARC_UPDATE_BLOCK 一致。
+    // 2026-10-25：与 rt_test.rgen 的 SHARC_UPDATE_BLOCK 同步（5 -> 3）。
+    // 依据 [SHARC STATS]：update 2616/frame vs query 95985/frame，写入量不足。
+    // 2026-10-25：3 -> 2（覆盖率 25%）。必须与 rt_test.rgen 的 SHARC_UPDATE_BLOCK 一致。
+    // 2026-10-28：2 -> 4（覆盖率 6.25%）。依据：sharcup 实测 5.54 ms，
+    // dispatch = ceil(w/2)×ceil(h/2) = 70,800 线程 ⇒ 78 ns/线程，与主 pass 的
+    // 48.8 ns/像素同量级 ⇒ 不是空线程，是真实路径成本。而 update 像素是**额外**的
+    // 完整路径（Remix 的 dispatch 高度也是 renderH + updateRows，见
+    // _ref/dxvk-remix/.../rtx_spatially_hashed_radiance_cache.cpp:185），
+    // 所以合并 dispatch 只省固定开销，一阶杠杆是覆盖率（成本 ∝ 1/BLOCK²）。
+    // 2026-10-28（按性能收益对齐 Remix）：4 -> 5，与 rt_test.rgen 的 SHARC_UPDATE_BLOCK 同步。
+    // 依据：Remix Ultra 的 downscaleFactor=5（rtx_spatially_hashed_radiance_cache.h:77），
+    // 即 1/25 = 4% 覆盖率；原来 1/16 = 6.25%，1080p 下 update 路径 129,600/frame，
+    // 比 Remix Ultra 的 82,944 多 56%，且分辨率越高越贵。成本 ∝ 1/BLOCK² ⇒ 5 约为 4 的 64%。
+    // ⚠ 必须与 shader 同步：dispatch 发 ceil(w/BLOCK) 个块坐标，shader 用
+    //   sharcBlock * BLOCK + sharcUpdateBlockOffset(block) 还原像素，两边不一致就覆盖不到全屏。
+    const uint32_t sharcUpdateBlock = 5u;
+    const uint32_t sharcUpdateWidth =
+        std::max(1u, (width + sharcUpdateBlock - 1u) / sharcUpdateBlock);
+    const uint32_t sharcUpdateHeight =
+        std::max(1u, (height + sharcUpdateBlock - 1u) / sharcUpdateBlock);
+
     trace(cmd, &g_sharcUpdateRaygenRegion, &g_sharcUpdateMissRegion,
           &g_sharcUpdateHitRegion, &g_sharcUpdateCallableRegion,
-          width, height, 1u);
+          sharcUpdateWidth, sharcUpdateHeight, 1u);
 
     // update 写了 hashEntries / accumulation（也可能读了 resolved）⇒ 必须在渲染
     // pass 读缓存之前把写对读可见。四块一起，SHADER_WRITE → SHADER_READ|WRITE。
@@ -26898,6 +29784,9 @@ static void ensureGiHalfPipeline()
 
         std::cerr << "[GI HALF] 管线已创建（rt_test_gi_half.rgen.spv，"
                      "半分辨率 dispatch = (w+1)/2 × (h+1)/2）" << std::endl;
+
+        // 2026-10-25：同上，把这条变体的编译结果立刻落盘。
+        persistSharedPipelineCache();
     }
     catch(const std::exception& error)
     {
@@ -28408,8 +31297,11 @@ static void createRayTracingDescriptorPoolAndSet()
 {
     VkDescriptorPoolSize ps[5] = {
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
-        // 12 original storage images + 4 NRD-1 textures (bindings 50-53).
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16 },
+        // 2026-10-26：泡沫 feature 曾把这里配到 32（binding 74 岸线注入）；
+        // 同日 21:1x 泡沫回退 ⇒ 还原为 16（池只需容纳实际写过的描述符）。
+        // 同日稍后：半透明 alpha blend 的三张旁路图占 73/74/75 ⇒ 16 -> 19。
+        // 2026-10-27：radiance volume 兜底图占 binding 77 ⇒ 19 -> 20。
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 20 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
         // 2026-10-09 实体 LabPBR：binding 63/64 各 32 个采样器 ⇒ 布局里的
         // sampler 总数从 54 涨到 118（36/37/63/64 四个数组 + 19 个单张），
@@ -28418,7 +31310,8 @@ static void createRayTracingDescriptorPoolAndSet()
         // （36/63/64 各 64 = 192，37 = 3，单张 19），池同步配 256 留头寸。
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512 },
         // 18 + the two LOD tables at bindings 19/20.
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20 }
+        // 2026-10-27：21（新增蓝噪声表的 storage buffer，binding 76）。
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 21 }
     };
     VkDescriptorPoolCreateInfo pi{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     pi.maxSets = 1;
@@ -36517,11 +39410,11 @@ static void createCloudBaseNoiseResources()
     }
     if(loadedReferenceNoise)
     {
-        RTLog("[CLOUD V2] base coverage noise = reference noisetex (64x64 RGBA8)");
+        RTLog("[CLOUD NOISE] base coverage noise = reference noisetex (64x64 RGBA8)");
     }
     else
     {
-        RTLog("[CLOUD V2] base coverage noise = procedural fallback (reference asset missing)");
+        RTLog("[CLOUD NOISE] base coverage noise = procedural fallback (reference asset missing)");
         for(uint32_t y = 0u; y < dim; ++y)
         for(uint32_t x = 0u; x < dim; ++x)
         {
@@ -36697,7 +39590,7 @@ static void createCloudBaseNoiseResources()
     check(vkCreateSampler(g_device, &samplerInfo, nullptr, &g_cloudBaseNoiseSampler),
         "cloud base noise sampler create failed");
 
-    RTLog("[CLOUD V2] 64x64 base coverage noise uploaded (" +
+    RTLog("[CLOUD NOISE] 64x64 base coverage noise uploaded (" +
         std::to_string(mipLevels) + " levels)");
 }
 
@@ -36912,6 +39805,19 @@ static void cloudV4DebugLog(const char* text)
     }
 }
 
+// 体积云模型选择（2026-10-25）：缺省 = v5（Schneider 重写版）；
+// 环境变量 ORION_CLOUD_MODEL=ue 回退 v4 的 UE 风格实现（渲染与烘焙都回）。
+// 只在进程启动时读一次；运行期切换不支持（烘焙资产不同）。
+static int cloudModelRequested()
+{
+    // 2026-10-25：v5（HPVolumeCloud 移植）成为**唯一**的云模型。
+    // 旧的 bevy/v4/UE 实现在 2026-10-25 的标定里已经被全面超越（同一个 24km² 俯视切片：
+    // 旧实现的密度场是"一张毯"，v5 是独立积云团块），继续留着只会让"游戏里看到的
+    // 和预览对不上"。ORION_CLOUD_MODEL=ue 开关**已退役**，这里恒返回 0。
+    // （函数保留是为了不动 3 处调用点；ue 的着色器与烘焙器仍在仓库里，随时可回退。）
+    return 0;
+}
+
 static void createCloudV4Resources()
 {
     // 2026-10-18 紧急开关：run/skip_cloud_v4.flag 存在时整段跳过。
@@ -36946,9 +39852,14 @@ static void createCloudV4Resources()
     check(vkCreateImage(g_device, &atlasInfo, nullptr, &g_cloudV4AtlasImage),
         "cloud v4 atlas create failed");
 
+    // 两张 3D 体积都带 mip 链（光步的 textureLod 需要它，见 CLOUD_V4_BASE_MIPS 注释）。
+    // usage 补 TRANSFER_SRC/DST：mip0 由 compute 写，其余级用 vkCmdBlitImage 逐级下采。
     VkImageCreateInfo worleyInfo = atlasInfo;
     worleyInfo.imageType = VK_IMAGE_TYPE_3D;
     worleyInfo.extent = {CLOUD_V4_WORLEY_SIZE, CLOUD_V4_WORLEY_SIZE, CLOUD_V4_WORLEY_SIZE};
+    worleyInfo.mipLevels = CLOUD_V4_WORLEY_MIPS;
+    worleyInfo.usage = atlasInfo.usage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     check(vkCreateImage(g_device, &worleyInfo, nullptr, &g_cloudV4WorleyImage),
         "cloud v4 worley create failed");
 
@@ -36956,6 +39867,9 @@ static void createCloudV4Resources()
     VkImageCreateInfo baseInfo = atlasInfo;
     baseInfo.imageType = VK_IMAGE_TYPE_3D;
     baseInfo.extent = {CLOUD_V4_BASE_SIZE, CLOUD_V4_BASE_SIZE, CLOUD_V4_BASE_SIZE};
+    baseInfo.mipLevels = CLOUD_V4_BASE_MIPS;
+    baseInfo.usage = atlasInfo.usage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     check(vkCreateImage(g_device, &baseInfo, nullptr, &g_cloudV4BaseImage),
         "cloud v4 base volume create failed");
 
@@ -36994,11 +39908,14 @@ static void createCloudV4Resources()
         "cloud v4 atlas view failed");
     viewInfo.image = g_cloudV4WorleyImage;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_3D;
+    viewInfo.subresourceRange.levelCount = CLOUD_V4_WORLEY_MIPS;   // mip 链：光步 LOD 要用
     check(vkCreateImageView(g_device, &viewInfo, nullptr, &g_cloudV4WorleyView),
         "cloud v4 worley view failed");
     viewInfo.image = g_cloudV4BaseImage;
+    viewInfo.subresourceRange.levelCount = CLOUD_V4_BASE_MIPS;
     check(vkCreateImageView(g_device, &viewInfo, nullptr, &g_cloudV4BaseView),
         "cloud v4 base volume view failed");
+    viewInfo.subresourceRange.levelCount = 1u;   // 下面 shape 视图仍是单级
     viewInfo.image = g_cloudV4ShapeImage;
     check(vkCreateImageView(g_device, &viewInfo, nullptr, &g_cloudV4ShapeView),
         "cloud v4 shape volume view failed");
@@ -37009,13 +39926,16 @@ static void createCloudV4Resources()
     samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    // maxLod 必须放开到 mip 级数-1，否则 textureLod(..., 1..3) 会被夹回 0（静默失效）。
     samplerInfo.maxLod = 0.0f;
     check(vkCreateSampler(g_device, &samplerInfo, nullptr, &g_cloudV4AtlasSampler),
         "cloud v4 atlas sampler failed");
+    samplerInfo.maxLod = static_cast<float>(CLOUD_V4_WORLEY_MIPS - 1u);
     check(vkCreateSampler(g_device, &samplerInfo, nullptr, &g_cloudV4WorleySampler),
         "cloud v4 worley sampler failed");
     check(vkCreateSampler(g_device, &samplerInfo, nullptr, &g_cloudV4BaseSampler),
         "cloud v4 base sampler failed");
+    samplerInfo.maxLod = 0.0f;
     check(vkCreateSampler(g_device, &samplerInfo, nullptr, &g_cloudV4ShapeSampler),
         "cloud v4 shape sampler failed");
 
@@ -37198,6 +40118,193 @@ static void createCloudV4Resources()
     barrier.image = g_cloudV4ShapeImage;
     vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr, 1u, &barrier);
+
+    // 2026-10-28：上面那段把三张图转到了 SHADER_READ_ONLY，而 v5 烘焙是**storage image
+    // 写**（描述符声明的布局是 GENERAL）⇒ 必须先把布局转回来，否则写入的合法布局与实际
+    // 布局不符（校验层报错、驱动上属于未定义行为）。
+    {
+        VkImageMemoryBarrier toGeneral{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toGeneral.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toGeneral.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        toGeneral.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+        toGeneral.subresourceRange.layerCount = 1u;
+        toGeneral.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        toGeneral.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        const VkImage images[3] = {g_cloudV4AtlasImage, g_cloudV4WorleyImage, g_cloudV4BaseImage};
+        for(const VkImage image : images)
+        {
+            toGeneral.image = image;
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr, 1u,
+                &toGeneral);
+        }
+    }
+
+    // ---- v5 资产烘焙（2026-10-25）----
+    // cloud_v5_noise.comp 与 cloud_bevy_noise.comp 的 **descriptor 布局逐位一致**
+    // （atlas/worley/base/shape 四个 storage binding），直接复用 bakeSet/bakePipelineLayout。
+    // 三次 dispatch：mode 0 = weather → atlas（512²，2026-10-28 从 1024² 降）、
+    // 1 = detail → worley（64³）、
+    // 2 = base → base（128³）。v5 的渲染 pass（volumetric_clouds_v5.comp）读的就是
+    // 这三张（weather=cloudAtlas / base=baseTex / detail=cloudWorley），写与查同一批视图。
+    // shape（mode 3 / binding 3）不重烘——tyndall/high cloud 还在用它的内容。
+    VkPipeline v5NoisePipeline = VK_NULL_HANDLE;
+    const bool v5Model = cloudModelRequested() != 1;   // 0/缺省 = v5，1 = ue（旧 UE 模型）
+    if(v5Model)
+    {
+        try
+        {
+            const std::vector<uint8_t> v5Code = loadSpv("shaders/cloud_v5_noise.comp.spv");
+            VkShaderModule v5Module = createShaderModule(g_device, v5Code);
+            VkPipelineShaderStageCreateInfo v5Stage{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            v5Stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            v5Stage.module = v5Module;
+            v5Stage.pName = "main";
+            VkComputePipelineCreateInfo v5Info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            v5Info.stage = v5Stage;
+            v5Info.layout = bakePipelineLayout;
+            const VkResult v5Result = vkCreateComputePipelines(g_device,
+                getSharedPipelineCache(), 1u, &v5Info, nullptr, &v5NoisePipeline);
+            vkDestroyShaderModule(g_device, v5Module, nullptr);
+            if(v5Result == VK_SUCCESS)
+            {
+                vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    v5NoisePipeline);
+                vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    bakePipelineLayout, 0u, 1u, &bakeSet, 0u, nullptr);
+                struct { float mode[4]; } v5Push{};
+                v5Push.mode[0] = 0.0f;
+                vkCmdPushConstants(commandBuffer, bakePipelineLayout,
+                    VK_SHADER_STAGE_COMPUTE_BIT, 0u, 16u, &v5Push);
+                vkCmdDispatch(commandBuffer, CLOUD_V4_ATLAS_SIZE / 8u,
+                    CLOUD_V4_ATLAS_SIZE / 8u, 1u);
+                v5Push.mode[0] = 1.0f;
+                vkCmdPushConstants(commandBuffer, bakePipelineLayout,
+                    VK_SHADER_STAGE_COMPUTE_BIT, 0u, 16u, &v5Push);
+                vkCmdDispatch(commandBuffer, CLOUD_V4_WORLEY_SIZE / 8u,
+                    CLOUD_V4_WORLEY_SIZE / 8u, CLOUD_V4_WORLEY_SIZE);
+                v5Push.mode[0] = 2.0f;
+                vkCmdPushConstants(commandBuffer, bakePipelineLayout,
+                    VK_SHADER_STAGE_COMPUTE_BIT, 0u, 16u, &v5Push);
+                vkCmdDispatch(commandBuffer, CLOUD_V4_BASE_SIZE / 8u,
+                    CLOUD_V4_BASE_SIZE / 8u, CLOUD_V4_BASE_SIZE);
+                RTLog("[CLOUD V5] assets baked: weather " +
+                    std::to_string(CLOUD_V4_ATLAS_SIZE) + "^2 + detail " +
+                    std::to_string(CLOUD_V4_WORLEY_SIZE) + "^3 + base " +
+                    std::to_string(CLOUD_V4_BASE_SIZE) + "^3 (mips " +
+                    std::to_string(CLOUD_V4_WORLEY_MIPS) + "/" +
+                    std::to_string(CLOUD_V4_BASE_MIPS) + ")");
+            }
+            else
+            {
+                RTLog("[CLOUD V5] noise pipeline creation failed; v5 will sample stale assets");
+            }
+        }
+        catch(const std::exception& error)
+        {
+            RTLog(std::string("[CLOUD V5] noise shader unavailable (") + error.what() + ")");
+        }
+    }
+
+    // ---- 3D 噪声 mip 链（2026-10-28）----
+    // 光步用 `textureLod(baseTex, uvw, j/(N-1)*3)`：越远的光步取越粗的层。没有 mip 时
+    // 这条 LOD 是空转的，远光步（锥形步长最大 1.5 km，而一个 texel 62.5 格）纯 cache
+    // miss。这里用 vkCmdBlitImage 逐级 box 下采（与 2D 图集那条 mip 链同一写法）。
+    // 布局链条：GENERAL(compute 写) → TRANSFER_DST → [逐级 blit] → SHADER_READ_ONLY。
+    {
+        const VkImage mipImages[2] = {g_cloudV4WorleyImage, g_cloudV4BaseImage};
+        const uint32_t mipLevels[2] = {CLOUD_V4_WORLEY_MIPS, CLOUD_V4_BASE_MIPS};
+        const uint32_t mipExtents[2] = {CLOUD_V4_WORLEY_SIZE, CLOUD_V4_BASE_SIZE};
+        // v5 关闭时（bevy 路径）这三张图停在 SHADER_READ_ONLY，别按 GENERAL 声明。
+        const VkImageLayout bakeLayout = v5Model ? VK_IMAGE_LAYOUT_GENERAL
+                                                 : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        for(int volume = 0; volume < 2; ++volume)
+        {
+            if(mipImages[volume] == VK_NULL_HANDLE)
+                continue;
+            // mip0：真正有内容，从烘焙布局转过来；mip1..N：创建后从未写过（UNDEFINED），
+            // 用 UNDEFINED→TRANSFER_DST 声明"内容会被整体覆盖"，别谎报成 bakeLayout。
+            VkImageMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            toTransfer.oldLayout = bakeLayout;
+            toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            toTransfer.subresourceRange.levelCount = 1u;
+            toTransfer.subresourceRange.layerCount = 1u;
+            toTransfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+            toTransfer.image = mipImages[volume];
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u, nullptr, 1u, &toTransfer);
+
+            if(mipLevels[volume] > 1u)
+            {
+                VkImageMemoryBarrier restMips = toTransfer;
+                restMips.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                restMips.srcAccessMask = 0u;
+                restMips.subresourceRange.baseMipLevel = 1u;
+                restMips.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+                vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u, nullptr, 1u, &restMips);
+            }
+
+            for(uint32_t level = 1u; level < mipLevels[volume]; ++level)
+            {
+                const uint32_t srcExtent = std::max(1u, mipExtents[volume] >> (level - 1u));
+                const uint32_t dstExtent = std::max(1u, mipExtents[volume] >> level);
+                VkImageBlit blit{};
+                blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                blit.srcSubresource.mipLevel = level - 1u;
+                blit.srcSubresource.layerCount = 1u;
+                blit.srcOffsets[1] = {static_cast<int32_t>(srcExtent),
+                    static_cast<int32_t>(srcExtent), static_cast<int32_t>(srcExtent)};
+                blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                blit.dstSubresource.mipLevel = level;
+                blit.dstSubresource.layerCount = 1u;
+                blit.dstOffsets[1] = {static_cast<int32_t>(dstExtent),
+                    static_cast<int32_t>(dstExtent), static_cast<int32_t>(dstExtent)};
+                vkCmdBlitImage(commandBuffer,
+                    mipImages[volume], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    mipImages[volume], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    1u, &blit, VK_FILTER_LINEAR);
+
+                VkImageMemoryBarrier nextLevel{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                nextLevel.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                nextLevel.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                nextLevel.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                nextLevel.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                nextLevel.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                nextLevel.subresourceRange.baseMipLevel = level;
+                nextLevel.subresourceRange.levelCount = 1u;
+                nextLevel.subresourceRange.layerCount = 1u;
+                nextLevel.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                nextLevel.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                nextLevel.image = mipImages[volume];
+                vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0u, 0u, nullptr, 0u, nullptr, 1u,
+                    &nextLevel);
+            }
+
+            VkImageMemoryBarrier toRead{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            toRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toRead.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            toRead.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+            toRead.subresourceRange.layerCount = 1u;
+            toRead.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            toRead.image = mipImages[volume];
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr, 1u, &toRead);
+        }
+    }
 
     check(vkEndCommandBuffer(commandBuffer), "cloud v4 bake end failed");
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -38956,6 +42063,35 @@ static bool volumetricCloudBindingsMatchCurrentSizes(
         g_volumetricCloudBoundOutputHeight == g_dlssOutputHeight;
 }
 
+// 2026-10-26：场景深度的 nearest + clamp 采样器。
+// 体积云的 depth binding（render set 5 / composite 2）与体积光的 sceneDepth
+// （light set 3）都用它。原先只在 createVolumeRestirResources 里懒建，而云的
+// 描述符集在**更早**的 createVolumetricCloudResources 里就要写它 ⇒ 首帧拿到
+// VK_NULL_HANDLE，被 vkGuard 挡下不写 ⇒ 深度绑定空、体积光恒为 0
+// （日志里的 "binding 2/5/3 NULL sampler"）。改成"谁先要谁建"。
+// 生命周期：会话级，运行期不销毁 —— destroyVolumeRestirResources 会随 froxel
+// 尺寸变化跑，而云的描述符集仍持有旧句柄，销毁即悬空。
+static VkSampler volDepthSampler()
+{
+    if(g_volDepthSampler == VK_NULL_HANDLE)
+    {
+        VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        samplerInfo.magFilter = VK_FILTER_NEAREST;
+        samplerInfo.minFilter = VK_FILTER_NEAREST;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.maxLod = 0.0f;
+        samplerInfo.compareOp = VK_COMPARE_OP_NEVER;
+
+        check(vkCreateSampler(g_device, &samplerInfo, nullptr, &g_volDepthSampler),
+            "vol depth sampler failed");
+        RTLogFlushed("[VOL] depth sampler created");
+    }
+    return g_volDepthSampler;
+}
+
 static void createVolumetricCloudResources(uint32_t width, uint32_t height)
 {
     const uint32_t cloudWidth = width;
@@ -39003,6 +42139,7 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     check(vkCreateImage(g_device, &imageInfo, nullptr, &g_volumetricCloudImage),
         "volumetric cloud image create failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39630");
 
     VkMemoryRequirements requirements{};
     vkGetImageMemoryRequirements(g_device, g_volumetricCloudImage, &requirements);
@@ -39012,8 +42149,10 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
         requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     check(vkAllocateMemory(g_device, &allocation, nullptr, &g_volumetricCloudMemory),
         "volumetric cloud image allocate failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39639");
     check(vkBindImageMemory(g_device, g_volumetricCloudImage,
         g_volumetricCloudMemory, 0u), "volumetric cloud image bind failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39641");
 
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = g_volumetricCloudImage;
@@ -39024,67 +42163,84 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
     viewInfo.subresourceRange.layerCount = 1u;
     check(vkCreateImageView(g_device, &viewInfo, nullptr, &g_volumetricCloudView),
         "volumetric cloud image view create failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39651");
 
     check(vkCreateImage(g_device, &imageInfo, nullptr, &g_volumetricCloudHistoryImage),
         "volumetric cloud history image create failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39654");
     vkGetImageMemoryRequirements(g_device, g_volumetricCloudHistoryImage, &requirements);
     allocation.allocationSize = requirements.size;
     allocation.memoryTypeIndex = findMemoryType(g_physicalDevice,
         requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     check(vkAllocateMemory(g_device, &allocation, nullptr, &g_volumetricCloudHistoryMemory),
         "volumetric cloud history memory allocate failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39660");
     check(vkBindImageMemory(g_device, g_volumetricCloudHistoryImage,
         g_volumetricCloudHistoryMemory, 0u), "volumetric cloud history image bind failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39662");
     viewInfo.image = g_volumetricCloudHistoryImage;
     check(vkCreateImageView(g_device, &viewInfo, nullptr, &g_volumetricCloudHistoryView),
         "volumetric cloud history image view create failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39665");
 
     check(vkCreateImage(g_device, &imageInfo, nullptr, &g_volumetricCloudResolvedImage),
         "volumetric cloud resolved image create failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39668");
     vkGetImageMemoryRequirements(g_device, g_volumetricCloudResolvedImage, &requirements);
     allocation.allocationSize = requirements.size;
     allocation.memoryTypeIndex = findMemoryType(g_physicalDevice,
         requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     check(vkAllocateMemory(g_device, &allocation, nullptr, &g_volumetricCloudResolvedMemory),
         "volumetric cloud resolved image allocate failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39674");
     check(vkBindImageMemory(g_device, g_volumetricCloudResolvedImage,
         g_volumetricCloudResolvedMemory, 0u), "volumetric cloud resolved image bind failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39676");
     viewInfo.image = g_volumetricCloudResolvedImage;
     check(vkCreateImageView(g_device, &viewInfo, nullptr, &g_volumetricCloudResolvedView),
         "volumetric cloud resolved image view create failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39679");
 
     // 批次2-T2c：rg32f —— .r 首命中（旧语义），.g 重投影距离。
     imageInfo.format = VK_FORMAT_R32G32_SFLOAT;
     check(vkCreateImage(g_device, &imageInfo, nullptr, &g_volumetricCloudDepthImage),
         "volumetric cloud depth image create failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39684");
     vkGetImageMemoryRequirements(g_device, g_volumetricCloudDepthImage, &requirements);
     allocation.allocationSize = requirements.size;
     allocation.memoryTypeIndex = findMemoryType(g_physicalDevice,
         requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     check(vkAllocateMemory(g_device, &allocation, nullptr, &g_volumetricCloudDepthMemory),
         "volumetric cloud depth image allocate failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39690");
     check(vkBindImageMemory(g_device, g_volumetricCloudDepthImage,
         g_volumetricCloudDepthMemory, 0u), "volumetric cloud depth image bind failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39692");
 
     viewInfo.image = g_volumetricCloudDepthImage;
     viewInfo.format = VK_FORMAT_R32G32_SFLOAT;
     check(vkCreateImageView(g_device, &viewInfo, nullptr, &g_volumetricCloudDepthView),
         "volumetric cloud depth image view create failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39697");
 
     check(vkCreateImage(g_device, &imageInfo, nullptr, &g_volumetricCloudHistoryDepthImage),
         "volumetric cloud history depth image create failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39700");
     vkGetImageMemoryRequirements(g_device, g_volumetricCloudHistoryDepthImage, &requirements);
     allocation.allocationSize = requirements.size;
     allocation.memoryTypeIndex = findMemoryType(g_physicalDevice,
         requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     check(vkAllocateMemory(g_device, &allocation, nullptr, &g_volumetricCloudHistoryDepthMemory),
         "volumetric cloud history depth image allocate failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39706");
     check(vkBindImageMemory(g_device, g_volumetricCloudHistoryDepthImage,
         g_volumetricCloudHistoryDepthMemory, 0u), "volumetric cloud history depth image bind failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39708");
 
     viewInfo.image = g_volumetricCloudHistoryDepthImage;
     check(vkCreateImageView(g_device, &viewInfo, nullptr, &g_volumetricCloudHistoryDepthView),
         "volumetric cloud history depth image view create failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39712");
 
     VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     samplerInfo.magFilter = VK_FILTER_LINEAR;
@@ -39096,6 +42252,7 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
     samplerInfo.maxLod = 0.0f;
     check(vkCreateSampler(g_device, &samplerInfo, nullptr, &g_volumetricCloudSampler),
         "volumetric cloud sampler create failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39723");
 
     // ---------------------------------------------------------------
     // 体积光目标 + 历史（2026-10-04 P1；2026-10-06 改全分辨率）
@@ -39146,6 +42303,7 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
         {
             check(vkCreateImage(g_device, &godRayImageInfo, nullptr, bind.image),
                 "god ray image create failed");
+                RTLogFlushed("[VOLCLOUD] passed check at L39773");
             VkMemoryRequirements godRayRequirements{};
             vkGetImageMemoryRequirements(g_device, *bind.image, &godRayRequirements);
             VkMemoryAllocateInfo godRayAllocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -39154,11 +42312,14 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
                 godRayRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             check(vkAllocateMemory(g_device, &godRayAllocation, nullptr, bind.memory),
                 "god ray image allocate failed");
+                RTLogFlushed("[VOLCLOUD] passed check at L39781");
             check(vkBindImageMemory(g_device, *bind.image, *bind.memory, 0u),
                 "god ray image bind failed");
+                RTLogFlushed("[VOLCLOUD] passed check at L39783");
             godRayViewInfo.image = *bind.image;
             check(vkCreateImageView(g_device, &godRayViewInfo, nullptr, bind.view),
                 "god ray image view create failed");
+                RTLogFlushed("[VOLCLOUD] passed check at L39786");
         }
         g_godRayWidth = godRayWidth;
         g_godRayHeight = godRayHeight;
@@ -39219,6 +42380,7 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
     renderLayoutInfo.pBindings = renderBindings;
     check(vkCreateDescriptorSetLayout(g_device, &renderLayoutInfo, nullptr,
         &g_volumetricCloudRenderSetLayout), "volumetric cloud render set layout failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39846");
 
     VkDescriptorSetLayoutBinding resolveBindings[6]{};
     resolveBindings[0] = { 0u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u,
@@ -39237,6 +42399,7 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
     resolveLayoutInfo.pBindings = resolveBindings;
     check(vkCreateDescriptorSetLayout(g_device, &resolveLayoutInfo, nullptr,
         &g_volumetricCloudResolveSetLayout), "volumetric cloud resolve set layout failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39864");
 
     VkDescriptorSetLayoutBinding compositeBindings[7]{};
     compositeBindings[0] = { 0u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u,
@@ -39266,6 +42429,7 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
     compositeLayoutInfo.pBindings = compositeBindings;
     check(vkCreateDescriptorSetLayout(g_device, &compositeLayoutInfo, nullptr,
         &g_volumetricCloudCompositeSetLayout), "volumetric cloud composite set layout failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39893");
 
     // Volumetric light.  Mirrors the render set's binding order (UBO first, then
     // the two 3D noise volumes) because the cloud shadow march needs the same
@@ -39343,6 +42507,7 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
     lightLayoutInfo.pBindings = lightBindings;
     check(vkCreateDescriptorSetLayout(g_device, &lightLayoutInfo, nullptr,
         &g_volumetricLightSetLayout), "volumetric light set layout failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39970");
 
     // Combined-image-sampler count must cover every sampled binding across the
     // four sets: render 6 (shape, curl, scene depth, sun shadow, terrain
@@ -39372,6 +42537,7 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
     poolInfo.pPoolSizes = poolSizes;
     check(vkCreateDescriptorPool(g_device, &poolInfo, nullptr,
         &g_volumetricCloudDescriptorPool), "volumetric cloud descriptor pool failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L39999");
 
     // ---------------------------------------------------------------
     // 体积光合成 pass 的描述符（2026-10-04 P1+P2）。用**独立**的池与布局：
@@ -39399,6 +42565,7 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
         godRayLayoutInfo.pBindings = godRayBindings;
         check(vkCreateDescriptorSetLayout(g_device, &godRayLayoutInfo, nullptr,
             &g_godRayCompositeSetLayout), "god ray composite set layout failed");
+            RTLogFlushed("[VOLCLOUD] passed check at L40026");
 
         VkDescriptorPoolSize godRayPoolSizes[3] = {
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u },
@@ -39413,6 +42580,7 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
         godRayPoolInfo.pPoolSizes = godRayPoolSizes;
         check(vkCreateDescriptorPool(g_device, &godRayPoolInfo, nullptr,
             &g_godRayDescriptorPool), "god ray composite pool failed");
+            RTLogFlushed("[VOLCLOUD] passed check at L40040");
 
         VkDescriptorSetAllocateInfo godRaySetAllocation{
             VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
@@ -39422,6 +42590,7 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
         godRaySetAllocation.pSetLayouts = &g_godRayCompositeSetLayout;
         check(vkAllocateDescriptorSets(g_device, &godRaySetAllocation,
             &g_godRayCompositeSet), "god ray composite set allocation failed");
+            RTLogFlushed("[VOLCLOUD] passed check at L40049");
 
         VkDescriptorImageInfo godRayInputInfo{};
         godRayInputInfo.sampler = g_volumetricCloudSampler;
@@ -39430,6 +42599,9 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
         VkDescriptorImageInfo godRaySceneInfo{};
         godRaySceneInfo.imageView = g_rtOutputView;
         godRaySceneInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        // 2026-10-26：COMBINED_IMAGE_SAMPLER 必须有 sampler，缺了会让驱动在
+        // vkUpdateDescriptorSets 处 access violation（与 composite depthInfo 同类）。
+        godRaySceneInfo.sampler = g_volumetricCloudSampler;
         VkDescriptorImageInfo godRayDepthInfo{};
         godRayDepthInfo.sampler = g_volumetricCloudSampler;
         godRayDepthInfo.imageView = g_dlssDepthView;
@@ -39464,6 +42636,7 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
     setAllocation.pSetLayouts = setLayouts;
     check(vkAllocateDescriptorSets(g_device, &setAllocation, descriptorSets),
         "volumetric cloud descriptor set allocation failed");
+        RTLogFlushed("[VOLCLOUD] passed check at L40094");
     g_volumetricCloudRenderSet = descriptorSets[0];
     g_volumetricCloudResolveSet = descriptorSets[1];
     g_volumetricCloudCompositeSet = descriptorSets[2];
@@ -39492,6 +42665,22 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
     v3WeatherInfo.sampler = g_cloudV3WeatherView ? g_cloudV3WeatherSampler : g_cloudBaseNoiseSampler;
     v3WeatherInfo.imageView = g_cloudV3WeatherView ? g_cloudV3WeatherView : g_cloudBaseNoiseView;
     v3WeatherInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    // 2026-10-28 修「天上的云一边疏一边密」——binding 11 一直停在 v3 时代的兜底。
+    // v3 资产（run/cloud_v3_weather_512.rgba8）已不在仓里 ⇒ createCloudV3Resources()
+    // 在 :39639 直接 return ⇒ g_cloudV3WeatherView 恒 NULL ⇒ 这一格实际绑的是 v2 的
+    // cloud_base_noise_64.rgba8（64x64 RG8）。而 v5 的 cloud_v5_core.glsl 把这张图
+    // 当「1024^2 覆盖 96 km 的 LoCoverage 天气图」采样（weatherUV / HP_WEATHER_TILE）：
+    // 一个 texel 被拉成 1.5 km，全天空只剩几十个大斑块 ⇒ 一半覆盖度拉满、一半几乎空，
+    // 分界是一条世界空间的直线。shader 侧把天气图频率改到 96 km 的那几轮「修复」
+    // 因此全部落空 —— 因为被采样的根本不是那张图。
+    // v5 自己在 createCloudV4Resources 里烘好了 1024^2 天气图（g_cloudV4AtlasView），
+    // 烘焙末尾已转到 SHADER_READ_ONLY_OPTIMAL，采样器是 REPEAT + maxLod=0。
+    // 与 binding 9/10 处理 v4/v5 资产的写法一致：存在就换，否则保留上面的兜底。
+    if(g_cloudV4AtlasView != VK_NULL_HANDLE)
+    {
+        v3WeatherInfo.sampler = g_cloudV4AtlasSampler;
+        v3WeatherInfo.imageView = g_cloudV4AtlasView;
+    }
 
     // 2026-10-17：体积云 v2 的 2D 基础覆盖噪声（binding 9）。
     VkDescriptorImageInfo cloudBaseNoiseInfo{};
@@ -39551,6 +42740,9 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
     depthInfo.sampler = g_volumetricCloudSampler;
     depthInfo.imageView = g_dlssDepthView;
     depthInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    // 2026-10-26：COMBINED_IMAGE_SAMPLER 必须有 sampler（深度用 nearest）。
+    // 必须是 volDepthSampler()（按需创建）—— 直接取 g_volDepthSampler 时它还没建。
+    depthInfo.sampler = volDepthSampler();
     // The AE state buffer is allocated before this pipeline in every path, so
     // there is no null case to guard here.
     VkDescriptorBufferInfo aeStateInfo{};
@@ -39593,6 +42785,14 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
     terrainHeightInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     const bool terrainHeightBound = g_terrainHeightView != VK_NULL_HANDLE &&
         g_terrainHeightSampler != VK_NULL_HANDLE;
+    // 2026-10-26：体积光的历史图（light set binding 8）。**必须**是函数作用域变量 ——
+    // 原先声明在下面那个花括号块里，而 vkUpdateDescriptorSets 在块外执行：写入结构
+    // 里存的是已结束生命周期的栈对象地址，被后续 vkGuard 块的临时变量复用 ⇒
+    // 守卫打出 "binding 8 NULL imageView" 并把整条写入丢弃（历史图恒空）。
+    VkDescriptorImageInfo godRayHistoryInfo{};
+    godRayHistoryInfo.sampler = g_volumetricCloudSampler;
+    godRayHistoryInfo.imageView = g_godRayHistoryView;
+    godRayHistoryInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     VkWriteDescriptorSet writes[36]{};  // 2026-10-03: 留余量（原 26 槽位曾被写越界）
     writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
         g_volumetricCloudRenderSet, 0u, 0u, 1u,
@@ -39702,11 +42902,11 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
         writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
             g_volumetricCloudRenderSet, 6u, 0u, 1u,
             VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &sunShadowInfo, nullptr, nullptr };
-        // 2026-10-14：体积光那条（light set 5）**临时**接回来做诊断（对照引擎影图），
-        // 诊断完删除。体积雾那边一直在用（render set 6）。
-        writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
-            g_volumetricLightSet, 5u, 0u, 1u,
-            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &sunShadowInfo, nullptr, nullptr };
+        // 2026-10-26：删除体积光那条**诊断**写入（原 light set binding 5）。
+        // 该 set 的 layout 只有 0/1/2/3/4/8/9（见 lightBindings，2026-10-14 已删
+        // 5/6/7，volumetric_light.comp 也不再声明 5）—— 往布局里不存在的 binding
+        // 写描述符是未定义行为，正是当年"调档就崩"（驱动堆被踩）的同一类错误。
+        // 体积雾那边（render set 6）保持在用，不受影响。
     }
     // 2026-10-04 远场太阳阴影图：体积雾（render set 8）与体积光（light set 7）
     // 各一份，供近图盒外的渐变过渡（修"六个面的圆圈"）。守卫条件与近图相同。
@@ -39731,15 +42931,11 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
     }
     // 2026-10-04（P1）：体积光的历史图（binding 8）。用"游标追加"而不是写死下标，
     // 理由同上面两条可选绑定 —— 数组容量与 writeCount 必须始终一致。
-    {
-        VkDescriptorImageInfo godRayHistoryInfo{};
-        godRayHistoryInfo.sampler = g_volumetricCloudSampler;
-        godRayHistoryInfo.imageView = g_godRayHistoryView;
-        godRayHistoryInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
-            g_volumetricLightSet, 8u, 0u, 1u,
-            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &godRayHistoryInfo, nullptr, nullptr };
-    }
+    // 2026-10-26：info 已提升到函数作用域（见上方 godRayHistoryInfo 的声明），
+    // 这里只保留追加写入，块作用域已无必要。
+    writes[writeCount++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr,
+        g_volumetricLightSet, 8u, 0u, 1u,
+        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &godRayHistoryInfo, nullptr, nullptr };
     // 2026-10-23 体积雾动态光源（render set 12/13）。两个 buffer 都建出来了才写。
     if(fogLightListInfo.buffer != VK_NULL_HANDLE &&
        fogLightGridInfo.buffer != VK_NULL_HANDLE)
@@ -39757,7 +42953,57 @@ static void createVolumetricCloudResources(uint32_t width, uint32_t height)
     }
     // 2026-10-03 防御：钳到数组真实容量，杜绝再出现写越界却静默崩的形态。
     writeCount = writeCount < 36u ? writeCount : 36u;
-    vkUpdateDescriptorSets(g_device, writeCount, writes, 0u, nullptr);
+
+    // 2026-10-26：提交前体检。零初始化槽位 / NULL imageView / NULL sampler
+    // 都会让 NVIDIA 驱动 access violation，且不产生任何 VkResult。
+    // 坏槽位直接跳过并落盘打印 —— 宁可少绑一个，也不要整局崩掉。
+    {
+        uint32_t safeCount = 0u;
+
+        for(uint32_t i = 0u; i < writeCount; ++i)
+        {
+            VkWriteDescriptorSet w = writes[i];
+
+            if(w.sType != VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET ||
+               w.descriptorType == 0u ||
+               w.descriptorCount == 0u)
+            {
+                RTLogFlushed("[VK GUARD] cloud: skip uninitialized slot " + std::to_string(i));
+                continue;
+            }
+
+            bool bad = false;
+
+            if(w.pImageInfo != nullptr)
+            {
+                for(uint32_t k = 0u; k < w.descriptorCount; ++k)
+                {
+                    if(w.pImageInfo[k].imageView == VK_NULL_HANDLE)
+                    {
+                        RTLogFlushed("[VK GUARD] cloud: binding " + std::to_string(w.dstBinding) + " NULL imageView");
+                        bad = true;
+                    }
+
+                    if((w.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+                        w.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER) &&
+                       w.pImageInfo[k].sampler == VK_NULL_HANDLE)
+                    {
+                        RTLogFlushed("[VK GUARD] cloud: binding " + std::to_string(w.dstBinding) + " NULL sampler");
+                        bad = true;
+                    }
+                }
+            }
+
+            if(bad)
+            {
+                continue;
+            }
+
+            writes[safeCount++] = w;
+        }
+
+        vkUpdateDescriptorSets(g_device, safeCount, writes, 0u, nullptr);
+    }
     // ── 2026-10-06 云 à-trous 空间降噪的描述符（独立池，理由同上面的 god-ray 块：
     // 主池的 maxSets/count 是围绕云四套 set 精确配的，且 writes[32] 只剩几个空槽）。
     //   binding 0 = 输入（采样）、1 = 云距离（采样，边缘权重）、2 = 输出（存储）
@@ -39883,7 +43129,8 @@ static void createVolumetricCloudPipeline(uint32_t width, uint32_t height)
     // 于是整套（图 + 描述符 + 管线）按当前窗口尺寸重建 —— 描述符里那些
     // 渲染分辨率相关视图（g_rtOutputView / g_dlssDepthView / 光柱 1/2 目标）
     // 因此重新指向新图，不再残留已销毁的句柄。
-    if(g_volumetricCloudRenderPipeline != VK_NULL_HANDLE &&
+    // 2026-10-26：v1/v2 渲染管线已删除，"已建好"的判据改用 v5 管线（g_...V3）。
+    if(g_volumetricCloudRenderPipelineLayout != VK_NULL_HANDLE &&
        volumetricCloudBindingsMatchCurrentSizes(cloudWidth, cloudHeight))
     {
         return;
@@ -39897,11 +43144,9 @@ static void createVolumetricCloudPipeline(uint32_t width, uint32_t height)
     // 跨 delta 的 RR guide 放宽 pass：与窗口分辨率无关，跟着这套资源一起建。
     createRRGuideRelaxResources();
     createVolumetricCloudResources(width, height);
-    const std::vector<uint8_t> renderCode = loadSpv("shaders/volumetric_clouds.comp.spv");
     const std::vector<uint8_t> resolveCode = loadSpv("shaders/volumetric_cloud_resolve.comp.spv");
     const std::vector<uint8_t> compositeCode = loadSpv("shaders/volumetric_cloud_composite.comp.spv");
     const std::vector<uint8_t> lightCode = loadSpv("shaders/volumetric_light.comp.spv");
-    VkShaderModule renderShader = createShaderModule(g_device, renderCode);
     VkShaderModule resolveShader = createShaderModule(g_device, resolveCode);
     VkShaderModule compositeShader = createShaderModule(g_device, compositeCode);
     VkShaderModule lightShader = createShaderModule(g_device, lightCode);
@@ -39947,58 +43192,9 @@ static void createVolumetricCloudPipeline(uint32_t width, uint32_t height)
             VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
         };
         renderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        renderStage.module = renderShader;
+        // v1 模块已删；renderStage 只作为下面 resolveStage 的模板，模块随后被覆盖。
+        renderStage.module = resolveShader;
         renderStage.pName = "main";
-        VkComputePipelineCreateInfo renderPipelineInfo{
-            VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
-        };
-        renderPipelineInfo.stage = renderStage;
-        renderPipelineInfo.layout = g_volumetricCloudRenderPipelineLayout;
-        check(vkCreateComputePipelines(g_device, getSharedPipelineCache(), 1u, &renderPipelineInfo,
-            nullptr, &g_volumetricCloudRenderPipeline), "volumetric cloud render pipeline failed");
- // 2026-10-17 体积云 v2。与 v1 同一描述符集/布局，
-        // 仅 shader 模块不同；只有 run/cloud_v2.flag 存在时才建。
-        // SPV 缺失/编译失败 ⇒ 安静回退 v1（不让一个可选实验模块把客户端带崩）。
-        if(volumetricCloudV2Requested() && g_volumetricCloudRenderPipelineV2 == VK_NULL_HANDLE)
-        {
-            try
-            {
-                const std::vector<uint8_t> renderCodeV2 =
-                    loadSpv("shaders/volumetric_clouds_v2.comp.spv");
-                VkShaderModule renderShaderV2 = createShaderModule(g_device, renderCodeV2);
-                VkPipelineShaderStageCreateInfo renderStageV2{
-                    VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
-                };
-                renderStageV2.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-                renderStageV2.module = renderShaderV2;
-                renderStageV2.pName = "main";
-                VkComputePipelineCreateInfo renderPipelineInfoV2{
-                    VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
-                };
-                renderPipelineInfoV2.stage = renderStageV2;
-                renderPipelineInfoV2.layout = g_volumetricCloudRenderPipelineLayout;
-                const VkResult v2Result = vkCreateComputePipelines(g_device,
-                    getSharedPipelineCache(), 1u, &renderPipelineInfoV2, nullptr,
-                    &g_volumetricCloudRenderPipelineV2);
-                vkDestroyShaderModule(g_device, renderShaderV2, nullptr);
-                if(v2Result != VK_SUCCESS)
-                {
-                    g_volumetricCloudRenderPipelineV2 = VK_NULL_HANDLE;
-                    RTLog("[CLOUD V2] pipeline creation failed (" +
-                        std::to_string(static_cast<int>(v2Result)) + "), falling back to v1");
-                }
-                else
-                {
-                    RTLog("[CLOUD V2] v2 cloud pipeline created");
-                }
-            }
-            catch(const std::exception& error)
-            {
-                g_volumetricCloudRenderPipelineV2 = VK_NULL_HANDLE;
-                RTLog(std::string("[CLOUD V2] shader unavailable (") + error.what() +
-                    "), falling back to v1");
-            }
-        }
  // 2026-10-17 体积云 v3。需要四张资产；
         // 资产缺失时安静回退 v2（此时 binding 1/2 仍指向 v2 的 Tyndall 场）。
         // 2026-10-18：v4（evroon/bevy-volumetric-clouds, MIT）取代 v3。
@@ -40008,8 +43204,13 @@ static void createVolumetricCloudPipeline(uint32_t width, uint32_t height)
         {
             try
             {
-                const std::vector<uint8_t> renderCodeV3 =
-                    loadSpv("shaders/volumetric_clouds_v4.comp.spv");
+                // 2026-10-25：缺省加载 v5（Schneider 重写版）；ORION_CLOUD_MODEL=ue
+                // 时加载旧 v4（UE 风格实现）。两条路径的 bindings/输出契约完全一致，
+                // 切换只改这一行；烘焙侧由 cloudModelRequested() 同步切换。
+                // 2026-10-26：UE 风格体积云（v4 / cloud_ue_core.glsl）已删除，
+                // 只剩 HDRP（HPVolumeCloud 移植，v5）这一套。
+                const std::vector<uint8_t> renderCodeV3 = loadSpv(
+                    "shaders/volumetric_clouds_v5.comp.spv");
                 VkShaderModule renderShaderV3 = createShaderModule(g_device, renderCodeV3);
                 VkPipelineShaderStageCreateInfo renderStageV3{
                     VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
@@ -40029,19 +43230,20 @@ static void createVolumetricCloudPipeline(uint32_t width, uint32_t height)
                 if(v3Result != VK_SUCCESS)
                 {
                     g_volumetricCloudRenderPipelineV3 = VK_NULL_HANDLE;
-                    RTLog("[CLOUD V3] pipeline creation failed (" +
-                        std::to_string(static_cast<int>(v3Result)) + "), falling back to v2");
+                    RTLog("[CLOUD V5] pipeline creation failed (" +
+                        std::to_string(static_cast<int>(v3Result)) +
+                        "), no cloud render pass this session");
                 }
                 else
                 {
-                    RTLog("[CLOUD V3] v3 cloud pipeline created");
+                    RTLog("[CLOUD V5] v5 cloud pipeline created");
                 }
             }
             catch(const std::exception& error)
             {
                 g_volumetricCloudRenderPipelineV3 = VK_NULL_HANDLE;
-                RTLog(std::string("[CLOUD V3] shader unavailable (") + error.what() +
-                    "), falling back to v2");
+                RTLog(std::string("[CLOUD V5] shader unavailable (") + error.what() +
+                    "), no cloud render pass this session");
             }
         }
         VkPipelineShaderStageCreateInfo resolveStage = renderStage;
@@ -40141,14 +43343,12 @@ static void createVolumetricCloudPipeline(uint32_t width, uint32_t height)
     }
     catch(...)
     {
-        vkDestroyShaderModule(g_device, renderShader, nullptr);
-        vkDestroyShaderModule(g_device, resolveShader, nullptr);
+            vkDestroyShaderModule(g_device, resolveShader, nullptr);
         vkDestroyShaderModule(g_device, compositeShader, nullptr);
         vkDestroyShaderModule(g_device, lightShader, nullptr);
         destroyVolumetricCloudResources();
         throw;
     }
-    vkDestroyShaderModule(g_device, renderShader, nullptr);
     vkDestroyShaderModule(g_device, resolveShader, nullptr);
     vkDestroyShaderModule(g_device, compositeShader, nullptr);
     vkDestroyShaderModule(g_device, lightShader, nullptr);
@@ -40180,9 +43380,146 @@ static void setCloudCompositeTarget(VkImageView target)
     g_volumetricCloudCompositeTargetView = target;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 2026-10-27 云着色器**热重载**：改完 SPV 不用再冷启游戏。
+//
+// 为什么原来必须重启：管线只在 createVolumetricCloudPipeline() 里建一次，而那个
+// 函数被 volumetricCloudBindingsMatchCurrentSizes() 挡住（尺寸不变就直接 return）。
+//
+// 这里的做法：每 ~20 帧 stat 一次这 4 个 SPV 的修改时间，一变就用**现有布局**
+// 重建对应的 compute pipeline，并清掉云的时域历史（避免旧画面残留）。
+//
+// 覆盖范围：volumetric_clouds_v5 / cloud_resolve / cloud_composite / volumetric_light
+// —— 也就是"改密度装配、廓形、受光、合成"这些都能即时看。
+// 不覆盖：cloud_v5_noise（烘焙器）。改 hpRenderBase/Detail/Weather 这类**烘焙函数**
+// 仍需要重启（3D 体积在启动时烘一次，重烘要重建 image + 描述符，风险大不值当）。
+// ═══════════════════════════════════════════════════════════════════════════
+static uint64_t cloudSpvStampOf(const char* relative)
+{
+    const std::string path = ResolveRTXRuntimePath(relative);
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if(!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &data))
+    {
+        return 0ull;
+    }
+    return (static_cast<uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32)
+        | static_cast<uint64_t>(data.ftLastWriteTime.dwLowDateTime);
+}
+
+static uint64_t cloudSpvStampAll()
+{
+    static const char* const kFiles[4] = {
+        "shaders/volumetric_clouds_v5.comp.spv",
+        "shaders/volumetric_cloud_resolve.comp.spv",
+        "shaders/volumetric_cloud_composite.comp.spv",
+        "shaders/volumetric_light.comp.spv",
+    };
+    uint64_t stamp = 1469598103934665603ull;   // FNV-1a
+    for(int i = 0; i < 4; ++i)
+    {
+        stamp ^= cloudSpvStampOf(kFiles[i]);
+        stamp *= 1099511628211ull;
+    }
+    return stamp;
+}
+
+static uint64_t g_cloudSpvStampSeen = 0ull;
+static int g_cloudSpvWatchCountdown = 0;
+
+static void hotReloadVolumetricCloudPipelines()
+{
+    if(g_device == VK_NULL_HANDLE) return;
+    if(g_volumetricCloudRenderPipelineLayout == VK_NULL_HANDLE) return;   // 还没初始化
+
+    // 旧管线可能仍被上一帧已提交的命令缓冲引用 ⇒ 先等设备空闲。
+    // （本函数只在 SPV 变化时执行，一次 ~16 ms 的停顿可以接受。
+    //   此刻正在录制的 cmd 还没有绑定任何云管线，所以替换句柄是安全的。）
+    vkDeviceWaitIdle(g_device);
+
+    bool any = false;
+    auto replace = [&any](const char* spv, VkPipelineLayout layout,
+                          VkPipeline* target, const char* tag)
+    {
+        try
+        {
+            const std::vector<uint8_t> code = loadSpv(spv);
+            VkShaderModule module = createShaderModule(g_device, code);
+            VkPipelineShaderStageCreateInfo stage{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+            };
+            stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            stage.module = module;
+            stage.pName = "main";
+            VkComputePipelineCreateInfo info{
+                VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+            };
+            info.stage = stage;
+            info.layout = layout;
+            VkPipeline fresh = VK_NULL_HANDLE;
+            const VkResult result = vkCreateComputePipelines(g_device,
+                getSharedPipelineCache(), 1u, &info, nullptr, &fresh);
+            vkDestroyShaderModule(g_device, module, nullptr);
+            if(result == VK_SUCCESS && fresh != VK_NULL_HANDLE)
+            {
+                if(*target != VK_NULL_HANDLE)
+                {
+                    vkDestroyPipeline(g_device, *target, nullptr);
+                }
+                *target = fresh;
+                any = true;
+                RTLog(std::string("[CLOUD HOT] reloaded ") + tag);
+            }
+            else
+            {
+                RTLog(std::string("[CLOUD HOT] create failed ") + tag +
+                    " (" + std::to_string(static_cast<int>(result)) + ")，保留旧管线");
+            }
+        }
+        catch(const std::exception& error)
+        {
+            // SPV 写坏了 / 还没编完：保留旧管线，别让一次热重载把渲染打死。
+            RTLog(std::string("[CLOUD HOT] ") + tag + " 读取失败: " + error.what());
+        }
+    };
+
+    replace("shaders/volumetric_clouds_v5.comp.spv",
+        g_volumetricCloudRenderPipelineLayout, &g_volumetricCloudRenderPipelineV3, "render");
+    replace("shaders/volumetric_cloud_resolve.comp.spv",
+        g_volumetricCloudResolvePipelineLayout, &g_volumetricCloudResolvePipeline, "resolve");
+    replace("shaders/volumetric_cloud_composite.comp.spv",
+        g_volumetricCloudCompositePipelineLayout, &g_volumetricCloudCompositePipeline, "composite");
+    replace("shaders/volumetric_light.comp.spv",
+        g_volumetricLightPipelineLayout, &g_volumetricLightPipeline, "light");
+
+    if(any)
+    {
+        // 着色器语义可能变了（密度/廓形/受光）⇒ 上一帧的历史不再可比。
+        g_volumetricCloudHistoryNeedsClear.store(true);
+        RTLog("[CLOUD HOT] cloud history cleared");
+    }
+}
+
+static void maybeHotReloadVolumetricCloudShaders()
+{
+    if(++g_cloudSpvWatchCountdown < 20) return;   // ~每 20 帧 stat 一次（约 0.3 s）
+    g_cloudSpvWatchCountdown = 0;
+    const uint64_t now = cloudSpvStampAll();
+    if(g_cloudSpvStampSeen == 0ull)
+    {
+        g_cloudSpvStampSeen = now;                 // 首次只记基线
+        return;
+    }
+    if(now == g_cloudSpvStampSeen) return;
+    g_cloudSpvStampSeen = now;
+    hotReloadVolumetricCloudPipelines();
+}
+
 static void recordVolumetricClouds(VkCommandBuffer cmd)
 {
-    if(cmd == VK_NULL_HANDLE || g_volumetricCloudRenderPipeline == VK_NULL_HANDLE ||
+    // 改完 SPV 后在这里被自动捡起来（见 maybeHotReloadVolumetricCloudShaders）。
+    // 放在最前面：此时本帧还没绑定任何云管线，替换句柄安全。
+    maybeHotReloadVolumetricCloudShaders();
+    if(cmd == VK_NULL_HANDLE || g_volumetricCloudRenderPipelineV3 == VK_NULL_HANDLE ||
        g_volumetricCloudResolvePipeline == VK_NULL_HANDLE ||
        g_volumetricCloudCompositePipeline == VK_NULL_HANDLE)
     {
@@ -40307,12 +43644,8 @@ static void recordVolumetricClouds(VkCommandBuffer cmd)
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr, 2u, sceneBarriers);
 
-    // v2 与 v1 共用描述符集/布局，只有模块不同 ⇒ 这里只换管线句柄。
-    const VkPipeline cloudRenderPipeline =
-        g_volumetricCloudRenderPipelineV3 != VK_NULL_HANDLE
-            ? g_volumetricCloudRenderPipelineV3
-            : (g_volumetricCloudRenderPipelineV2 != VK_NULL_HANDLE
-                ? g_volumetricCloudRenderPipelineV2 : g_volumetricCloudRenderPipeline);
+    // 2026-10-26：只剩 v5 一条渲染管线（变量名里的 V3 是历史命名，内容就是 v5）。
+    const VkPipeline cloudRenderPipeline = g_volumetricCloudRenderPipelineV3;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cloudRenderPipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
         g_volumetricCloudRenderPipelineLayout, 0u, 1u, &g_volumetricCloudRenderSet,
@@ -40508,7 +43841,11 @@ static void recordVolumetricClouds(VkCommandBuffer cmd)
     // 2026-10-14 体积光重构（第二刀）：光柱现在每样本向 TLAS 发遮蔽射线，
     // 所以 g_tlas 为空时（首帧/几何尚未建立）必须整段跳过 —— 否则会对着未绑定的
     // 加速结构发射线（validation 报错 + 结果未定义）。
-    if(g_godRayEnabled.load() && g_tlas != VK_NULL_HANDLE &&
+    // 2026-10-26 整链替换：体积光 ReSTIR 开启时，旧 pass **整体**停用
+    // （包括 marchUnderwaterGodRays）。水下已并入 vol_restir_composite.comp 的
+    // 介质分支 —— 与 RTX Remix 的架构一致（它的 shaders 树里 underwater 零命中，
+    // 体积光只有一套）。两者写同一张 g_godRayTargetImage，不能同时跑。
+    if(g_godRayEnabled.load() && volRestirEnabled() == 0u && g_tlas != VK_NULL_HANDLE &&
        g_volumetricLightPipeline != VK_NULL_HANDLE &&
        g_volumetricLightSet != VK_NULL_HANDLE &&
        g_godRayCompositePipeline != VK_NULL_HANDLE &&
@@ -41032,6 +44369,1887 @@ static void recordCloudComposite(VkCommandBuffer cmd)
         (g_dlssOutputHeight + 7u) / 8u, 1u);
 }
 
+
+// 2026-10-26：体积光 ReSTIR 开关（只读一次环境变量）。
+// 体积光 ReSTIR 总开关。三级解析：
+//   1) GUI 覆盖（设置界面「体积光 ReSTIR」）；
+//   2) 环境变量 ORION_VOL_RESTIR（启动时读一次，供无 GUI 的批处理/CI 用）；
+//   3) 出厂关闭。
+// GUI 覆盖优先，且每次调用都读 —— 开关可以在游戏内直接切。
+static uint32_t volRestirEnabled()
+{
+    const uint32_t overrideValue =
+        g_volRestirGuiOverride.load(std::memory_order_relaxed);
+
+    if(overrideValue != 0xFFFFFFFFu)
+    {
+        return overrideValue != 0u ? 1u : 0u;
+    }
+
+    static const uint32_t cached = []() -> uint32_t
+    {
+        // 2026-10-27：默认**开启**。
+        // radiance volume（SH 辐照度缓存）由这条链每帧填充，是半透明兜底的
+        // 唯一原文数据源（composite_alpha_blend.comp.slang:259-267 的
+        // evalVolumetricNEE）。关掉它等于没有 radiance volume。
+        // ORION_VOL_RESTIR=0 仍可显式关闭。
+        const char* raw = std::getenv("ORION_VOL_RESTIR");
+
+        if(raw != nullptr && raw[0] == '0' && raw[1] == '\0')
+        {
+            return 0u;
+        }
+
+        return 1u;
+    }();
+
+    return cached;
+}
+
+// 2026-10-27：体积 ReSTIR / SH 缓存的诊断视图开关。
+//   0 = 关；1..4 = 显示 SH 辐照度 / 体积 radiance / age / reservoir 有效性
+static uint32_t volDiagMode()
+{
+    static const uint32_t cached = []() -> uint32_t
+    {
+        const char* raw = std::getenv("ORION_VOL_DIAG");
+        if(raw == nullptr)
+        {
+            return 0u;
+        }
+        const int value = std::atoi(raw);
+        return (value >= 1 && value <= 4) ? static_cast<uint32_t>(value) : 0u;
+    }();
+    return cached;
+}
+
+static void createVolumeRestir3DImage(
+    uint32_t width,
+    uint32_t height,
+    uint32_t depth,
+    VkFormat format,
+    VkImage& image,
+    VkDeviceMemory& memory,
+    VkImageView& view)
+{
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+
+    info.imageType = VK_IMAGE_TYPE_3D;
+    info.format = format;
+    info.extent = {width, height, depth};
+    info.mipLevels = 1u;
+    info.arrayLayers = 1u;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_STORAGE_BIT |
+        VK_IMAGE_USAGE_SAMPLED_BIT |
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    check(vkCreateImage(g_device, &info, nullptr, &image), "vol restir image create failed");
+
+    VkMemoryRequirements requirements{};
+    vkGetImageMemoryRequirements(g_device, image, &requirements);
+
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = requirements.size;
+    allocation.memoryTypeIndex = findMemoryType(
+        g_physicalDevice, requirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    check(vkAllocateMemory(g_device, &allocation, nullptr, &memory), "vol restir memory failed");
+    check(vkBindImageMemory(g_device, image, memory, 0u), "vol restir bind failed");
+
+    VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    viewInfo.image = image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_3D;
+    viewInfo.format = format;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.levelCount = 1u;
+    viewInfo.subresourceRange.layerCount = 1u;
+
+    check(vkCreateImageView(g_device, &viewInfo, nullptr, &view), "vol restir view failed");
+}
+
+static void destroyVolumeRestirResources()
+{
+    // 管线/描述符可能仍被在途帧引用（本函数在"分辨率变了"的帧内路径里被调用）。
+    // 与 destroyVolumetricCloudResources 同一处理：只在真的要销毁时等一次。
+    if(g_device != VK_NULL_HANDLE && g_volRestirPipeline != VK_NULL_HANDLE)
+    {
+        vkDeviceWaitIdle(g_device);
+    }
+
+    for(uint32_t i = 0u; i < 2u; ++i)
+    {
+        if(g_volRadianceView[i] != VK_NULL_HANDLE) { vkDestroyImageView(g_device, g_volRadianceView[i], nullptr); g_volRadianceView[i] = VK_NULL_HANDLE; }
+        if(g_volRadianceImage[i] != VK_NULL_HANDLE) { vkDestroyImage(g_device, g_volRadianceImage[i], nullptr); g_volRadianceImage[i] = VK_NULL_HANDLE; }
+        if(g_volRadianceMemory[i] != VK_NULL_HANDLE) { vkFreeMemory(g_device, g_volRadianceMemory[i], nullptr); g_volRadianceMemory[i] = VK_NULL_HANDLE; }
+
+        if(g_volShYView[i] != VK_NULL_HANDLE) { vkDestroyImageView(g_device, g_volShYView[i], nullptr); g_volShYView[i] = VK_NULL_HANDLE; }
+        if(g_volShYImage[i] != VK_NULL_HANDLE) { vkDestroyImage(g_device, g_volShYImage[i], nullptr); g_volShYImage[i] = VK_NULL_HANDLE; }
+        if(g_volShYMemory[i] != VK_NULL_HANDLE) { vkFreeMemory(g_device, g_volShYMemory[i], nullptr); g_volShYMemory[i] = VK_NULL_HANDLE; }
+        if(g_volShCoCgView[i] != VK_NULL_HANDLE) { vkDestroyImageView(g_device, g_volShCoCgView[i], nullptr); g_volShCoCgView[i] = VK_NULL_HANDLE; }
+        if(g_volShCoCgImage[i] != VK_NULL_HANDLE) { vkDestroyImage(g_device, g_volShCoCgImage[i], nullptr); g_volShCoCgImage[i] = VK_NULL_HANDLE; }
+        if(g_volShCoCgMemory[i] != VK_NULL_HANDLE) { vkFreeMemory(g_device, g_volShCoCgMemory[i], nullptr); g_volShCoCgMemory[i] = VK_NULL_HANDLE; }
+        if(g_volAgeView[i] != VK_NULL_HANDLE) { vkDestroyImageView(g_device, g_volAgeView[i], nullptr); g_volAgeView[i] = VK_NULL_HANDLE; }
+        if(g_volAgeImage[i] != VK_NULL_HANDLE) { vkDestroyImage(g_device, g_volAgeImage[i], nullptr); g_volAgeImage[i] = VK_NULL_HANDLE; }
+        if(g_volAgeMemory[i] != VK_NULL_HANDLE) { vkFreeMemory(g_device, g_volAgeMemory[i], nullptr); g_volAgeMemory[i] = VK_NULL_HANDLE; }
+
+        if(g_volReservoirView[i] != VK_NULL_HANDLE) { vkDestroyImageView(g_device, g_volReservoirView[i], nullptr); g_volReservoirView[i] = VK_NULL_HANDLE; }
+        if(g_volReservoirImage[i] != VK_NULL_HANDLE) { vkDestroyImage(g_device, g_volReservoirImage[i], nullptr); g_volReservoirImage[i] = VK_NULL_HANDLE; }
+        if(g_volReservoirMemory[i] != VK_NULL_HANDLE) { vkFreeMemory(g_device, g_volReservoirMemory[i], nullptr); g_volReservoirMemory[i] = VK_NULL_HANDLE; }
+    }
+
+    if(g_volRestirPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_volRestirPipeline, nullptr);
+        g_volRestirPipeline = VK_NULL_HANDLE;
+    }
+    if(g_volRestirPipelineLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(g_device, g_volRestirPipelineLayout, nullptr);
+        g_volRestirPipelineLayout = VK_NULL_HANDLE;
+    }
+    if(g_volRestirDescriptorPool != VK_NULL_HANDLE)
+    {
+        // 描述符集随池一起释放。
+        vkDestroyDescriptorPool(g_device, g_volRestirDescriptorPool, nullptr);
+        g_volRestirDescriptorPool = VK_NULL_HANDLE;
+        g_volRestirSet = VK_NULL_HANDLE;
+    }
+    if(g_volRestirSetLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(g_device, g_volRestirSetLayout, nullptr);
+        g_volRestirSetLayout = VK_NULL_HANDLE;
+    }
+
+    if(g_volRestirTemporalPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_volRestirTemporalPipeline, nullptr);
+        g_volRestirTemporalPipeline = VK_NULL_HANDLE;
+    }
+    if(g_volRestirSpatialPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_volRestirSpatialPipeline, nullptr);
+        g_volRestirSpatialPipeline = VK_NULL_HANDLE;
+    }
+    if(g_volRestirTemporalPipelineLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(g_device, g_volRestirTemporalPipelineLayout, nullptr);
+        g_volRestirTemporalPipelineLayout = VK_NULL_HANDLE;
+    }
+    if(g_volRestirSpatialPipelineLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(g_device, g_volRestirSpatialPipelineLayout, nullptr);
+        g_volRestirSpatialPipelineLayout = VK_NULL_HANDLE;
+    }
+    if(g_volRestirTemporalDescriptorPool != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorPool(g_device, g_volRestirTemporalDescriptorPool, nullptr);
+        g_volRestirTemporalDescriptorPool = VK_NULL_HANDLE;
+        g_volRestirTemporalSet = VK_NULL_HANDLE;
+    }
+    if(g_volRestirSpatialDescriptorPool != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorPool(g_device, g_volRestirSpatialDescriptorPool, nullptr);
+        g_volRestirSpatialDescriptorPool = VK_NULL_HANDLE;
+        g_volRestirSpatialSet = VK_NULL_HANDLE;
+    }
+    if(g_volRestirTemporalSetLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(g_device, g_volRestirTemporalSetLayout, nullptr);
+        g_volRestirTemporalSetLayout = VK_NULL_HANDLE;
+    }
+    if(g_volRestirSpatialSetLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(g_device, g_volRestirSpatialSetLayout, nullptr);
+        g_volRestirSpatialSetLayout = VK_NULL_HANDLE;
+    }
+
+    if(g_volRestirIntegratePipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_volRestirIntegratePipeline, nullptr);
+        g_volRestirIntegratePipeline = VK_NULL_HANDLE;
+    }
+    if(g_volRestirCompositePipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_volRestirCompositePipeline, nullptr);
+        g_volRestirCompositePipeline = VK_NULL_HANDLE;
+    }
+    if(g_volRestirIntegratePipelineLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(g_device, g_volRestirIntegratePipelineLayout, nullptr);
+        g_volRestirIntegratePipelineLayout = VK_NULL_HANDLE;
+    }
+    if(g_volRestirCompositePipelineLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(g_device, g_volRestirCompositePipelineLayout, nullptr);
+        g_volRestirCompositePipelineLayout = VK_NULL_HANDLE;
+    }
+    if(g_volRestirIntegrateDescriptorPool != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorPool(g_device, g_volRestirIntegrateDescriptorPool, nullptr);
+        g_volRestirIntegrateDescriptorPool = VK_NULL_HANDLE;
+        g_volRestirIntegrateSet = VK_NULL_HANDLE;
+    }
+    if(g_volRestirCompositeDescriptorPool != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorPool(g_device, g_volRestirCompositeDescriptorPool, nullptr);
+        g_volRestirCompositeDescriptorPool = VK_NULL_HANDLE;
+        g_volRestirCompositeSet = VK_NULL_HANDLE;
+    }
+    if(g_volRestirIntegrateSetLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(g_device, g_volRestirIntegrateSetLayout, nullptr);
+        g_volRestirIntegrateSetLayout = VK_NULL_HANDLE;
+    }
+    if(g_volRestirCompositeSetLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(g_device, g_volRestirCompositeSetLayout, nullptr);
+        g_volRestirCompositeSetLayout = VK_NULL_HANDLE;
+    }
+
+    if(g_volRestirVisibilityPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_volRestirVisibilityPipeline, nullptr);
+        g_volRestirVisibilityPipeline = VK_NULL_HANDLE;
+    }
+    if(g_volRestirVisibilityPipelineLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(g_device, g_volRestirVisibilityPipelineLayout, nullptr);
+        g_volRestirVisibilityPipelineLayout = VK_NULL_HANDLE;
+    }
+    if(g_volRestirVisibilityDescriptorPool != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorPool(g_device, g_volRestirVisibilityDescriptorPool, nullptr);
+        g_volRestirVisibilityDescriptorPool = VK_NULL_HANDLE;
+        g_volRestirVisibilitySet = VK_NULL_HANDLE;
+    }
+    if(g_volRestirVisibilitySetLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(g_device, g_volRestirVisibilitySetLayout, nullptr);
+        g_volRestirVisibilitySetLayout = VK_NULL_HANDLE;
+    }
+
+    g_volRestirLayoutReady = false;
+
+    // 2026-10-28：描述符集随池一起释放 ⇒ 句柄记账必须归零，
+    // 否则重建出来的 set 会被告知"已绑定过"，binding 12/13/2 保持未写。
+    g_volRestirBoundLightBuffer = VK_NULL_HANDLE;
+    g_volRestirBoundGridBuffer = VK_NULL_HANDLE;
+    g_volRestirBoundVisibilityTlas = VK_NULL_HANDLE;
+    g_volRestirBoundVisibilityLightBuffer = VK_NULL_HANDLE;
+    g_volRestirBoundVisibilityGridBuffer = VK_NULL_HANDLE;
+    g_volRestirBoundIntegrateLightBuffer = VK_NULL_HANDLE;
+    g_volRestirBoundIntegrateGridBuffer = VK_NULL_HANDLE;
+    g_volRestirBoundIntegrateTlas = VK_NULL_HANDLE;
+
+    // 2026-10-26：g_volDepthSampler 不再在这里销毁 —— 它是会话级资源，云的描述符集
+    // （render/composite/light set）也持有它，而本函数会随 froxel 尺寸变化执行 ⇒
+    // 销毁后那些 set 里就是悬空句柄。改在会话收尾处释放（见 destroyVolumetricCloudResources
+    // 的调用点，68618 附近）。
+
+    g_volFroxelW = 0u;
+    g_volFroxelH = 0u;
+    g_volRestirW = 0u;
+    g_volRestirH = 0u;
+    g_volWriteIndex = 0u;
+}
+
+static void createVolumeRestirResources(uint32_t renderWidth, uint32_t renderHeight)
+{
+    if(volRestirEnabled() == 0u)
+    {
+        return;
+    }
+
+    const uint32_t froxelW = std::max(1u, (renderWidth + VOL_FROXEL_DOWNSCALE - 1u) / VOL_FROXEL_DOWNSCALE);
+    const uint32_t froxelH = std::max(1u, (renderHeight + VOL_FROXEL_DOWNSCALE - 1u) / VOL_FROXEL_DOWNSCALE);
+    const uint32_t restirW = std::max(1u, (froxelW + VOL_RESTIR_DOWNSCALE - 1u) / VOL_RESTIR_DOWNSCALE);
+    const uint32_t restirH = std::max(1u, (froxelH + VOL_RESTIR_DOWNSCALE - 1u) / VOL_RESTIR_DOWNSCALE);
+
+    if(g_volFroxelW == froxelW && g_volFroxelH == froxelH &&
+       g_volRadianceImage[1] != VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    destroyVolumeRestirResources();
+
+    g_volFroxelW = froxelW;
+    g_volFroxelH = froxelH;
+    g_volRestirW = restirW;
+    g_volRestirH = restirH;
+
+    for(uint32_t i = 0u; i < 2u; ++i)
+    {
+        createVolumeRestir3DImage(froxelW, froxelH, VOL_RESTIR_DEPTH,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            g_volRadianceImage[i], g_volRadianceMemory[i], g_volRadianceView[i]);
+
+        createVolumeRestir3DImage(froxelW, froxelH, VOL_RESTIR_DEPTH,
+            VK_FORMAT_R8_UNORM,
+            g_volAgeImage[i], g_volAgeMemory[i], g_volAgeView[i]);
+
+        // 2026-10-27：SH 辐照度缓存（Remix 的两张 3D 图，froxel 网格、rgba16f）。
+        createVolumeRestir3DImage(froxelW, froxelH, VOL_RESTIR_DEPTH,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            g_volShYImage[i], g_volShYMemory[i], g_volShYView[i]);
+
+        createVolumeRestir3DImage(froxelW, froxelH, VOL_RESTIR_DEPTH,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            g_volShCoCgImage[i], g_volShCoCgMemory[i], g_volShCoCgView[i]);
+
+        createVolumeRestir3DImage(restirW, restirH, VOL_RESTIR_DEPTH,
+            VK_FORMAT_R32G32B32A32_UINT,
+            g_volReservoirImage[i], g_volReservoirMemory[i], g_volReservoirView[i]);
+    }
+
+    g_volShNeedsInit = true;
+
+    // 2026-10-26：采样器的创建统一走 volDepthSampler()（幂等）——
+    // 云的描述符集比本函数更早要它，创建时机不能再挂在这里。
+    volDepthSampler();
+
+    RTLog(
+        "[VOL RESTIR] resources created froxel=" + std::to_string(froxelW) + "x" +
+        std::to_string(froxelH) + "x" + std::to_string(VOL_RESTIR_DEPTH) +
+        " restir=" + std::to_string(restirW) + "x" + std::to_string(restirH) +
+        "x" + std::to_string(VOL_RESTIR_DEPTH));
+}
+
+// S2：INITIAL 阶段的 push constant。与 vol_restir.comp 的 VolRestirPush 逐字段对应。
+struct VolRestirPushConstants
+{
+    // x = froxel 宽, y = froxel 高, z = 层数, w = restir 下采样比
+    int32_t froxelSize[4];
+    // x = 最远距离, y = 深度指数, z = 保留, w = 帧种子（当前恒 0，着色器用 frameCount）
+    float volumeParams[4];
+};
+
+// S2：INITIAL 阶段的描述符与管线。只建一次（资源重建时随 destroy 一起清空）。
+static void createVolumeRestirPipeline()
+{
+    if(g_volRestirPipeline != VK_NULL_HANDLE || g_volRestirPipelineFailed)
+    {
+        return;
+    }
+    if(g_volReservoirView[0] == VK_NULL_HANDLE || g_volRadianceView[0] == VK_NULL_HANDLE ||
+       g_localLightGpuBuffer == VK_NULL_HANDLE || g_localLightGridGpuBuffer == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    try
+    {
+        // binding 12/13 由 local_light_grid_common.glsl 声明（体积云 pass 的头文件），
+        // 这里必须给同样的两个 buffer —— 灯的身份因此与 rgen/雾完全一致。
+        VkDescriptorSetLayoutBinding bindings[5]{};
+        bindings[0] = { 0u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u,
+            VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        bindings[1] = { 12u, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u,
+            VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        bindings[2] = { 13u, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u,
+            VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        bindings[3] = { 14u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+            VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        bindings[4] = { 15u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+            VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+
+        VkDescriptorSetLayoutCreateInfo layoutInfo{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+        };
+        layoutInfo.bindingCount = 5u;
+        layoutInfo.pBindings = bindings;
+        check(vkCreateDescriptorSetLayout(g_device, &layoutInfo, nullptr,
+            &g_volRestirSetLayout), "vol restir set layout failed");
+
+        VkDescriptorPoolSize poolSizes[3] = {
+            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u },
+            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2u },
+            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2u }
+        };
+        VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolInfo.maxSets = 1u;
+        poolInfo.poolSizeCount = 3u;
+        poolInfo.pPoolSizes = poolSizes;
+        check(vkCreateDescriptorPool(g_device, &poolInfo, nullptr,
+            &g_volRestirDescriptorPool), "vol restir descriptor pool failed");
+
+        VkDescriptorSetAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocateInfo.descriptorPool = g_volRestirDescriptorPool;
+        allocateInfo.descriptorSetCount = 1u;
+        allocateInfo.pSetLayouts = &g_volRestirSetLayout;
+        check(vkAllocateDescriptorSets(g_device, &allocateInfo, &g_volRestirSet),
+            "vol restir descriptor set failed");
+
+        VkDescriptorBufferInfo cameraInfo{};
+        cameraInfo.buffer = g_cameraUboBuffer;
+        cameraInfo.offset = 0u;
+        cameraInfo.range = sizeof(CameraUBO);
+
+        VkDescriptorBufferInfo lightInfo{};
+        lightInfo.buffer = g_localLightGpuBuffer;
+        lightInfo.offset = 0u;
+        lightInfo.range = VK_WHOLE_SIZE;
+
+        VkDescriptorBufferInfo gridInfo{};
+        gridInfo.buffer = g_localLightGridGpuBuffer;
+        gridInfo.offset = 0u;
+        gridInfo.range = VK_WHOLE_SIZE;
+
+        VkDescriptorImageInfo reservoirInfo{};
+        reservoirInfo.imageView = g_volReservoirView[0];
+        reservoirInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo radianceInfo{};
+        radianceInfo.imageView = g_volRadianceView[0];
+        radianceInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet writes[5]{};
+        for(uint32_t i = 0u; i < 5u; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = g_volRestirSet;
+            writes[i].descriptorCount = 1u;
+        }
+        writes[0].dstBinding = 0u;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].pBufferInfo = &cameraInfo;
+        writes[1].dstBinding = 12u;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].pBufferInfo = &lightInfo;
+        writes[2].dstBinding = 13u;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[2].pBufferInfo = &gridInfo;
+        writes[3].dstBinding = 14u;
+        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[3].pImageInfo = &reservoirInfo;
+        writes[4].dstBinding = 15u;
+        writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[4].pImageInfo = &radianceInfo;
+
+        vkUpdateDescriptorSets(g_device, 5u, writes, 0u, nullptr);
+
+        VkPushConstantRange pushRange{};
+        pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pushRange.offset = 0u;
+        pushRange.size = sizeof(VolRestirPushConstants);
+
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo{
+            VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+        };
+        pipelineLayoutInfo.setLayoutCount = 1u;
+        pipelineLayoutInfo.pSetLayouts = &g_volRestirSetLayout;
+        pipelineLayoutInfo.pushConstantRangeCount = 1u;
+        pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+        check(vkCreatePipelineLayout(g_device, &pipelineLayoutInfo, nullptr,
+            &g_volRestirPipelineLayout), "vol restir pipeline layout failed");
+
+        const std::vector<uint8_t> code = loadSpv("shaders/vol_restir.comp.spv");
+        VkShaderModule module = createShaderModule(g_device, code);
+        VkPipelineShaderStageCreateInfo stage{
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+        };
+        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        stage.module = module;
+        stage.pName = "main";
+        VkComputePipelineCreateInfo pipelineInfo{
+            VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+        };
+        pipelineInfo.stage = stage;
+        pipelineInfo.layout = g_volRestirPipelineLayout;
+        const VkResult pipelineResult = vkCreateComputePipelines(g_device,
+            getSharedPipelineCache(), 1u, &pipelineInfo, nullptr, &g_volRestirPipeline);
+        vkDestroyShaderModule(g_device, module, nullptr);
+        check(pipelineResult, "vol restir pipeline failed");
+
+        RTLog("[VOL RESTIR] initial pipeline ready");
+    }
+    catch(const std::exception& error)
+    {
+        // SPV 缺失 / 驱动拒绝：本模块整体降级为"不 dispatch"，不影响其余渲染。
+        g_volRestirPipelineFailed = true;
+        RTLog(std::string("[VOL RESTIR] pipeline unavailable: ") + error.what());
+    }
+}
+
+// S3：temporal / spatial 的 push constant。两者共用 32 字节范围（见
+// VOL_RESTIR_CHAIN_PUSH_BYTES），字段按各自的 shader 块体对应。
+struct VolRestirTemporalPushConstants
+{
+    // x = froxel 宽, y = froxel 高, z = 层数, w = restir 下采样比
+    int32_t froxelSize[4];
+    // x = 最远距离, y = 深度指数, z = M 上限, w = 帧种子
+    float temporalParams[4];
+};
+
+struct VolRestirSpatialPushConstants
+{
+    // x = 邻域半径, yzw = 保留
+    float spatialParams[4];
+    // 补齐到 32 字节，与 pipeline layout 声明的范围一致。
+    float reserved[4];
+};
+
+// S3：temporal + spatial 的描述符与管线。只建一次（资源重建时随 destroy 清空）。
+// 两个 pass 的绑定布局一致（0 = UBO，1 = 当前帧 reservoir，2 = 上一帧 reservoir），
+// 差别只在 shader 里谁读谁写。
+// 2026-10-26：descriptor 提交体检。NVIDIA 驱动对 NULL sampler / NULL imageView /
+// 零初始化槽位不报错、直接 access violation，连 VkResult 都不给。这里统一拦。
+static void vkGuardUpdate(
+    uint32_t count,
+    VkWriteDescriptorSet* writes,
+    const char* tag)
+{
+    uint32_t safe = 0u;
+
+    for(uint32_t i = 0u; i < count; ++i)
+    {
+        VkWriteDescriptorSet w = writes[i];
+
+        if(w.sType != VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET ||
+           w.descriptorType == 0u ||
+           w.descriptorCount == 0u)
+        {
+            RTLogFlushed(std::string("[VK GUARD] ") + tag + " slot " + std::to_string(i) + " uninitialized");
+            continue;
+        }
+
+        bool bad = false;
+
+        if(w.pImageInfo != nullptr)
+        {
+            for(uint32_t k = 0u; k < w.descriptorCount; ++k)
+            {
+                if(w.pImageInfo[k].imageView == VK_NULL_HANDLE)
+                {
+                    RTLogFlushed(std::string("[VK GUARD] ") + tag + " binding " + std::to_string(w.dstBinding) + " NULL imageView");
+                    bad = true;
+                }
+
+                if((w.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+                    w.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER) &&
+                   w.pImageInfo[k].sampler == VK_NULL_HANDLE)
+                {
+                    RTLogFlushed(std::string("[VK GUARD] ") + tag + " binding " + std::to_string(w.dstBinding) + " NULL sampler");
+                    bad = true;
+                }
+            }
+        }
+        else if(w.pBufferInfo == nullptr &&
+                w.pTexelBufferView == nullptr &&
+                w.pNext == nullptr)
+        {
+            RTLogFlushed(std::string("[VK GUARD] ") + tag + " binding " + std::to_string(w.dstBinding) + " no data pointer");
+            bad = true;
+        }
+
+        if(bad)
+        {
+            continue;
+        }
+
+        writes[safe++] = w;
+    }
+
+    vkUpdateDescriptorSets(g_device, safe, writes, 0u, nullptr);
+}
+
+static void createVolumeRestirChainPipelines()
+{
+    if(g_volRestirTemporalPipeline != VK_NULL_HANDLE || g_volRestirPipelineFailed)
+    {
+        return;
+    }
+    if(g_volReservoirView[0] == VK_NULL_HANDLE || g_volReservoirView[1] == VK_NULL_HANDLE ||
+       g_cameraUboBuffer == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    try
+    {
+        auto createStage = [](
+            const char* spvPath,
+            VkDescriptorSetLayout& setLayout,
+            VkDescriptorPool& pool,
+            VkDescriptorSet& set,
+            VkPipelineLayout& pipelineLayout,
+            VkPipeline& pipeline)
+        {
+            VkDescriptorSetLayoutBinding bindings[3]{};
+            bindings[0] = { 0u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[1] = { 1u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[2] = { 2u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+
+            VkDescriptorSetLayoutCreateInfo layoutInfo{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+            };
+            layoutInfo.bindingCount = 3u;
+            layoutInfo.pBindings = bindings;
+            check(vkCreateDescriptorSetLayout(g_device, &layoutInfo, nullptr,
+                &setLayout), "vol restir chain set layout failed");
+
+            VkDescriptorPoolSize poolSizes[2] = {
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u },
+                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2u }
+            };
+            VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            poolInfo.maxSets = 1u;
+            poolInfo.poolSizeCount = 2u;
+            poolInfo.pPoolSizes = poolSizes;
+            check(vkCreateDescriptorPool(g_device, &poolInfo, nullptr,
+                &pool), "vol restir chain descriptor pool failed");
+
+            VkDescriptorSetAllocateInfo allocateInfo{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+            };
+            allocateInfo.descriptorPool = pool;
+            allocateInfo.descriptorSetCount = 1u;
+            allocateInfo.pSetLayouts = &setLayout;
+            check(vkAllocateDescriptorSets(g_device, &allocateInfo, &set),
+                "vol restir chain descriptor set failed");
+
+            VkDescriptorBufferInfo cameraInfo{};
+            cameraInfo.buffer = g_cameraUboBuffer;
+            cameraInfo.offset = 0u;
+            cameraInfo.range = sizeof(CameraUBO);
+
+            VkDescriptorImageInfo currentInfo{};
+            currentInfo.imageView = g_volReservoirView[0];
+            currentInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkDescriptorImageInfo historyInfo{};
+            historyInfo.imageView = g_volReservoirView[1];
+            historyInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkWriteDescriptorSet writes[3]{};
+            for(uint32_t i = 0u; i < 3u; ++i)
+            {
+                writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[i].dstSet = set;
+                writes[i].descriptorCount = 1u;
+            }
+            writes[0].dstBinding = 0u;
+            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            writes[0].pBufferInfo = &cameraInfo;
+            writes[1].dstBinding = 1u;
+            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[1].pImageInfo = &currentInfo;
+            writes[2].dstBinding = 2u;
+            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[2].pImageInfo = &historyInfo;
+
+            vkGuardUpdate(3u, writes, "vol");
+
+            VkPushConstantRange pushRange{};
+            pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            pushRange.offset = 0u;
+            pushRange.size = VOL_RESTIR_CHAIN_PUSH_BYTES;
+
+            VkPipelineLayoutCreateInfo pipelineLayoutInfo{
+                VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+            };
+            pipelineLayoutInfo.setLayoutCount = 1u;
+            pipelineLayoutInfo.pSetLayouts = &setLayout;
+            pipelineLayoutInfo.pushConstantRangeCount = 1u;
+            pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+            check(vkCreatePipelineLayout(g_device, &pipelineLayoutInfo, nullptr,
+                &pipelineLayout), "vol restir chain pipeline layout failed");
+
+            const std::vector<uint8_t> code = loadSpv(spvPath);
+            VkShaderModule module = createShaderModule(g_device, code);
+            VkPipelineShaderStageCreateInfo stage{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+            };
+            stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            stage.module = module;
+            stage.pName = "main";
+            VkComputePipelineCreateInfo pipelineInfo{
+                VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+            };
+            pipelineInfo.stage = stage;
+            pipelineInfo.layout = pipelineLayout;
+            const VkResult pipelineResult = vkCreateComputePipelines(g_device,
+                getSharedPipelineCache(), 1u, &pipelineInfo, nullptr, &pipeline);
+            vkDestroyShaderModule(g_device, module, nullptr);
+            check(pipelineResult, "vol restir chain pipeline failed");
+        };
+
+        createStage("shaders/vol_restir_temporal.comp.spv",
+            g_volRestirTemporalSetLayout, g_volRestirTemporalDescriptorPool,
+            g_volRestirTemporalSet, g_volRestirTemporalPipelineLayout,
+            g_volRestirTemporalPipeline);
+
+        createStage("shaders/vol_restir_spatial.comp.spv",
+            g_volRestirSpatialSetLayout, g_volRestirSpatialDescriptorPool,
+            g_volRestirSpatialSet, g_volRestirSpatialPipelineLayout,
+            g_volRestirSpatialPipeline);
+
+        RTLog("[VOL RESTIR] temporal + spatial pipelines ready");
+    }
+    catch(const std::exception& error)
+    {
+        g_volRestirPipelineFailed = true;
+        RTLog(std::string("[VOL RESTIR] chain pipeline unavailable: ") + error.what());
+    }
+}
+
+// S3：在 INITIAL 之后接 temporal → spatial。两个 pass 都是 restir 网格尺寸。
+static void recordVolumeRestirChain(VkCommandBuffer cmd)
+{
+    if(g_volRestirTemporalPipeline == VK_NULL_HANDLE ||
+       g_volRestirSpatialPipeline == VK_NULL_HANDLE ||
+       g_volRestirTemporalSet == VK_NULL_HANDLE ||
+       g_volRestirSpatialSet == VK_NULL_HANDLE ||
+       g_volRestirW == 0u || g_volRestirH == 0u)
+    {
+        return;
+    }
+
+    const uint32_t groupCountX = (g_volRestirW + 7u) / 8u;
+    const uint32_t groupCountY = (g_volRestirH + 7u) / 8u;
+
+    // ---- temporal：initial 的写 → 本 pass 的读（原地合并 R0，只读 R1）----
+    {
+        VkImageMemoryBarrier barriers[2]{};
+        for(uint32_t i = 0u; i < 2u; ++i)
+        {
+            VkImageMemoryBarrier& barrier = barriers[i];
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.levelCount = 1u;
+            barrier.subresourceRange.layerCount = 1u;
+        }
+        barriers[0].image = g_volReservoirImage[0];
+        barriers[1].image = g_volReservoirImage[1];
+
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+            0u, nullptr, 0u, nullptr, 2u, barriers);
+
+        VolRestirTemporalPushConstants pushConstants{};
+        pushConstants.froxelSize[0] = static_cast<int32_t>(g_volFroxelW);
+        pushConstants.froxelSize[1] = static_cast<int32_t>(g_volFroxelH);
+        pushConstants.froxelSize[2] = static_cast<int32_t>(VOL_RESTIR_DEPTH);
+        pushConstants.froxelSize[3] = static_cast<int32_t>(VOL_RESTIR_DOWNSCALE);
+        pushConstants.temporalParams[0] = VOL_RESTIR_MAX_DISTANCE;
+        pushConstants.temporalParams[1] = VOL_RESTIR_DEPTH_EXPONENT;
+        pushConstants.temporalParams[2] = static_cast<float>(VOL_RESTIR_MAX_SAMPLES);
+        pushConstants.temporalParams[3] = 0.0f;
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_volRestirTemporalPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            g_volRestirTemporalPipelineLayout, 0u, 1u, &g_volRestirTemporalSet, 0u, nullptr);
+        vkCmdPushConstants(cmd, g_volRestirTemporalPipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT, 0u, VOL_RESTIR_CHAIN_PUSH_BYTES, &pushConstants);
+        vkCmdDispatch(cmd, groupCountX, groupCountY, VOL_RESTIR_DEPTH);
+    }
+
+    // ---- spatial：读 R0、写 R1 ----
+    {
+        VkImageMemoryBarrier barriers[2]{};
+        for(uint32_t i = 0u; i < 2u; ++i)
+        {
+            VkImageMemoryBarrier& barrier = barriers[i];
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.levelCount = 1u;
+            barrier.subresourceRange.layerCount = 1u;
+        }
+        barriers[0].image = g_volReservoirImage[0];
+        barriers[1].image = g_volReservoirImage[1];
+
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+            0u, nullptr, 0u, nullptr, 2u, barriers);
+
+        VolRestirSpatialPushConstants pushConstants{};
+        pushConstants.spatialParams[0] = 1.0f;
+        pushConstants.spatialParams[1] = 0.0f;
+        pushConstants.spatialParams[2] = 0.0f;
+        pushConstants.spatialParams[3] = 0.0f;
+        pushConstants.reserved[0] = 0.0f;
+        pushConstants.reserved[1] = 0.0f;
+        pushConstants.reserved[2] = 0.0f;
+        pushConstants.reserved[3] = 0.0f;
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_volRestirSpatialPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            g_volRestirSpatialPipelineLayout, 0u, 1u, &g_volRestirSpatialSet, 0u, nullptr);
+        vkCmdPushConstants(cmd, g_volRestirSpatialPipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT, 0u, VOL_RESTIR_CHAIN_PUSH_BYTES, &pushConstants);
+        vkCmdDispatch(cmd, groupCountX, groupCountY, VOL_RESTIR_DEPTH);
+    }
+}
+
+// S4：froxel 入散射与屏幕积分的 push constant。
+struct VolRestirIntegratePushConstants
+{
+    int32_t froxelSize[4];
+    float volumeParams[4];
+};
+
+struct VolRestirCompositePushConstants
+{
+    // x = 最远距离, y = 深度指数, z = 步数, w = 消光缩放
+    float params[4];
+    // x = froxel 宽, y = froxel 高, z = 层数, w = 保留
+    int32_t grid[4];
+};
+
+// S4：integrate 与 composite 的描述符/管线。
+//   integrate：0 = UBO, 1 = 最终 reservoir（R1）, 12/13 = 灯表/网格, 15 = froxel 辐亮度
+//   composite：0 = UBO, 1 = 场景深度, 2 = froxel 辐亮度（sampler3D）, 3 = 输出
+static void createVolumeRestirOutputPipelines()
+{
+    if(g_volRestirIntegratePipeline != VK_NULL_HANDLE || g_volRestirPipelineFailed)
+    {
+        return;
+    }
+    // 2026-10-28：多一条 g_tlas —— binding 22 必须有可写句柄，否则这个 set
+    // 建出来就是"22 未定义"，NEE 射线会打在空加速结构上（遮挡恒失效）。
+    if(g_volRadianceView[0] == VK_NULL_HANDLE || g_volReservoirView[1] == VK_NULL_HANDLE ||
+       g_dlssDepthView == VK_NULL_HANDLE || g_godRayTargetView == VK_NULL_HANDLE ||
+       g_tlas == VK_NULL_HANDLE ||
+       g_localLightGpuBuffer == VK_NULL_HANDLE || g_localLightGridGpuBuffer == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    try
+    {
+        // ---------------- integrate ----------------
+        {
+            // 2026-10-27：5 -> 11。新增 6 个是 SH 辐照度缓存（Remix
+            // AccumulatedRadianceY/CoCg/Age 的 prev/cur 两套）：
+            //   16 prev Y   17 prev CoCg   18 prev age
+            //   19 cur Y    20 cur CoCg    21 cur age
+            VkDescriptorSetLayoutBinding bindings[12]{};
+            bindings[0] = { 0u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[1] = { 1u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[2] = { 12u, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[3] = { 13u, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[4] = { 15u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[5] = { 16u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[6] = { 17u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[7] = { 18u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[8] = { 19u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[9] = { 20u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[10] = { 21u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            // 2026-10-28：22 = 场景 TLAS（每 froxel 的 NEE 可见性，见 shader 的
+            // volRestirNeeVisible）。与 volume_restir_visibility.comp 的 binding 2
+            // 绑同一棵，口径一致。
+            bindings[11] = { 22u, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+
+            VkDescriptorSetLayoutCreateInfo layoutInfo{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+            };
+            layoutInfo.bindingCount = 12u;
+            layoutInfo.pBindings = bindings;
+            check(vkCreateDescriptorSetLayout(g_device, &layoutInfo, nullptr,
+                &g_volRestirIntegrateSetLayout), "vol restir integrate set layout failed");
+
+            VkDescriptorPoolSize poolSizes[4] = {
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u },
+                { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2u },
+                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8u },
+                { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1u }
+            };
+            VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            poolInfo.maxSets = 1u;
+            poolInfo.poolSizeCount = 4u;
+            poolInfo.pPoolSizes = poolSizes;
+            check(vkCreateDescriptorPool(g_device, &poolInfo, nullptr,
+                &g_volRestirIntegrateDescriptorPool), "vol restir integrate pool failed");
+
+            VkDescriptorSetAllocateInfo allocateInfo{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+            };
+            allocateInfo.descriptorPool = g_volRestirIntegrateDescriptorPool;
+            allocateInfo.descriptorSetCount = 1u;
+            allocateInfo.pSetLayouts = &g_volRestirIntegrateSetLayout;
+            check(vkAllocateDescriptorSets(g_device, &allocateInfo,
+                &g_volRestirIntegrateSet), "vol restir integrate set failed");
+
+            VkDescriptorBufferInfo cameraInfo{};
+            cameraInfo.buffer = g_cameraUboBuffer;
+            cameraInfo.offset = 0u;
+            cameraInfo.range = sizeof(CameraUBO);
+
+            VkDescriptorBufferInfo lightInfo{};
+            lightInfo.buffer = g_localLightGpuBuffer;
+            lightInfo.offset = 0u;
+            lightInfo.range = VK_WHOLE_SIZE;
+
+            VkDescriptorBufferInfo gridInfo{};
+            gridInfo.buffer = g_localLightGridGpuBuffer;
+            gridInfo.offset = 0u;
+            gridInfo.range = VK_WHOLE_SIZE;
+
+            VkDescriptorImageInfo reservoirInfo{};
+            reservoirInfo.imageView = g_volReservoirView[1];
+            reservoirInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkDescriptorImageInfo radianceInfo{};
+            radianceInfo.imageView = g_volRadianceView[0];
+            radianceInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            // SH 的 prev/cur view（age 复用 g_volAgeView）。
+            VkDescriptorImageInfo shShYPrevInfo{};
+            shShYPrevInfo.imageView = g_volShYView[1];
+            shShYPrevInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            VkDescriptorImageInfo shCoCgPrevInfo{};
+            shCoCgPrevInfo.imageView = g_volShCoCgView[1];
+            shCoCgPrevInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            VkDescriptorImageInfo shAgePrevInfo{};
+            shAgePrevInfo.imageView = g_volAgeView[1];
+            shAgePrevInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            VkDescriptorImageInfo shYCurInfo{};
+            shYCurInfo.imageView = g_volShYView[0];
+            shYCurInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            VkDescriptorImageInfo shCoCgCurInfo{};
+            shCoCgCurInfo.imageView = g_volShCoCgView[0];
+            shCoCgCurInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            VkDescriptorImageInfo shAgeCurInfo{};
+            shAgeCurInfo.imageView = g_volAgeView[0];
+            shAgeCurInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkWriteDescriptorSetAccelerationStructureKHR tlasWrite{
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR
+            };
+            tlasWrite.accelerationStructureCount = 1u;
+            tlasWrite.pAccelerationStructures = &g_tlas;
+
+            VkWriteDescriptorSet writes[12]{};
+            for(uint32_t i = 0u; i < 12u; ++i)
+            {
+                writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[i].dstSet = g_volRestirIntegrateSet;
+                writes[i].descriptorCount = 1u;
+            }
+
+            writes[5].dstBinding = 16u;
+            writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[5].pImageInfo = &shShYPrevInfo;
+            writes[6].dstBinding = 17u;
+            writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[6].pImageInfo = &shCoCgPrevInfo;
+            writes[7].dstBinding = 18u;
+            writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[7].pImageInfo = &shAgePrevInfo;
+            writes[8].dstBinding = 19u;
+            writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[8].pImageInfo = &shYCurInfo;
+            writes[9].dstBinding = 20u;
+            writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[9].pImageInfo = &shCoCgCurInfo;
+            writes[10].dstBinding = 21u;
+            writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[10].pImageInfo = &shAgeCurInfo;
+            writes[11].dstBinding = 22u;
+            writes[11].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+            writes[11].pNext = &tlasWrite;
+            writes[0].dstBinding = 0u;
+            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            writes[0].pBufferInfo = &cameraInfo;
+            writes[1].dstBinding = 1u;
+            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[1].pImageInfo = &reservoirInfo;
+            writes[2].dstBinding = 12u;
+            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[2].pBufferInfo = &lightInfo;
+            writes[3].dstBinding = 13u;
+            writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[3].pBufferInfo = &gridInfo;
+            writes[4].dstBinding = 15u;
+            writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[4].pImageInfo = &radianceInfo;
+
+            vkGuardUpdate(12u, writes, "vol");
+
+            g_volRestirBoundIntegrateLightBuffer = g_localLightGpuBuffer;
+            g_volRestirBoundIntegrateGridBuffer = g_localLightGridGpuBuffer;
+            g_volRestirBoundIntegrateTlas = g_tlas;
+
+            VkPushConstantRange pushRange{};
+            pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            pushRange.offset = 0u;
+            pushRange.size = sizeof(VolRestirIntegratePushConstants);
+
+            VkPipelineLayoutCreateInfo pipelineLayoutInfo{
+                VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+            };
+            pipelineLayoutInfo.setLayoutCount = 1u;
+            pipelineLayoutInfo.pSetLayouts = &g_volRestirIntegrateSetLayout;
+            pipelineLayoutInfo.pushConstantRangeCount = 1u;
+            pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+            check(vkCreatePipelineLayout(g_device, &pipelineLayoutInfo, nullptr,
+                &g_volRestirIntegratePipelineLayout), "vol restir integrate layout failed");
+
+            const std::vector<uint8_t> code = loadSpv("shaders/vol_restir_integrate.comp.spv");
+            VkShaderModule module = createShaderModule(g_device, code);
+            VkPipelineShaderStageCreateInfo stage{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+            };
+            stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            stage.module = module;
+            stage.pName = "main";
+            VkComputePipelineCreateInfo pipelineInfo{
+                VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+            };
+            pipelineInfo.stage = stage;
+            pipelineInfo.layout = g_volRestirIntegratePipelineLayout;
+            const VkResult result = vkCreateComputePipelines(g_device,
+                getSharedPipelineCache(), 1u, &pipelineInfo, nullptr,
+                &g_volRestirIntegratePipeline);
+            vkDestroyShaderModule(g_device, module, nullptr);
+            check(result, "vol restir integrate pipeline failed");
+
+            RTLog("[VOL RESTIR] vol restir integrate pipeline ok");
+        }
+
+        // ---------------- composite ----------------
+        {
+            VkDescriptorSetLayoutBinding bindings[4]{};
+            bindings[0] = { 0u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[1] = { 1u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[2] = { 2u, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[3] = { 3u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+
+            VkDescriptorSetLayoutCreateInfo layoutInfo{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+            };
+            layoutInfo.bindingCount = 4u;
+            layoutInfo.pBindings = bindings;
+            check(vkCreateDescriptorSetLayout(g_device, &layoutInfo, nullptr,
+                &g_volRestirCompositeSetLayout), "vol restir composite set layout failed");
+
+            VkDescriptorPoolSize poolSizes[3] = {
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u },
+                { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2u },
+                { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u }
+            };
+            VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            poolInfo.maxSets = 1u;
+            poolInfo.poolSizeCount = 3u;
+            poolInfo.pPoolSizes = poolSizes;
+            check(vkCreateDescriptorPool(g_device, &poolInfo, nullptr,
+                &g_volRestirCompositeDescriptorPool), "vol restir composite pool failed");
+
+            VkDescriptorSetAllocateInfo allocateInfo{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+            };
+            allocateInfo.descriptorPool = g_volRestirCompositeDescriptorPool;
+            allocateInfo.descriptorSetCount = 1u;
+            allocateInfo.pSetLayouts = &g_volRestirCompositeSetLayout;
+            check(vkAllocateDescriptorSets(g_device, &allocateInfo,
+                &g_volRestirCompositeSet), "vol restir composite set failed");
+
+            VkDescriptorBufferInfo cameraInfo{};
+            cameraInfo.buffer = g_cameraUboBuffer;
+            cameraInfo.offset = 0u;
+            cameraInfo.range = sizeof(CameraUBO);
+
+            // 深度图在 DLSS 前置阶段一直是 GENERAL（rgen 当 storage image 用）。
+            // 2026-10-26：COMBINED_IMAGE_SAMPLER 必须有 sampler，否则 vkGuard 打出
+            // "vol binding 1 NULL sampler" 并丢掉整条写入 ⇒ 屏幕合成的场景深度空。
+            VkDescriptorImageInfo depthInfo{};
+            depthInfo.sampler = volDepthSampler();
+            depthInfo.imageView = g_dlssDepthView;
+            depthInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            // froxel 辐亮度：integrate 写完后由本 pass 采样。复用云的 shape 采样器
+            // （linear + clamp to edge，正是 3D 查找需要的状态）。
+            VkDescriptorImageInfo radianceInfo{};
+            radianceInfo.sampler = g_cloudShapeNoiseSampler;
+            radianceInfo.imageView = g_volRadianceView[0];
+            radianceInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkDescriptorImageInfo outputInfo{};
+            outputInfo.imageView = g_godRayTargetView;
+            outputInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkWriteDescriptorSet writes[4]{};
+            for(uint32_t i = 0u; i < 4u; ++i)
+            {
+                writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[i].dstSet = g_volRestirCompositeSet;
+                writes[i].descriptorCount = 1u;
+            }
+            writes[0].dstBinding = 0u;
+            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            writes[0].pBufferInfo = &cameraInfo;
+            writes[1].dstBinding = 1u;
+            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[1].pImageInfo = &depthInfo;
+            writes[2].dstBinding = 2u;
+            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[2].pImageInfo = &radianceInfo;
+            writes[3].dstBinding = 3u;
+            writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[3].pImageInfo = &outputInfo;
+
+            vkGuardUpdate(4u, writes, "vol");
+
+            VkPushConstantRange pushRange{};
+            pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            pushRange.offset = 0u;
+            pushRange.size = sizeof(VolRestirCompositePushConstants);
+
+            VkPipelineLayoutCreateInfo pipelineLayoutInfo{
+                VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+            };
+            pipelineLayoutInfo.setLayoutCount = 1u;
+            pipelineLayoutInfo.pSetLayouts = &g_volRestirCompositeSetLayout;
+            pipelineLayoutInfo.pushConstantRangeCount = 1u;
+            pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+            check(vkCreatePipelineLayout(g_device, &pipelineLayoutInfo, nullptr,
+                &g_volRestirCompositePipelineLayout), "vol restir composite layout failed");
+
+            const std::vector<uint8_t> code = loadSpv("shaders/vol_restir_composite.comp.spv");
+            VkShaderModule module = createShaderModule(g_device, code);
+            VkPipelineShaderStageCreateInfo stage{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+            };
+            stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            stage.module = module;
+            stage.pName = "main";
+            VkComputePipelineCreateInfo pipelineInfo{
+                VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+            };
+            pipelineInfo.stage = stage;
+            pipelineInfo.layout = g_volRestirCompositePipelineLayout;
+            const VkResult result = vkCreateComputePipelines(g_device,
+                getSharedPipelineCache(), 1u, &pipelineInfo, nullptr,
+                &g_volRestirCompositePipeline);
+            vkDestroyShaderModule(g_device, module, nullptr);
+            check(result, "vol restir composite pipeline failed");
+
+            RTLog("[VOL RESTIR] vol restir composite pipeline ok");
+        }
+
+        RTLog("[VOL RESTIR] integrate + composite pipelines ready");
+    }
+    catch(const std::exception& error)
+    {
+        g_volRestirPipelineFailed = true;
+        RTLog(std::string("[VOL RESTIR] output pipeline unavailable: ") + error.what());
+    }
+}
+
+// S3b：可见性 pass 的描述符与管线。TLAS 首帧可能还没建好，因此每次录制时
+// 尝试一次（g_tlas 就绪后自然建起）；失败一次就置 g_volRestirPipelineFailed。
+static void createVolumeRestirVisibilityPipeline()
+{
+    if(g_volRestirVisibilityPipeline != VK_NULL_HANDLE || g_volRestirPipelineFailed)
+    {
+        return;
+    }
+    if(g_tlas == VK_NULL_HANDLE || g_volReservoirView[1] == VK_NULL_HANDLE ||
+       g_localLightGpuBuffer == VK_NULL_HANDLE || g_localLightGridGpuBuffer == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    try
+    {
+        VkDescriptorSetLayoutBinding bindings[5]{};
+        bindings[0] = { 0u, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u,
+            VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        bindings[1] = { 1u, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u,
+            VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        bindings[2] = { 2u, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1u,
+            VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        bindings[3] = { 12u, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u,
+            VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+        bindings[4] = { 13u, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u,
+            VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+
+        VkDescriptorSetLayoutCreateInfo layoutInfo{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+        };
+        layoutInfo.bindingCount = 5u;
+        layoutInfo.pBindings = bindings;
+        check(vkCreateDescriptorSetLayout(g_device, &layoutInfo, nullptr,
+            &g_volRestirVisibilitySetLayout), "vol restir visibility set layout failed");
+
+        VkDescriptorPoolSize poolSizes[3] = {
+            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u },
+            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2u },
+            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1u }
+        };
+        VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolInfo.maxSets = 1u;
+        poolInfo.poolSizeCount = 3u;
+        poolInfo.pPoolSizes = poolSizes;
+        check(vkCreateDescriptorPool(g_device, &poolInfo, nullptr,
+            &g_volRestirVisibilityDescriptorPool), "vol restir visibility pool failed");
+
+        VkDescriptorSetAllocateInfo allocateInfo{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+        };
+        allocateInfo.descriptorPool = g_volRestirVisibilityDescriptorPool;
+        allocateInfo.descriptorSetCount = 1u;
+        allocateInfo.pSetLayouts = &g_volRestirVisibilitySetLayout;
+        check(vkAllocateDescriptorSets(g_device, &allocateInfo,
+            &g_volRestirVisibilitySet), "vol restir visibility set failed");
+
+        VkDescriptorBufferInfo cameraInfo{};
+        cameraInfo.buffer = g_cameraUboBuffer;
+        cameraInfo.offset = 0u;
+        cameraInfo.range = sizeof(CameraUBO);
+
+        VkDescriptorBufferInfo lightInfo{};
+        lightInfo.buffer = g_localLightGpuBuffer;
+        lightInfo.offset = 0u;
+        lightInfo.range = VK_WHOLE_SIZE;
+
+        VkDescriptorBufferInfo gridInfo{};
+        gridInfo.buffer = g_localLightGridGpuBuffer;
+        gridInfo.offset = 0u;
+        gridInfo.range = VK_WHOLE_SIZE;
+
+        VkDescriptorImageInfo reservoirInfo{};
+        reservoirInfo.imageView = g_volReservoirView[1];
+        reservoirInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSetAccelerationStructureKHR tlasWrite{
+            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR
+        };
+        tlasWrite.accelerationStructureCount = 1u;
+        tlasWrite.pAccelerationStructures = &g_tlas;
+
+        VkWriteDescriptorSet writes[5]{};
+        for(uint32_t i = 0u; i < 5u; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = g_volRestirVisibilitySet;
+            writes[i].descriptorCount = 1u;
+        }
+        writes[0].dstBinding = 0u;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].pBufferInfo = &cameraInfo;
+        writes[1].dstBinding = 1u;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[1].pImageInfo = &reservoirInfo;
+        writes[2].dstBinding = 2u;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        writes[2].pNext = &tlasWrite;
+        writes[3].dstBinding = 12u;
+        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[3].pBufferInfo = &lightInfo;
+        writes[4].dstBinding = 13u;
+        writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[4].pBufferInfo = &gridInfo;
+
+        vkGuardUpdate(5u, writes, "vol");
+
+        // 记账：这几个句柄一旦被会话内换掉，record 侧要能发现（见 P3）。
+        g_volRestirBoundVisibilityTlas = g_tlas;
+        g_volRestirBoundVisibilityLightBuffer = g_localLightGpuBuffer;
+        g_volRestirBoundVisibilityGridBuffer = g_localLightGridGpuBuffer;
+
+        VkPushConstantRange pushRange{};
+        pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pushRange.offset = 0u;
+        pushRange.size = sizeof(VolRestirIntegratePushConstants);
+
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo{
+            VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+        };
+        pipelineLayoutInfo.setLayoutCount = 1u;
+        pipelineLayoutInfo.pSetLayouts = &g_volRestirVisibilitySetLayout;
+        pipelineLayoutInfo.pushConstantRangeCount = 1u;
+        pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+        check(vkCreatePipelineLayout(g_device, &pipelineLayoutInfo, nullptr,
+            &g_volRestirVisibilityPipelineLayout), "vol restir visibility layout failed");
+
+        const std::vector<uint8_t> code =
+            loadSpv("shaders/vol_restir_visibility.comp.spv");
+        VkShaderModule module = createShaderModule(g_device, code);
+        VkPipelineShaderStageCreateInfo stage{
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+        };
+        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        stage.module = module;
+        stage.pName = "main";
+        VkComputePipelineCreateInfo pipelineInfo{
+            VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+        };
+        pipelineInfo.stage = stage;
+        pipelineInfo.layout = g_volRestirVisibilityPipelineLayout;
+        const VkResult result = vkCreateComputePipelines(g_device,
+            getSharedPipelineCache(), 1u, &pipelineInfo, nullptr,
+            &g_volRestirVisibilityPipeline);
+        vkDestroyShaderModule(g_device, module, nullptr);
+        check(result, "vol restir visibility pipeline failed");
+
+        RTLog("[VOL RESTIR] vol restir visibility pipeline ok");
+
+        RTLog("[VOL RESTIR] visibility pipeline ready");
+    }
+    catch(const std::exception& error)
+    {
+        g_volRestirPipelineFailed = true;
+        RTLog(std::string("[VOL RESTIR] visibility pipeline unavailable: ") + error.what());
+    }
+}
+
+// S3b：可见性 dispatch。网格与 spatial 相同（restir 尺寸）。
+static void recordVolumeRestirVisibility(VkCommandBuffer cmd)
+{
+    if(g_volRestirVisibilityPipeline == VK_NULL_HANDLE ||
+       g_volRestirVisibilitySet == VK_NULL_HANDLE ||
+       g_volRestirW == 0u || g_volRestirH == 0u)
+    {
+        return;
+    }
+
+    // TLAS 正在重建（parkTlasStorage 已把 g_tlas 置空）：描述符里此刻是已销毁的
+    // 句柄，派发上线等于拿一棵已释放的加速结构做 ray query ⇒ 本帧直接跳过。
+    // 保留上一帧的 reservoir 不动，比"整帧判成全可见"安全得多。
+    if(g_tlas == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    // 句柄身份变了就重写 binding 2/12/13（原因见文件头的记账声明）。
+    if(g_volRestirBoundVisibilityTlas != g_tlas ||
+       g_volRestirBoundVisibilityLightBuffer != g_localLightGpuBuffer ||
+       g_volRestirBoundVisibilityGridBuffer != g_localLightGridGpuBuffer)
+    {
+        VkDescriptorBufferInfo lightInfo{};
+        lightInfo.buffer = g_localLightGpuBuffer;
+        lightInfo.offset = 0u;
+        lightInfo.range = VK_WHOLE_SIZE;
+
+        VkDescriptorBufferInfo gridInfo{};
+        gridInfo.buffer = g_localLightGridGpuBuffer;
+        gridInfo.offset = 0u;
+        gridInfo.range = VK_WHOLE_SIZE;
+
+        VkWriteDescriptorSetAccelerationStructureKHR tlasWrite{
+            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR
+        };
+        tlasWrite.accelerationStructureCount = 1u;
+        tlasWrite.pAccelerationStructures = &g_tlas;
+
+        VkWriteDescriptorSet writes[3]{};
+        for(uint32_t i = 0u; i < 3u; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = g_volRestirVisibilitySet;
+            writes[i].descriptorCount = 1u;
+        }
+        writes[0].dstBinding = 2u;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        writes[0].pNext = &tlasWrite;
+        writes[1].dstBinding = 12u;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].pBufferInfo = &lightInfo;
+        writes[2].dstBinding = 13u;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[2].pBufferInfo = &gridInfo;
+
+        vkGuardUpdate(3u, writes, "vol");
+
+        g_volRestirBoundVisibilityTlas = g_tlas;
+        g_volRestirBoundVisibilityLightBuffer = g_localLightGpuBuffer;
+        g_volRestirBoundVisibilityGridBuffer = g_localLightGridGpuBuffer;
+    }
+
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = g_volReservoirImage[1];
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.levelCount = 1u;
+    barrier.subresourceRange.layerCount = 1u;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+        0u, nullptr, 0u, nullptr, 1u, &barrier);
+
+    VolRestirIntegratePushConstants pushConstants{};
+    pushConstants.froxelSize[0] = static_cast<int32_t>(g_volFroxelW);
+    pushConstants.froxelSize[1] = static_cast<int32_t>(g_volFroxelH);
+    pushConstants.froxelSize[2] = static_cast<int32_t>(VOL_RESTIR_DEPTH);
+    pushConstants.froxelSize[3] = static_cast<int32_t>(VOL_RESTIR_DOWNSCALE);
+    pushConstants.volumeParams[0] = VOL_RESTIR_MAX_DISTANCE;
+    pushConstants.volumeParams[1] = VOL_RESTIR_DEPTH_EXPONENT;
+    pushConstants.volumeParams[2] = 0.0f;
+    pushConstants.volumeParams[3] = 0.0f;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_volRestirVisibilityPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_volRestirVisibilityPipelineLayout, 0u, 1u, &g_volRestirVisibilitySet, 0u, nullptr);
+    vkCmdPushConstants(cmd, g_volRestirVisibilityPipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(VolRestirIntegratePushConstants), &pushConstants);
+    vkCmdDispatch(cmd,
+        (g_volRestirW + 7u) / 8u,
+        (g_volRestirH + 7u) / 8u,
+        VOL_RESTIR_DEPTH);
+}
+
+// S4：froxel 入散射。dispatch 尺寸是 **froxel** 网格（不是 restir 网格）。
+static void recordVolumeRestirIntegrate(VkCommandBuffer cmd)
+{
+    if(g_volRestirIntegratePipeline == VK_NULL_HANDLE || g_volRestirIntegrateSet == VK_NULL_HANDLE ||
+       g_volFroxelW == 0u || g_volFroxelH == 0u)
+    {
+        return;
+    }
+
+    // TLAS 正在重建：本帧不重算（保留上一帧的 radiance 与 SH）。这一帧派出去的
+    // NEE 射线会打在已销毁的加速结构上，比"晚一帧"危险得多。
+    if(g_tlas == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    // 灯表/网格重建、或 TLAS 换了句柄后重写 12/13/22。integrate 按
+    // reservoir.lightIndex 查灯的位置与发光等级（读已释放缓冲会得到垃圾灯位 ⇒
+    // 辐亮度画到完全不相关的位置），并用 binding 22 做每 froxel 的 NEE 可见性
+    // （旧句柄 ⇒ 射线打在已释放的加速结构上 ⇒ 遮挡失效、隔墙漏光）。
+    if(g_volRestirBoundIntegrateLightBuffer != g_localLightGpuBuffer ||
+       g_volRestirBoundIntegrateGridBuffer != g_localLightGridGpuBuffer ||
+       g_volRestirBoundIntegrateTlas != g_tlas)
+    {
+        VkDescriptorBufferInfo lightInfo{};
+        lightInfo.buffer = g_localLightGpuBuffer;
+        lightInfo.offset = 0u;
+        lightInfo.range = VK_WHOLE_SIZE;
+
+        VkDescriptorBufferInfo gridInfo{};
+        gridInfo.buffer = g_localLightGridGpuBuffer;
+        gridInfo.offset = 0u;
+        gridInfo.range = VK_WHOLE_SIZE;
+
+        VkWriteDescriptorSetAccelerationStructureKHR tlasWrite{
+            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR
+        };
+        tlasWrite.accelerationStructureCount = 1u;
+        tlasWrite.pAccelerationStructures = &g_tlas;
+
+        VkWriteDescriptorSet writes[3]{};
+        for(uint32_t i = 0u; i < 3u; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = g_volRestirIntegrateSet;
+            writes[i].descriptorCount = 1u;
+        }
+        writes[0].dstBinding = 12u;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[0].pBufferInfo = &lightInfo;
+        writes[1].dstBinding = 13u;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].pBufferInfo = &gridInfo;
+        writes[2].dstBinding = 22u;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        writes[2].pNext = &tlasWrite;
+
+        vkGuardUpdate(3u, writes, "vol");
+
+        g_volRestirBoundIntegrateLightBuffer = g_localLightGpuBuffer;
+        g_volRestirBoundIntegrateGridBuffer = g_localLightGridGpuBuffer;
+        g_volRestirBoundIntegrateTlas = g_tlas;
+    }
+
+    VkImageMemoryBarrier barriers[2]{};
+    for(uint32_t i = 0u; i < 2u; ++i)
+    {
+        VkImageMemoryBarrier& barrier = barriers[i];
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1u;
+        barrier.subresourceRange.layerCount = 1u;
+    }
+    barriers[0].image = g_volReservoirImage[1];
+    barriers[1].image = g_volRadianceImage[0];
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+        0u, nullptr, 0u, nullptr, 2u, barriers);
+
+    VolRestirIntegratePushConstants pushConstants{};
+    pushConstants.froxelSize[0] = static_cast<int32_t>(g_volFroxelW);
+    pushConstants.froxelSize[1] = static_cast<int32_t>(g_volFroxelH);
+    pushConstants.froxelSize[2] = static_cast<int32_t>(VOL_RESTIR_DEPTH);
+    pushConstants.froxelSize[3] = static_cast<int32_t>(VOL_RESTIR_DOWNSCALE);
+    pushConstants.volumeParams[0] = VOL_RESTIR_MAX_DISTANCE;
+    pushConstants.volumeParams[1] = VOL_RESTIR_DEPTH_EXPONENT;
+    pushConstants.volumeParams[2] = 0.0f;
+    pushConstants.volumeParams[3] = 0.0f;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_volRestirIntegratePipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_volRestirIntegratePipelineLayout, 0u, 1u, &g_volRestirIntegrateSet, 0u, nullptr);
+    vkCmdPushConstants(cmd, g_volRestirIntegratePipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(VolRestirIntegratePushConstants), &pushConstants);
+    vkCmdDispatch(cmd,
+        (g_volFroxelW + 7u) / 8u,
+        (g_volFroxelH + 7u) / 8u,
+        VOL_RESTIR_DEPTH);
+
+    // 写出的辐亮度随后由屏幕积分采样。
+    VkImageMemoryBarrier readBarrier{};
+    readBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    readBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    readBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    readBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    readBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    readBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    readBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    readBarrier.image = g_volRadianceImage[0];
+    readBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    readBarrier.subresourceRange.levelCount = 1u;
+    readBarrier.subresourceRange.layerCount = 1u;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+        0u, nullptr, 0u, nullptr, 1u, &readBarrier);
+
+    // ---------------------------------------------------------------
+    // 2026-10-27：SH 的 ping-pong（[0] 本帧 -> [1] 上一帧）
+    //
+    // 首帧 [1] 是未初始化显存，必须先清 0：age 一旦是垃圾值，
+    // `newHistoryAge = min(oldAge + 1, 128)` 会直接饱和 ⇒ 权重固定 1/133，
+    // 旧 SH 的垃圾值会以 1/133 的比例长期残留（Remix 起手 age = 0）。
+    // ---------------------------------------------------------------
+    {
+        VkImageSubresourceRange shRange{};
+        shRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        shRange.baseMipLevel = 0u;
+        shRange.levelCount = 1u;
+        shRange.baseArrayLayer = 0u;
+        shRange.layerCount = 1u;
+
+        VkClearColorValue shZero{};
+        shZero.float32[0] = 0.0f;
+        shZero.float32[1] = 0.0f;
+        shZero.float32[2] = 0.0f;
+        shZero.float32[3] = 0.0f;
+
+        VkImageMemoryBarrier shPrepare[3]{};
+        for(uint32_t i = 0u; i < 3u; ++i)
+        {
+            shPrepare[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            shPrepare[i].srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            shPrepare[i].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            shPrepare[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            shPrepare[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            shPrepare[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            shPrepare[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            shPrepare[i].subresourceRange = shRange;
+        }
+        shPrepare[0].image = g_volShYImage[0];
+        shPrepare[1].image = g_volShCoCgImage[0];
+        shPrepare[2].image = g_volAgeImage[0];
+
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0u,
+            0u, nullptr, 0u, nullptr, 3u, shPrepare);
+
+        if(g_volShNeedsInit)
+        {
+            vkCmdClearColorImage(cmd, g_volShYImage[1], VK_IMAGE_LAYOUT_GENERAL,
+                &shZero, 1u, &shRange);
+            vkCmdClearColorImage(cmd, g_volShCoCgImage[1], VK_IMAGE_LAYOUT_GENERAL,
+                &shZero, 1u, &shRange);
+            vkCmdClearColorImage(cmd, g_volAgeImage[1], VK_IMAGE_LAYOUT_GENERAL,
+                &shZero, 1u, &shRange);
+            g_volShNeedsInit = false;
+        }
+
+        VkImageCopy shRegion{};
+        shRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
+        shRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
+        shRegion.extent.width = g_volFroxelW;
+        shRegion.extent.height = g_volFroxelH;
+        shRegion.extent.depth = VOL_RESTIR_DEPTH;
+
+        vkCmdCopyImage(cmd, g_volShYImage[0], VK_IMAGE_LAYOUT_GENERAL,
+            g_volShYImage[1], VK_IMAGE_LAYOUT_GENERAL, 1u, &shRegion);
+        vkCmdCopyImage(cmd, g_volShCoCgImage[0], VK_IMAGE_LAYOUT_GENERAL,
+            g_volShCoCgImage[1], VK_IMAGE_LAYOUT_GENERAL, 1u, &shRegion);
+        vkCmdCopyImage(cmd, g_volAgeImage[0], VK_IMAGE_LAYOUT_GENERAL,
+            g_volAgeImage[1], VK_IMAGE_LAYOUT_GENERAL, 1u, &shRegion);
+
+        VkImageMemoryBarrier shDone[3]{};
+        for(uint32_t i = 0u; i < 3u; ++i)
+        {
+            shDone[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            shDone[i].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            shDone[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            shDone[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            shDone[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            shDone[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            shDone[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            shDone[i].subresourceRange = shRange;
+        }
+        shDone[0].image = g_volShYImage[1];
+        shDone[1].image = g_volShCoCgImage[1];
+        shDone[2].image = g_volAgeImage[1];
+
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+            0u, nullptr, 0u, nullptr, 3u, shDone);
+    }
+}
+
+// S4：屏幕积分，输出到 g_godRayTargetImage（随后由 god_ray_composite 做
+// scene * a + rgb）。**必须**排在旧体积光之后调用，否则会被它写的"中性值"覆盖。
+static void recordVolumeRestirScreenComposite(VkCommandBuffer cmd)
+{
+    if(cmd == VK_NULL_HANDLE || volRestirEnabled() == 0u)
+    {
+        return;
+    }
+    if(g_volRestirCompositePipeline == VK_NULL_HANDLE || g_volRestirCompositeSet == VK_NULL_HANDLE ||
+       g_godRayWidth == 0u || g_godRayHeight == 0u || g_godRayTargetImage == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkImageMemoryBarrier targetBarrier{};
+    targetBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    targetBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    targetBarrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    targetBarrier.oldLayout = g_godRayTargetLayout;
+    targetBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    targetBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    targetBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    targetBarrier.image = g_godRayTargetImage;
+    targetBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    targetBarrier.subresourceRange.levelCount = 1u;
+    targetBarrier.subresourceRange.layerCount = 1u;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+        0u, nullptr, 0u, nullptr, 1u, &targetBarrier);
+
+    VolRestirCompositePushConstants pushConstants{};
+    pushConstants.params[0] = VOL_RESTIR_MAX_DISTANCE;
+    pushConstants.params[1] = VOL_RESTIR_DEPTH_EXPONENT;
+    pushConstants.params[2] = static_cast<float>(VOL_RESTIR_COMPOSITE_STEPS);
+    pushConstants.params[3] = VOL_RESTIR_EXTINCTION_SCALE;
+    pushConstants.grid[0] = static_cast<int32_t>(g_volFroxelW);
+    pushConstants.grid[1] = static_cast<int32_t>(g_volFroxelH);
+    pushConstants.grid[2] = static_cast<int32_t>(VOL_RESTIR_DEPTH);
+    pushConstants.grid[3] = 0;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_volRestirCompositePipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_volRestirCompositePipelineLayout, 0u, 1u, &g_volRestirCompositeSet, 0u, nullptr);
+    vkCmdPushConstants(cmd, g_volRestirCompositePipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(VolRestirCompositePushConstants), &pushConstants);
+    vkCmdDispatch(cmd,
+        (g_godRayWidth + 7u) / 8u,
+        (g_godRayHeight + 7u) / 8u,
+        1u);
+
+    g_godRayTargetLayout = VK_IMAGE_LAYOUT_GENERAL;
+}
+
+// S2：INITIAL 阶段 dispatch。S3 起在其后接 temporal / spatial。
+static void recordVolumeRestir(VkCommandBuffer cmd, uint32_t renderWidth, uint32_t renderHeight)
+{
+    if(cmd == VK_NULL_HANDLE || volRestirEnabled() == 0u)
+    {
+        return;
+    }
+
+    createVolumeRestirResources(renderWidth, renderHeight);
+    createVolumeRestirPipeline();
+
+    if(g_volRestirPipeline == VK_NULL_HANDLE || g_volRestirSet == VK_NULL_HANDLE ||
+       g_volRestirW == 0u || g_volRestirH == 0u)
+    {
+        return;
+    }
+
+    // 灯表/网格 buffer 重建后（灯数增长）重写 binding 12/13。destroy 路径在
+    // 28394 附近已经等过队列空闲，此处更新不会与在途帧竞争。
+    if(g_volRestirBoundLightBuffer != g_localLightGpuBuffer ||
+       g_volRestirBoundGridBuffer != g_localLightGridGpuBuffer)
+    {
+        VkDescriptorBufferInfo lightInfo{};
+        lightInfo.buffer = g_localLightGpuBuffer;
+        lightInfo.offset = 0u;
+        lightInfo.range = VK_WHOLE_SIZE;
+
+        VkDescriptorBufferInfo gridInfo{};
+        gridInfo.buffer = g_localLightGridGpuBuffer;
+        gridInfo.offset = 0u;
+        gridInfo.range = VK_WHOLE_SIZE;
+
+        VkWriteDescriptorSet writes[2]{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = g_volRestirSet;
+        writes[0].dstBinding = 12u;
+        writes[0].descriptorCount = 1u;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[0].pBufferInfo = &lightInfo;
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = g_volRestirSet;
+        writes[1].dstBinding = 13u;
+        writes[1].descriptorCount = 1u;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].pBufferInfo = &gridInfo;
+
+        vkGuardUpdate(2u, writes, "vol");
+
+        g_volRestirBoundLightBuffer = g_localLightGpuBuffer;
+        g_volRestirBoundGridBuffer = g_localLightGridGpuBuffer;
+    }
+
+    // 首次使用：两张 3D 图从 UNDEFINED 转到 GENERAL；之后同布局只做可见性同步。
+    VkImageMemoryBarrier imageBarriers[3]{};
+    for(uint32_t i = 0u; i < 3u; ++i)
+    {
+        VkImageMemoryBarrier& barrier = imageBarriers[i];
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcAccessMask = g_volRestirLayoutReady ? VK_ACCESS_SHADER_WRITE_BIT : 0u;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.oldLayout = g_volRestirLayoutReady
+            ? VK_IMAGE_LAYOUT_GENERAL
+            : VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1u;
+        barrier.subresourceRange.layerCount = 1u;
+    }
+    imageBarriers[0].image = g_volReservoirImage[0];
+    imageBarriers[1].image = g_volRadianceImage[0];
+    // S3：R1（上一帧最终结果）也要进 GENERAL —— temporal 会读它、spatial 会写它。
+    imageBarriers[2].image = g_volReservoirImage[1];
+
+    vkCmdPipelineBarrier(cmd,
+        g_volRestirLayoutReady
+            ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+            : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+        0u, nullptr, 0u, nullptr, 3u, imageBarriers);
+
+    g_volRestirLayoutReady = true;
+
+    VolRestirPushConstants pushConstants{};
+    pushConstants.froxelSize[0] = static_cast<int32_t>(g_volFroxelW);
+    pushConstants.froxelSize[1] = static_cast<int32_t>(g_volFroxelH);
+    pushConstants.froxelSize[2] = static_cast<int32_t>(VOL_RESTIR_DEPTH);
+    pushConstants.froxelSize[3] = static_cast<int32_t>(VOL_RESTIR_DOWNSCALE);
+    pushConstants.volumeParams[0] = VOL_RESTIR_MAX_DISTANCE;
+    pushConstants.volumeParams[1] = VOL_RESTIR_DEPTH_EXPONENT;
+    pushConstants.volumeParams[2] = 0.0f;
+    pushConstants.volumeParams[3] = 0.0f;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_volRestirPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        g_volRestirPipelineLayout, 0u, 1u, &g_volRestirSet, 0u, nullptr);
+    vkCmdPushConstants(cmd, g_volRestirPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+        0u, sizeof(VolRestirPushConstants), &pushConstants);
+
+    // local_size = 8x8x1，z 方向一层一个线程组（层数 = VOL_RESTIR_DEPTH）。
+    vkCmdDispatch(cmd,
+        (g_volRestirW + 7u) / 8u,
+        (g_volRestirH + 7u) / 8u,
+        VOL_RESTIR_DEPTH);
+
+    // 写出的两张图要等本 pass 完成才可被后续 pass 读（S3 起有消费者）。
+    VkImageMemoryBarrier readBarriers[2]{};
+    for(uint32_t i = 0u; i < 2u; ++i)
+    {
+        VkImageMemoryBarrier& barrier = readBarriers[i];
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1u;
+        barrier.subresourceRange.layerCount = 1u;
+    }
+    readBarriers[0].image = g_volReservoirImage[0];
+    readBarriers[1].image = g_volRadianceImage[0];
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+        0u, nullptr, 0u, nullptr, 2u, readBarriers);
+
+    // S3：temporal → spatial。管线没建起来（SPV 缺失）时自行返回。
+    createVolumeRestirChainPipelines();
+    recordVolumeRestirChain(cmd);
+
+    // S3b：可见性。必须排在 spatial（写 R1）之后、integrate（读 R1）之前。
+    createVolumeRestirVisibilityPipeline();
+    recordVolumeRestirVisibility(cmd);
+
+    // S4：froxel 入散射。屏幕积分不在这里 —— 它要排在云/旧体积光之后，
+    // 见 recordVolumeRestirScreenComposite 的调用点。
+    createVolumeRestirOutputPipelines();
+    recordVolumeRestirIntegrate(cmd);
+}
+
+
 static void destroyVolumetricCloudResources()
 {
     // 2026-10-17 修「动一下设置就卡死」：这个函数会销毁**云图 + 直方图 + 描述符池
@@ -41052,8 +46270,6 @@ static void destroyVolumetricCloudResources()
         }
     }
     if(g_volumetricCloudRenderPipelineV3) vkDestroyPipeline(g_device, g_volumetricCloudRenderPipelineV3, nullptr);
-    if(g_volumetricCloudRenderPipelineV2) vkDestroyPipeline(g_device, g_volumetricCloudRenderPipelineV2, nullptr);
-    if(g_volumetricCloudRenderPipeline) vkDestroyPipeline(g_device, g_volumetricCloudRenderPipeline, nullptr);
     if(g_volumetricCloudResolvePipeline) vkDestroyPipeline(g_device, g_volumetricCloudResolvePipeline, nullptr);
     if(g_volumetricCloudCompositePipeline) vkDestroyPipeline(g_device, g_volumetricCloudCompositePipeline, nullptr);
     if(g_volumetricLightPipeline) vkDestroyPipeline(g_device, g_volumetricLightPipeline, nullptr);
@@ -41129,8 +46345,6 @@ static void destroyVolumetricCloudResources()
     g_volumetricCloudRenderPipelineLayout = VK_NULL_HANDLE;
     g_volumetricCloudResolvePipelineLayout = VK_NULL_HANDLE;
     g_volumetricCloudCompositePipelineLayout = VK_NULL_HANDLE;
-    g_volumetricCloudRenderPipeline = VK_NULL_HANDLE;
-    g_volumetricCloudRenderPipelineV2 = VK_NULL_HANDLE;
     g_volumetricCloudRenderPipelineV3 = VK_NULL_HANDLE;
     g_volumetricCloudResolvePipeline = VK_NULL_HANDLE;
     g_volumetricCloudCompositePipeline = VK_NULL_HANDLE;
@@ -44063,8 +49277,75 @@ static void createWaterCausticMapResources()
     }
 }
 
+// ===========================================================================
+// 2026-10-28 焦散图独立时钟（ORION_WATER_CAUSTIC_HZ）
+//
+// 为什么：这条链原本只能跟着 FFT 的 30 Hz 时钟跑（g_waterFftUpdatedThisFrame），
+// 而"帧越慢 ⇒ 每帧都命中 30 Hz 节拍 ⇒ 每帧都重建"会把帧时间钉在 ~30 ms。
+// 实测（2026-10-28 水边一局，perf/step0/perf-20261028-moving_*.log）：
+// 焦散图重建 5.82 ms = 整帧 21%，与主 RayGen 12.6 ms 同级，而当时 FFT 只有
+// 0.07 ms、水面波方程模拟 ≈0 —— 整条水链的开销几乎全在这一张图上。
+//
+// 取值（与 docs/env-switches.md 的约定一致）：
+//   · 未设 / 空 ⇒ -1 = **不节流**，完全等于闸门上线前的行为（跟随 FFT 时钟）
+//   · >0        ⇒ 该频率上限（10 ⇒ 每 100 ms 最多重建一次）
+//   · 0         ⇒ 永不重建（保留已有图；进世界时图是清空的，水下会没有光斑）
+// 只读一次，改完必须重启客户端。
+// ===========================================================================
+static float waterCausticMapHz()
+{
+    static const float cached = []() -> float
+    {
+        const char* raw = std::getenv("ORION_WATER_CAUSTIC_HZ");
+
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return -1.0f;
+        }
+
+        const float value = static_cast<float>(std::atof(raw));
+
+        return value < 0.0f ? -1.0f : value;
+    }();
+
+    return cached;
+}
+
+// true = 本帧不重建。只在**真正要录**的位置调用（见 recordWaterCausticMap 的
+// 调用点），否则维度门/雨天门会白白消耗配额，雨停后要多等一个周期才更新。
+static bool waterCausticMapSkipThisFrame()
+{
+    const float hz = waterCausticMapHz();
+
+    if(hz < 0.0f)
+    {
+        return false;   // 未设：老行为，不参与节流
+    }
+
+    if(hz <= 0.0f)
+    {
+        return true;    // 0：整条跳过
+    }
+
+    static double s_lastSeconds = -1.0e9;
+
+    const double seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
+    if(seconds - s_lastSeconds < 1.0 / static_cast<double>(hz))
+    {
+        return true;
+    }
+
+    s_lastSeconds = seconds;
+
+    return false;
+}
+
+
 // 逐帧调度：只在 FFT 斜率图**本帧真的重写**时重建（同一 30 Hz 时钟）。
 // 2026-10-23：雨天直接跳过（见下面的雨天门）。
+// 2026-10-28：再叠一层 ORION_WATER_CAUSTIC_HZ 的独立时钟（默认不节流）。
 static void recordWaterCausticMap(VkCommandBuffer cmd)
 {
     const bool fftUpdated = g_waterFftUpdatedThisFrame;
@@ -44120,6 +49401,12 @@ static void recordWaterCausticMap(VkCommandBuffer cmd)
     sunZ /= sunLength;
     // 太阳在地平线下：消费端本身也不出焦散（sunDirection.y <= 0 早退）。
     if(sunY <= 0.0f)
+    {
+        return;
+    }
+
+    // 2026-10-28：独立时钟闸门放在所有前置门之后 —— 只有真的要录时才消耗配额。
+    if(waterCausticMapSkipThisFrame())
     {
         return;
     }
@@ -44337,6 +49624,888 @@ static void recordWaterCausticMap(VkCommandBuffer cmd)
         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
         0u, 0u, nullptr, 0u, nullptr, 1u, &consumeBarrier);
 }
+
+// 2026-10-26 21:1x 用户定档不要泡沫 ⇒ 本模块整块回退（源码屏蔽保留；
+// 复活时去掉这里的 #if 0，并恢复 b[73]/74、池 32、三处调用与 UBO 发布）。
+#if 0
+// ===========================================================================
+// 2026-10-26 持久泡沫图（路线 B，Crest Ocean 移植）
+//
+// 数据流（30 Hz tick）：
+//   FFT 斜率图（binding 59 同一张）──5 次采样──→ 雅可比白浪
+//   水模拟状态（binding 33 同一张）──5 次采样──→ 高度拉普拉斯交互波
+//   RT 上一帧（binding 74）──原子写覆盖率──→ r32ui 岸线注入图
+//                        ↓
+//   512² RGBA16F 泡沫图（2 层乒乓 · 6 级 mip）── .r = 泡沫量 [0,1]
+//                        ↓ mip 逐级 blit
+//   水面（rt_test.rgen）每像素 1 次 textureLod + 2 个噪声八度阈值化
+//
+// 不新增任何 BVH 射线；水像素只多 1 次采样 + ~16 ALU。
+// 失败策略与 FFT / 焦散图模块一致：**软失败** —— 任何异常只记日志并把本模块
+// 标记为不可用，绝不向上抛。
+// ===========================================================================
+constexpr uint32_t WATER_FOAM_RESOLUTION = 512u;
+constexpr uint32_t WATER_FOAM_LAYERS = 2u;
+// 512 → 16：6 级够覆盖远处足迹（水面采样把 LOD clamp 到 5），再多级没有消费者。
+constexpr uint32_t WATER_FOAM_MIPS = 6u;
+// 世界覆盖 192 格（玩家周围 ±96 格）。纹素 0.375 格 —— 比 FFT 基础层纹素
+// 0.5 格更细，白浪形状按波峰尺度落格；更远处泡沫细节本来就被 mip 滤掉。
+constexpr float WATER_FOAM_WORLD_SIZE = 192.0f;
+constexpr float WATER_FOAM_TEXEL_WORLD_SIZE =
+    WATER_FOAM_WORLD_SIZE / static_cast<float>(WATER_FOAM_RESOLUTION);
+constexpr uint32_t WATER_FOAM_LOCAL_SIZE = 16u;
+// Crest 的 _UpdateFoam 是逐帧；我们的白浪输入（FFT 斜率）本身就是 30 Hz ⇒
+// 泡沫图同频即可，帧慢时也不会把"每帧都跑"放大成悬崖。
+constexpr float WATER_FOAM_UPDATE_SECONDS = 1.0f / 30.0f;
+
+// 与 water_foam.comp 的 WaterFoamPush 逐字对应（6 × vec4 = 96 B）。
+struct WaterFoamPushConstants
+{
+    int32_t layersAndScroll[4]; // x 源层 / y 目标层 / z,w 源纹素滚动量
+    float timing[4];            // dt / 水模拟可用 / FFT 可用 / 重置
+    float simState[4];          // 模拟原点 xy / 模拟纹素 / 模拟读层
+    float foamFrame[4];         // 泡沫原点 xy / 泡沫纹素 / 泡沫上限
+    float knobs[4];             // 耗散率 / 白浪强度 / 白浪覆盖 / 交互强度
+    float knobs2[4];            // 岸线强度 / FFT 基础周期 / 细节周期 / 雅可比增益
+};
+static_assert(sizeof(WaterFoamPushConstants) == 96u,
+    "WaterFoamPushConstants must match the std430 layout of the GLSL push block");
+
+static VkImage g_waterFoamImage = VK_NULL_HANDLE;
+static VkDeviceMemory g_waterFoamMemory = VK_NULL_HANDLE;
+static VkImageView g_waterFoamView = VK_NULL_HANDLE;        // 2 层全 mip（binding 73）
+static VkImageView g_waterFoamStorageView = VK_NULL_HANDLE; // 2 层仅 mip0（compute）
+static VkSampler g_waterFoamSampler = VK_NULL_HANDLE;
+static VkImage g_waterFoamInjectionImage = VK_NULL_HANDLE;
+static VkDeviceMemory g_waterFoamInjectionMemory = VK_NULL_HANDLE;
+static VkImageView g_waterFoamInjectionView = VK_NULL_HANDLE; // mip0（binding 74）
+static VkDescriptorSetLayout g_waterFoamSetLayout = VK_NULL_HANDLE;
+static VkDescriptorPool g_waterFoamDescriptorPool = VK_NULL_HANDLE;
+static VkDescriptorSet g_waterFoamDescriptorSet = VK_NULL_HANDLE;
+static VkPipelineLayout g_waterFoamPipelineLayout = VK_NULL_HANDLE;
+static VkPipeline g_waterFoamPipeline = VK_NULL_HANDLE;
+static std::atomic<bool> g_waterFoamAvailable{false};
+static bool g_waterFoamLayoutReady = false;
+static uint32_t g_waterFoamReadLayer = 0u;
+static bool g_waterFoamOriginValid = false;
+static float g_waterFoamOriginX = 0.0f;
+static float g_waterFoamOriginZ = 0.0f;
+static std::chrono::steady_clock::time_point g_waterFoamLastUpdate{};
+static bool g_waterFoamLastUpdateValid = false;
+static bool g_waterFoamLoggedFirstDispatch = false;
+
+static bool waterFoamFeatureEnabled()
+{
+    static const bool cached = []() -> bool
+    {
+        const char* raw = std::getenv("ORION_WATER_FOAM");
+        if(raw == nullptr)
+        {
+            return true;
+        }
+        return std::atoi(raw) != 0;
+    }();
+    return cached;
+}
+
+// 把泡沫图绑到 RT set 的 binding 73（采样）/ 74（岸线注入）。创建成功后调用一次。
+static void updateWaterFoamRayDescriptor()
+{
+    if(g_rayTracingDescriptorSet == VK_NULL_HANDLE ||
+       g_waterFoamView == VK_NULL_HANDLE ||
+       g_waterFoamSampler == VK_NULL_HANDLE ||
+       g_waterFoamInjectionView == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkDescriptorImageInfo info[2]{};
+    info[0].sampler = g_waterFoamSampler;
+    info[0].imageView = g_waterFoamView;
+    info[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    info[1].imageView = g_waterFoamInjectionView;
+    info[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkWriteDescriptorSet writes[2]{};
+    for(uint32_t i = 0u; i < 2u; ++i)
+    {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = g_rayTracingDescriptorSet;
+        writes[i].dstBinding = 73u + i;
+        writes[i].descriptorCount = 1u;
+        writes[i].descriptorType = (i == 0u)
+            ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+            : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[i].pImageInfo = &info[i];
+    }
+    vkUpdateDescriptorSets(g_device, 2u, writes, 0u, nullptr);
+    RTLog("[WATER FOAM] foam map bound to RT bindings 73 (sample) / 74 (shore injection)");
+}
+
+static void destroyWaterFoamResources()
+{
+    g_waterFoamAvailable.store(false);
+    g_waterFoamLayoutReady = false;
+    g_waterFoamOriginValid = false;
+    if(g_waterFoamPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_waterFoamPipeline, nullptr);
+        g_waterFoamPipeline = VK_NULL_HANDLE;
+    }
+    if(g_waterFoamPipelineLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(g_device, g_waterFoamPipelineLayout, nullptr);
+        g_waterFoamPipelineLayout = VK_NULL_HANDLE;
+    }
+    if(g_waterFoamDescriptorPool != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorPool(g_device, g_waterFoamDescriptorPool, nullptr);
+        g_waterFoamDescriptorPool = VK_NULL_HANDLE;
+        g_waterFoamDescriptorSet = VK_NULL_HANDLE;
+    }
+    if(g_waterFoamSetLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(g_device, g_waterFoamSetLayout, nullptr);
+        g_waterFoamSetLayout = VK_NULL_HANDLE;
+    }
+    if(g_waterFoamSampler != VK_NULL_HANDLE)
+    {
+        vkDestroySampler(g_device, g_waterFoamSampler, nullptr);
+        g_waterFoamSampler = VK_NULL_HANDLE;
+    }
+    if(g_waterFoamView != VK_NULL_HANDLE)
+    {
+        vkDestroyImageView(g_device, g_waterFoamView, nullptr);
+        g_waterFoamView = VK_NULL_HANDLE;
+    }
+    if(g_waterFoamStorageView != VK_NULL_HANDLE)
+    {
+        vkDestroyImageView(g_device, g_waterFoamStorageView, nullptr);
+        g_waterFoamStorageView = VK_NULL_HANDLE;
+    }
+    if(g_waterFoamInjectionView != VK_NULL_HANDLE)
+    {
+        vkDestroyImageView(g_device, g_waterFoamInjectionView, nullptr);
+        g_waterFoamInjectionView = VK_NULL_HANDLE;
+    }
+    if(g_waterFoamImage != VK_NULL_HANDLE)
+    {
+        vkDestroyImage(g_device, g_waterFoamImage, nullptr);
+        g_waterFoamImage = VK_NULL_HANDLE;
+    }
+    if(g_waterFoamMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(g_device, g_waterFoamMemory, nullptr);
+        g_waterFoamMemory = VK_NULL_HANDLE;
+    }
+    if(g_waterFoamInjectionImage != VK_NULL_HANDLE)
+    {
+        vkDestroyImage(g_device, g_waterFoamInjectionImage, nullptr);
+        g_waterFoamInjectionImage = VK_NULL_HANDLE;
+    }
+    if(g_waterFoamInjectionMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(g_device, g_waterFoamInjectionMemory, nullptr);
+        g_waterFoamInjectionMemory = VK_NULL_HANDLE;
+    }
+}
+
+static void createWaterFoamResources()
+{
+    if(g_waterFoamAvailable.load())
+    {
+        return;
+    }
+    if(!waterFoamFeatureEnabled())
+    {
+        RTLog("[WATER FOAM] disabled by ORION_WATER_FOAM");
+        return;
+    }
+    // 白浪要 FFT 斜率图、交互波要水模拟状态：任一缺失就整模块软失败。
+    if(!g_waterFftAvailable.load() ||
+       g_waterFftSlopeView == VK_NULL_HANDLE ||
+       g_waterFftSlopeSampler == VK_NULL_HANDLE ||
+       g_waterSimView == VK_NULL_HANDLE ||
+       g_waterSimSampler == VK_NULL_HANDLE)
+    {
+        RTLog("[WATER FOAM] FFT/simulation inputs unavailable; foam map disabled");
+        return;
+    }
+
+    try
+    {
+        VkFormatProperties formatProperties{};
+        vkGetPhysicalDeviceFormatProperties(
+            g_physicalDevice, VK_FORMAT_R16G16B16A16_SFLOAT, &formatProperties);
+        const VkFormatFeatureFlags foamFeatures =
+            VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        if((formatProperties.optimalTilingFeatures & foamFeatures) != foamFeatures)
+        {
+            RTLog("[WATER FOAM] RGBA16F storage/sampled/linear unsupported; disabled");
+            return;
+        }
+        // imageAtomicMax 需要 VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT。
+        vkGetPhysicalDeviceFormatProperties(
+            g_physicalDevice, VK_FORMAT_R32_UINT, &formatProperties);
+        const VkFormatFeatureFlags injectionFeatures =
+            VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+            VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT;
+        if((formatProperties.optimalTilingFeatures & injectionFeatures) !=
+           injectionFeatures)
+        {
+            RTLog("[WATER FOAM] R32_UINT storage atomics unsupported; disabled");
+            return;
+        }
+
+        // ---- 泡沫图：2 层乒乓 + 6 级 mip（mip 由 blit 重建）----
+        VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        imageInfo.extent = {
+            WATER_FOAM_RESOLUTION, WATER_FOAM_RESOLUTION, 1u};
+        imageInfo.mipLevels = WATER_FOAM_MIPS;
+        imageInfo.arrayLayers = WATER_FOAM_LAYERS;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT |
+                          VK_IMAGE_USAGE_SAMPLED_BIT |
+                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                          VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        check(vkCreateImage(g_device, &imageInfo, nullptr, &g_waterFoamImage),
+            "water foam map create image failed");
+
+        VkMemoryRequirements requirements{};
+        vkGetImageMemoryRequirements(g_device, g_waterFoamImage, &requirements);
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = findMemoryType(
+            g_physicalDevice, requirements.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        check(vkAllocateMemory(g_device, &allocation, nullptr, &g_waterFoamMemory),
+            "water foam map allocate image memory failed");
+        check(vkBindImageMemory(
+            g_device, g_waterFoamImage, g_waterFoamMemory, 0u),
+            "water foam map bind image memory failed");
+
+        VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        viewInfo.image = g_waterFoamImage;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.baseMipLevel = 0u;
+        viewInfo.subresourceRange.levelCount = WATER_FOAM_MIPS;
+        viewInfo.subresourceRange.baseArrayLayer = 0u;
+        viewInfo.subresourceRange.layerCount = WATER_FOAM_LAYERS;
+        check(vkCreateImageView(g_device, &viewInfo, nullptr, &g_waterFoamView),
+            "water foam map create view failed");
+
+        // storage 视图必须是单一 mip（Vulkan STORAGE_IMAGE 要求）。
+        viewInfo.subresourceRange.levelCount = 1u;
+        check(vkCreateImageView(
+            g_device, &viewInfo, nullptr, &g_waterFoamStorageView),
+            "water foam map create storage view failed");
+
+        VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        // 世界空间图：出界即"没有泡沫"，绝不能 REPEAT。
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.minLod = 0.0f;
+        samplerInfo.maxLod = static_cast<float>(WATER_FOAM_MIPS - 1u);
+        check(vkCreateSampler(g_device, &samplerInfo, nullptr, &g_waterFoamSampler),
+            "water foam map create sampler failed");
+
+        // ---- 岸线注入图：R32_UINT，RT 原子写、compute 读后清零 ----
+        VkImageCreateInfo injectionInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        injectionInfo.imageType = VK_IMAGE_TYPE_2D;
+        injectionInfo.format = VK_FORMAT_R32_UINT;
+        injectionInfo.extent = {
+            WATER_FOAM_RESOLUTION, WATER_FOAM_RESOLUTION, 1u};
+        injectionInfo.mipLevels = 1u;
+        injectionInfo.arrayLayers = 1u;
+        injectionInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        injectionInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        injectionInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT |
+                              VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        injectionInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        injectionInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        check(vkCreateImage(
+            g_device, &injectionInfo, nullptr, &g_waterFoamInjectionImage),
+            "water foam injection create image failed");
+
+        VkMemoryRequirements injectionRequirements{};
+        vkGetImageMemoryRequirements(
+            g_device, g_waterFoamInjectionImage, &injectionRequirements);
+        VkMemoryAllocateInfo injectionAllocation{
+            VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        injectionAllocation.allocationSize = injectionRequirements.size;
+        injectionAllocation.memoryTypeIndex = findMemoryType(
+            g_physicalDevice, injectionRequirements.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        check(vkAllocateMemory(
+            g_device, &injectionAllocation, nullptr, &g_waterFoamInjectionMemory),
+            "water foam injection allocate image memory failed");
+        check(vkBindImageMemory(
+            g_device, g_waterFoamInjectionImage,
+            g_waterFoamInjectionMemory, 0u),
+            "water foam injection bind image memory failed");
+
+        VkImageViewCreateInfo injectionViewInfo{
+            VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        injectionViewInfo.image = g_waterFoamInjectionImage;
+        injectionViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        injectionViewInfo.format = VK_FORMAT_R32_UINT;
+        injectionViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        injectionViewInfo.subresourceRange.baseMipLevel = 0u;
+        injectionViewInfo.subresourceRange.levelCount = 1u;
+        injectionViewInfo.subresourceRange.baseArrayLayer = 0u;
+        injectionViewInfo.subresourceRange.layerCount = 1u;
+        check(vkCreateImageView(
+            g_device, &injectionViewInfo, nullptr, &g_waterFoamInjectionView),
+            "water foam injection create view failed");
+
+        // ---- 初始内容：泡沫全 0（第一帧不采样未初始化内存）+ 注入全 0 ----
+        {
+            VkCommandBufferAllocateInfo commandAllocation{
+                VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            commandAllocation.commandPool = g_rtCommandPool;
+            commandAllocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            commandAllocation.commandBufferCount = 1u;
+            VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+            check(vkAllocateCommandBuffers(
+                g_device, &commandAllocation, &commandBuffer),
+                "water foam init command allocation failed");
+            VkCommandBufferBeginInfo begin{
+                VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            check(vkBeginCommandBuffer(commandBuffer, &begin),
+                "water foam init command begin failed");
+
+            VkImageMemoryBarrier initial[2]{};
+            initial[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            initial[0].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            initial[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            initial[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            initial[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            initial[0].image = g_waterFoamImage;
+            initial[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            initial[0].subresourceRange.baseMipLevel = 0u;
+            initial[0].subresourceRange.levelCount = WATER_FOAM_MIPS;
+            initial[0].subresourceRange.baseArrayLayer = 0u;
+            initial[0].subresourceRange.layerCount = WATER_FOAM_LAYERS;
+            initial[0].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            initial[1] = initial[0];
+            initial[1].image = g_waterFoamInjectionImage;
+            initial[1].subresourceRange.levelCount = 1u;
+            initial[1].subresourceRange.layerCount = 1u;
+            vkCmdPipelineBarrier(
+                commandBuffer,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0u, 0u, nullptr, 0u, nullptr, 2u, initial);
+
+            VkClearColorValue clear{};
+            VkImageSubresourceRange clearRange{};
+            clearRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            clearRange.baseMipLevel = 0u;
+            clearRange.levelCount = WATER_FOAM_MIPS;
+            clearRange.baseArrayLayer = 0u;
+            clearRange.layerCount = WATER_FOAM_LAYERS;
+            vkCmdClearColorImage(
+                commandBuffer, g_waterFoamImage,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                &clear, 1u, &clearRange);
+
+            clearRange.levelCount = 1u;
+            clearRange.layerCount = 1u;
+            vkCmdClearColorImage(
+                commandBuffer, g_waterFoamInjectionImage,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                &clear, 1u, &clearRange);
+
+            for(uint32_t i = 0u; i < 2u; ++i)
+            {
+                initial[i].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                initial[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                initial[i].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                initial[i].dstAccessMask =
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            }
+            vkCmdPipelineBarrier(
+                commandBuffer,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                0u, 0u, nullptr, 0u, nullptr, 2u, initial);
+
+            check(vkEndCommandBuffer(commandBuffer),
+                "water foam init command end failed");
+            VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            submit.commandBufferCount = 1u;
+            submit.pCommandBuffers = &commandBuffer;
+            check(vkQueueSubmit(g_queue, 1u, &submit, VK_NULL_HANDLE),
+                "water foam init submit failed");
+            check(vkQueueWaitIdle(g_queue),
+                "water foam init wait failed");
+            vkFreeCommandBuffers(g_device, g_rtCommandPool, 1u, &commandBuffer);
+        }
+
+        // ---- 描述符集：0 泡沫历史 / 1 泡沫输出 / 2 水模拟 / 3 FFT 斜率 / 4 岸线注入 ----
+        VkDescriptorSetLayoutBinding bindings[5]{};
+        bindings[0].binding = 0u;
+        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[0].descriptorCount = 1u;
+        bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[1].binding = 1u;
+        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[1].descriptorCount = 1u;
+        bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[2] = bindings[0];
+        bindings[2].binding = 2u;
+        bindings[3] = bindings[0];
+        bindings[3].binding = 3u;
+        bindings[4].binding = 4u;
+        bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[4].descriptorCount = 1u;
+        bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        VkDescriptorSetLayoutCreateInfo layoutInfo{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        layoutInfo.bindingCount = 5u;
+        layoutInfo.pBindings = bindings;
+        check(vkCreateDescriptorSetLayout(
+            g_device, &layoutInfo, nullptr, &g_waterFoamSetLayout),
+            "water foam create descriptor set layout failed");
+
+        VkDescriptorPoolSize poolSizes[2]{};
+        poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSizes[0].descriptorCount = 3u;
+        poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        poolSizes[1].descriptorCount = 2u;
+        VkDescriptorPoolCreateInfo poolInfo{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolInfo.maxSets = 1u;
+        poolInfo.poolSizeCount = 2u;
+        poolInfo.pPoolSizes = poolSizes;
+        check(vkCreateDescriptorPool(
+            g_device, &poolInfo, nullptr, &g_waterFoamDescriptorPool),
+            "water foam create descriptor pool failed");
+
+        VkDescriptorSetAllocateInfo setAllocate{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        setAllocate.descriptorPool = g_waterFoamDescriptorPool;
+        setAllocate.descriptorSetCount = 1u;
+        setAllocate.pSetLayouts = &g_waterFoamSetLayout;
+        check(vkAllocateDescriptorSets(
+            g_device, &setAllocate, &g_waterFoamDescriptorSet),
+            "water foam allocate descriptor set failed");
+
+        VkDescriptorImageInfo infos[5]{};
+        infos[0].sampler = g_waterFoamSampler;
+        infos[0].imageView = g_waterFoamView;
+        infos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        infos[1].imageView = g_waterFoamStorageView;
+        infos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        infos[2].sampler = g_waterSimSampler;
+        infos[2].imageView = g_waterSimView;
+        infos[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        infos[3].sampler = g_waterFftSlopeSampler;
+        infos[3].imageView = g_waterFftSlopeView;
+        infos[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        infos[4].imageView = g_waterFoamInjectionView;
+        infos[4].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet writes[5]{};
+        for(uint32_t i = 0u; i < 5u; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = g_waterFoamDescriptorSet;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1u;
+            writes[i].descriptorType = (i == 1u || i == 4u)
+                ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[i].pImageInfo = &infos[i];
+        }
+        vkUpdateDescriptorSets(g_device, 5u, writes, 0u, nullptr);
+
+        // ---- 管线：一个 compute，96 B push ----
+        VkPushConstantRange pushRange{};
+        pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pushRange.offset = 0u;
+        pushRange.size =
+            static_cast<uint32_t>(sizeof(WaterFoamPushConstants));
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo{
+            VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pipelineLayoutInfo.setLayoutCount = 1u;
+        pipelineLayoutInfo.pSetLayouts = &g_waterFoamSetLayout;
+        pipelineLayoutInfo.pushConstantRangeCount = 1u;
+        pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+        check(vkCreatePipelineLayout(
+            g_device, &pipelineLayoutInfo, nullptr, &g_waterFoamPipelineLayout),
+            "water foam create pipeline layout failed");
+
+        const std::vector<uint8_t> code =
+            loadSpv("shaders/water_foam.comp.spv");
+        VkShaderModule shaderModule = createShaderModule(g_device, code);
+        VkComputePipelineCreateInfo pipelineInfo{
+            VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = shaderModule;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = g_waterFoamPipelineLayout;
+        check(vkCreateComputePipelines(
+            g_device, getSharedPipelineCache(), 1u, &pipelineInfo,
+            nullptr, &g_waterFoamPipeline),
+            "water foam create compute pipeline failed");
+        vkDestroyShaderModule(g_device, shaderModule, nullptr);
+
+        g_waterFoamReadLayer = 0u;
+        g_waterFoamOriginValid = false;
+        g_waterFoamLayoutReady = true;
+        g_waterFoamAvailable.store(true);
+        updateWaterFoamRayDescriptor();
+        RTLog("[WATER FOAM] persistent foam map created ("
+            + std::to_string(WATER_FOAM_RESOLUTION) + "x"
+            + std::to_string(WATER_FOAM_RESOLUTION) + ", "
+            + std::to_string(WATER_FOAM_MIPS) + " mips, "
+            + std::to_string(WATER_FOAM_LAYERS) + " layers, world "
+            + std::to_string(static_cast<int>(WATER_FOAM_WORLD_SIZE)) + "m, "
+            + "texel " + std::to_string(WATER_FOAM_TEXEL_WORLD_SIZE) + "m)");
+    }
+    catch(const std::exception& error)
+    {
+        RTLog(std::string("[WATER FOAM] creation failed, feature disabled: ")
+            + error.what());
+        destroyWaterFoamResources();
+    }
+}
+
+// 每 tick（30 Hz）：滚动重映射 + 耗散 + 三类注入 → 另一层，然后重建 mip。
+// 消费端（rt_test.rgen）只在下一帧 updateCamera 发布新读层后才切过去。
+static void recordWaterFoam(VkCommandBuffer cmd)
+{
+    if(cmd == VK_NULL_HANDLE ||
+       !g_waterFoamAvailable.load() ||
+       !g_waterFoamLayoutReady ||
+       g_waterFoamPipeline == VK_NULL_HANDLE ||
+       g_waterFoamDescriptorSet == VK_NULL_HANDLE ||
+       g_cameraUboMapped == nullptr)
+    {
+        return;
+    }
+
+    CameraUBO* ubo = static_cast<CameraUBO*>(g_cameraUboMapped);
+    const auto now = std::chrono::steady_clock::now();
+    if(!g_waterFoamLastUpdateValid)
+    {
+        g_waterFoamLastUpdate = now;
+        g_waterFoamLastUpdateValid = true;
+    }
+    const float elapsed = std::chrono::duration<float>(
+        now - g_waterFoamLastUpdate).count();
+    if(elapsed < WATER_FOAM_UPDATE_SECONDS)
+    {
+        return;
+    }
+    g_waterFoamLastUpdate = now;
+    const float deltaSeconds = std::min(elapsed, 0.1f);
+
+    // 原点吸附到纹素网格：滚动量恒为整数 ⇒ 历史重映射是纯纹素平移，不糊。
+    const float targetX =
+        ubo->playerX - 0.5f * WATER_FOAM_WORLD_SIZE;
+    const float targetZ =
+        ubo->playerZ - 0.5f * WATER_FOAM_WORLD_SIZE;
+    const float snappedX =
+        std::floor(targetX / WATER_FOAM_TEXEL_WORLD_SIZE) *
+        WATER_FOAM_TEXEL_WORLD_SIZE;
+    const float snappedZ =
+        std::floor(targetZ / WATER_FOAM_TEXEL_WORLD_SIZE) *
+        WATER_FOAM_TEXEL_WORLD_SIZE;
+
+    int32_t scrollX = 0;
+    int32_t scrollZ = 0;
+    bool reset = !g_waterFoamOriginValid;
+    if(!reset)
+    {
+        scrollX = static_cast<int32_t>(std::lround(
+            (snappedX - g_waterFoamOriginX) / WATER_FOAM_TEXEL_WORLD_SIZE));
+        scrollZ = static_cast<int32_t>(std::lround(
+            (snappedZ - g_waterFoamOriginZ) / WATER_FOAM_TEXEL_WORLD_SIZE));
+        // 滚动超过半张图（远处传送 / 创世飞行）：直接丢弃历史，避免把边缘拉成条带。
+        if(std::abs(scrollX) >= static_cast<int32_t>(WATER_FOAM_RESOLUTION / 2u) ||
+           std::abs(scrollZ) >= static_cast<int32_t>(WATER_FOAM_RESOLUTION / 2u))
+        {
+            scrollX = 0;
+            scrollZ = 0;
+            reset = true;
+        }
+    }
+    g_waterFoamOriginX = snappedX;
+    g_waterFoamOriginZ = snappedZ;
+    g_waterFoamOriginValid = true;
+
+    const uint32_t sourceLayer = g_waterFoamReadLayer;
+    const uint32_t destinationLayer = sourceLayer ^ 1u;
+
+    // ---- 输入依赖 ----
+    // 泡沫图：上一帧 RT 读过整张图 → 本 tick 写目标层。
+    VkImageMemoryBarrier foamBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    foamBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    foamBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    foamBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    foamBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    foamBarrier.image = g_waterFoamImage;
+    foamBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    foamBarrier.subresourceRange.baseMipLevel = 0u;
+    foamBarrier.subresourceRange.levelCount = WATER_FOAM_MIPS;
+    foamBarrier.subresourceRange.baseArrayLayer = 0u;
+    foamBarrier.subresourceRange.layerCount = WATER_FOAM_LAYERS;
+    foamBarrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    foamBarrier.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+    // 岸线注入：上一帧 RT 的原子写 → 本 tick 读后清零。
+    VkImageMemoryBarrier injectionBarrier{foamBarrier};
+    injectionBarrier.image = g_waterFoamInjectionImage;
+    injectionBarrier.subresourceRange.levelCount = 1u;
+    injectionBarrier.subresourceRange.layerCount = 1u;
+    injectionBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    injectionBarrier.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+    VkImageMemoryBarrier inputs[2] = {foamBarrier, injectionBarrier};
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0u, 0u, nullptr, 0u, nullptr, 2u, inputs);
+
+    const bool simAvailable =
+        ubo->waterSimEnabled > 0u &&
+        g_waterSimView != VK_NULL_HANDLE;
+    if(simAvailable)
+    {
+        VkImageMemoryBarrier simBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        simBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        simBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        simBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        simBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        simBarrier.image = g_waterSimImage;
+        simBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        simBarrier.subresourceRange.baseMipLevel = 0u;
+        simBarrier.subresourceRange.levelCount = 1u;
+        simBarrier.subresourceRange.baseArrayLayer = 0u;
+        simBarrier.subresourceRange.layerCount = 2u;
+        simBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        simBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        // 源阶段必须是 COMPUTE：本帧的水模拟 dispatch 就排在本 pass 前面
+        //（它的收尾屏障只把写入放行给 RT 读，不覆盖"compute 再读"）。
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0u, 0u, nullptr, 0u, nullptr, 1u, &simBarrier);
+    }
+
+    const bool fftAvailable =
+        g_waterFftEnabled.load() && ubo->waterFftParams[1] > 0.0f;
+    if(fftAvailable)
+    {
+        VkImageMemoryBarrier slopeBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        slopeBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        slopeBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        slopeBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        slopeBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        slopeBarrier.image = g_waterFftSlopeImage;
+        slopeBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        slopeBarrier.subresourceRange.baseMipLevel = 0u;
+        slopeBarrier.subresourceRange.levelCount = WATER_FFT_SLOPE_MIPS;
+        slopeBarrier.subresourceRange.layerCount = 1u;
+        slopeBarrier.srcAccessMask =
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        slopeBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0u, 0u, nullptr, 0u, nullptr, 1u, &slopeBarrier);
+    }
+
+    WaterFoamPushConstants push{};
+    push.layersAndScroll[0] = static_cast<int32_t>(sourceLayer);
+    push.layersAndScroll[1] = static_cast<int32_t>(destinationLayer);
+    push.layersAndScroll[2] = scrollX;
+    push.layersAndScroll[3] = scrollZ;
+    push.timing[0] = deltaSeconds;
+    push.timing[1] = simAvailable ? 1.0f : 0.0f;
+    push.timing[2] = fftAvailable ? 1.0f : 0.0f;
+    push.timing[3] = reset ? 1.0f : 0.0f;
+    push.simState[0] = ubo->waterSimOriginX;
+    push.simState[1] = ubo->waterSimOriginZ;
+    push.simState[2] = ubo->waterSimTexelWorldSize;
+    push.simState[3] = static_cast<float>(ubo->waterSimReadLayer);
+    push.foamFrame[0] = g_waterFoamOriginX;
+    push.foamFrame[1] = g_waterFoamOriginZ;
+    push.foamFrame[2] = WATER_FOAM_TEXEL_WORLD_SIZE;
+    push.foamFrame[3] = 1.0f;
+    // Crest 出厂口径：_FoamFadeRate 0.8/s、白浪覆盖 0.55。
+    push.knobs[0] = 0.8f;
+    push.knobs[1] = 1.0f;
+    push.knobs[2] = 0.55f;
+    push.knobs[3] = 1.0f;
+    push.knobs2[0] = 2.0f;
+    push.knobs2[1] = std::max(ubo->waterFftParams[0], 1.0f);
+    push.knobs2[2] = kWATER_FFT_DETAIL_TILE;
+    push.knobs2[3] = 4.0f;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_waterFoamPipeline);
+    vkCmdBindDescriptorSets(
+        cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_waterFoamPipelineLayout,
+        0u, 1u, &g_waterFoamDescriptorSet, 0u, nullptr);
+    vkCmdPushConstants(
+        cmd,
+        g_waterFoamPipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0u,
+        static_cast<uint32_t>(sizeof(push)),
+        &push);
+    vkCmdDispatch(
+        cmd,
+        (WATER_FOAM_RESOLUTION + WATER_FOAM_LOCAL_SIZE - 1u) /
+            WATER_FOAM_LOCAL_SIZE,
+        (WATER_FOAM_RESOLUTION + WATER_FOAM_LOCAL_SIZE - 1u) /
+            WATER_FOAM_LOCAL_SIZE,
+        1u);
+
+    if(!g_waterFoamLoggedFirstDispatch)
+    {
+        RTLog("[WATER FOAM] first dispatch origin=("
+            + std::to_string(g_waterFoamOriginX) + ","
+            + std::to_string(g_waterFoamOriginZ) + ") texel="
+            + std::to_string(WATER_FOAM_TEXEL_WORLD_SIZE)
+            + " sim=" + std::to_string(simAvailable ? 1 : 0)
+            + " fft=" + std::to_string(fftAvailable ? 1 : 0));
+        g_waterFoamLoggedFirstDispatch = true;
+    }
+
+    // ---- mip 链：只重建目标层的 mip1..5（同焦散图的逐级 blit）----
+    VkImageMemoryBarrier preMip{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    preMip.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    preMip.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    preMip.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    preMip.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    preMip.image = g_waterFoamImage;
+    preMip.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    preMip.subresourceRange.baseMipLevel = 0u;
+    preMip.subresourceRange.levelCount = WATER_FOAM_MIPS;
+    preMip.subresourceRange.baseArrayLayer = destinationLayer;
+    preMip.subresourceRange.layerCount = 1u;
+    preMip.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    preMip.dstAccessMask =
+        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0u, 0u, nullptr, 0u, nullptr, 1u, &preMip);
+
+    for(uint32_t level = 1u; level < WATER_FOAM_MIPS; ++level)
+    {
+        const uint32_t srcSize = WATER_FOAM_RESOLUTION >> (level - 1u);
+        const uint32_t dstSize = WATER_FOAM_RESOLUTION >> level;
+
+        VkImageBlit blit{};
+        blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.srcSubresource.mipLevel = level - 1u;
+        blit.srcSubresource.baseArrayLayer = destinationLayer;
+        blit.srcSubresource.layerCount = 1u;
+        blit.srcOffsets[0] = {0, 0, 0};
+        blit.srcOffsets[1] = {static_cast<int32_t>(srcSize),
+                              static_cast<int32_t>(srcSize), 1};
+        blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.dstSubresource.mipLevel = level;
+        blit.dstSubresource.baseArrayLayer = destinationLayer;
+        blit.dstSubresource.layerCount = 1u;
+        blit.dstOffsets[0] = {0, 0, 0};
+        blit.dstOffsets[1] = {static_cast<int32_t>(dstSize),
+                              static_cast<int32_t>(dstSize), 1};
+        vkCmdBlitImage(
+            cmd,
+            g_waterFoamImage, VK_IMAGE_LAYOUT_GENERAL,
+            g_waterFoamImage, VK_IMAGE_LAYOUT_GENERAL,
+            1u, &blit, VK_FILTER_LINEAR);
+
+        VkImageMemoryBarrier midMip{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        midMip.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        midMip.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        midMip.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        midMip.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        midMip.image = g_waterFoamImage;
+        midMip.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        midMip.subresourceRange.baseMipLevel = level;
+        midMip.subresourceRange.levelCount = 1u;
+        midMip.subresourceRange.baseArrayLayer = destinationLayer;
+        midMip.subresourceRange.layerCount = 1u;
+        midMip.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        midMip.dstAccessMask =
+            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0u, 0u, nullptr, 0u, nullptr, 1u, &midMip);
+    }
+
+    // ---- 交给 RT 采样（整条 mip 链）+ 注入图交给下一帧 RT 原子写 ----
+    VkImageMemoryBarrier consume[2]{};
+    consume[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    consume[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    consume[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    consume[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    consume[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    consume[0].image = g_waterFoamImage;
+    consume[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    consume[0].subresourceRange.baseMipLevel = 0u;
+    consume[0].subresourceRange.levelCount = WATER_FOAM_MIPS;
+    consume[0].subresourceRange.baseArrayLayer = 0u;
+    consume[0].subresourceRange.layerCount = WATER_FOAM_LAYERS;
+    consume[0].srcAccessMask =
+        VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    consume[0].dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    consume[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    consume[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    consume[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    consume[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    consume[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    consume[1].image = g_waterFoamInjectionImage;
+    consume[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    consume[1].subresourceRange.levelCount = 1u;
+    consume[1].subresourceRange.layerCount = 1u;
+    consume[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    consume[1].dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0u, 0u, nullptr, 0u, nullptr, 2u, consume);
+
+    // 读层在 updateCamera（下一帧）才发布 ⇒ 本帧 RT 仍读旧层，绝不与本次写竞争。
+    g_waterFoamReadLayer = destinationLayer;
+}
+#endif
 
 static void createWaterSimulationResources()
 {
@@ -44698,7 +50867,7 @@ static void recordWaterSimulation(VkCommandBuffer cmd)
     // 2026-10-03：风源开着时不允许进入 idle（风源本身是常驻扰动，模拟必须一直跑才能让
     // 水面保持流动）。
     // 2026-10-14 REVERT：用户实测"只有下水才触发波浪、否则是平的" ⇒ 恢复常驻风源。
-    const bool windKeepsSimAlive = kWaterWindStrength > 0.0f;
+    const bool windKeepsSimAlive = waterWindStrength() > 0.0f;
     if(!windKeepsSimAlive && !playerInWater && !g_waterSimPendingImpulse &&
        g_waterSimKeepAliveSeconds <= 0.0f)
     {
@@ -44719,7 +50888,7 @@ static void recordWaterSimulation(VkCommandBuffer cmd)
     const float elapsed = std::chrono::duration<float>(
         now - g_waterSimLastUpdate
     ).count();
-    if(elapsed < WATER_SIM_UPDATE_SECONDS)
+    if(elapsed < waterSimUpdateSeconds())
     {
         return;
     }
@@ -44785,7 +50954,7 @@ static void recordWaterSimulation(VkCommandBuffer cmd)
     ubo->waterSimEnabled =
         (playerInWater || g_waterSimPendingImpulse ||
          g_waterSimKeepAliveSeconds > 0.0f ||
-         kWaterWindStrength > 0.0f) ? 1u : 0u;
+         waterWindStrength() > 0.0f) ? 1u : 0u;
 
     VkImageMemoryBarrier imageBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     imageBarrier.image = g_waterSimImage;
@@ -44876,7 +51045,7 @@ static void recordWaterSimulation(VkCommandBuffer cmd)
     // 2026-10-03 按 HPWater 重构自然波面：该槽位承载波方程场的"风源"强度
     //（着色器侧 waveParams.y，见 water_sim.comp 的风源块）。常量定义在文件作用域，
     // 因为 recordWaterSimulation 的 idle 判定也要用它。
-    push.waveReservedObstacle = kWaterWindStrength;
+    push.waveReservedObstacle = waterWindStrength();
     // 2026-10-03 波形四旋钮接靶到风源（定义见 WaterSimPushConstants 的注释）。
     // 它们原本只作用于已被删除的解析波带 ⇒ 现在驱动风源形态，单一真源（波方程场）。
     push.waveShapeScale = g_waterWaveLengthScale.load();
@@ -46022,6 +52191,68 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_setInWorld(
         g_lastCameraFrame =
             -1;
     }
+}
+
+// =====================================================
+// 2026-10-24 可见性图上传（说明见 SPATIAL_SECTION_KEY_MASK 附近）
+//
+// coords 是扁平的 [x0,y0,z0, x1,y1,z1, ...]（Section 坐标，不是方块坐标）。
+// 用三列 int 而不是 long：Java 侧 RenderSection.getSectionNode() 的打包格式
+// （SectionPos.asLong）与本文件的 packSectionKey 不是同一套位布局，让 native
+// 用自己的编码器重算，比在 Java 里手抄一份位运算安全。
+//
+// count <= 0 或数组为 null ⇒ 清空（等同于"没有可见性数据"，剔除自动失效）。
+// 相机处于 frustum 捕获状态（第三人称 / 调试冻结）时 Java 也走这条。
+// =====================================================
+extern "C"
+JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_setVisibleSections(
+    JNIEnv* env,
+    jclass,
+    jintArray coords,
+    jint count)
+{
+    std::vector<uint64_t> keys;
+
+    if(env != nullptr && coords != nullptr && count > 0)
+    {
+        const jsize wanted = static_cast<jsize>(count) * 3;
+
+        if(env->GetArrayLength(coords) >= wanted)
+        {
+            jint* raw = env->GetIntArrayElements(coords, nullptr);
+
+            if(raw != nullptr)
+            {
+                keys.reserve(static_cast<size_t>(count));
+
+                for(jint i = 0; i < count; ++i)
+                {
+                    keys.push_back(
+                        packSectionKey(
+                            static_cast<int>(raw[i * 3 + 0]),
+                            static_cast<int>(raw[i * 3 + 1]),
+                            static_cast<int>(raw[i * 3 + 2]),
+                            0
+                        )
+                    );
+                }
+
+                env->ReleaseIntArrayElements(coords, raw, JNI_ABORT);
+            }
+        }
+    }
+
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+
+    const uint32_t keyCount = static_cast<uint32_t>(keys.size());
+
+    {
+        std::lock_guard<std::mutex> lock(g_visibleSectionKeysMutex);
+        g_visibleSectionKeys.swap(keys);
+    }
+
+    g_visibleSectionKeyCount.store(keyCount);
 }
 // =====================================================
 // Frame generation base frame-rate cap
@@ -49412,6 +55643,181 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_getPOMSharp(
 }
 
 
+// =====================================================
+// 2026-10-25：设置界面「GI 近场采样」与「光泽采样」
+//
+// 只写进程内的原子量，下一次 updateCamera 就会带进 CameraUBO —— 因此**不用重启**
+// 就能看到效果（与 pomSharp 同一套语义）。越界值一律返回 JNI_FALSE，调用方会把
+// 界面值读回来，行为与 pomSharp 的失败路径一致。
+// 暂不写 JSON：持久化要动 RTXSettingsConfig 的 8 处，先打通"能调"。
+// =====================================================
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setGiNearRate(
+    JNIEnv*,
+    jclass,
+    jint level)
+{
+    if(level < 0 || level > 2)
+    {
+        return JNI_FALSE;
+    }
+
+    g_giNearRateOverride.store(
+        static_cast<int>(level),
+        std::memory_order_relaxed
+    );
+
+    return JNI_TRUE;
+}
+
+extern "C"
+JNIEXPORT jint JNICALL Java_com_example_vulkan_NativeVulkan_getGiNearRate(
+    JNIEnv*,
+    jclass)
+{
+    return static_cast<jint>(giNearRateLevel());
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setGlossyRoughLod(
+    JNIEnv*,
+    jclass,
+    jboolean enabled)
+{
+    g_glossyRoughLodOverride.store(
+        enabled != JNI_FALSE ? 1 : 0,
+        std::memory_order_relaxed
+    );
+
+    return JNI_TRUE;
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_getGlossyRoughLod(
+    JNIEnv*,
+    jclass)
+{
+    return glossyRoughLodEnabled()
+        ? JNI_TRUE
+        : JNI_FALSE;
+}
+
+
+// =====================================================
+// 2026-10-26 直接光模式 + 稀疏渲染（HANDOFF-2026-10-26-RTDI-SPARSE.md）。
+// 纯状态拷贝：只写覆盖原子量，下一帧 updateCamera 拷进 CameraUBO.sparseParams
+//（偏移 1712），零 Vulkan 调用、切换下一帧生效。
+// =====================================================
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setDirectLightMode(
+    JNIEnv*,
+    jclass,
+    jint mode)
+{
+    if(mode < 0 || mode > 1)
+    {
+        return JNI_FALSE;
+    }
+
+    g_directLightModeOverride.store(
+        static_cast<int>(mode),
+        std::memory_order_relaxed
+    );
+
+    return JNI_TRUE;
+}
+
+extern "C"
+JNIEXPORT jint JNICALL Java_com_example_vulkan_NativeVulkan_getDirectLightMode(
+    JNIEnv*,
+    jclass)
+{
+    return static_cast<jint>(directLightMode());
+}
+
+// =====================================================
+// 2026-10-28 间接光模式（对齐 Remix 的 IntegrateIndirectMode）
+//   0 = GI（出厂）/ 1 = SHaRC
+// 只写原子量；但 SHaRC 的缓冲与管线在 native init 里按它创建 ⇒ **改动需重启客户端**。
+// Java 侧的恢复调用必须发生在 initDeviceHandlesNative() 之前。
+// =====================================================
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setIndirectMode(
+    JNIEnv*,
+    jclass,
+    jint mode)
+{
+    if(mode < 0 || mode > 1)
+    {
+        return JNI_FALSE;
+    }
+
+    g_indirectModeOverride.store(
+        static_cast<int>(mode),
+        std::memory_order_relaxed
+    );
+
+    RTLog(
+        std::string("[INDIRECT MODE] requested=") +
+        (mode == 1 ? "SHaRC" : "GI") +
+        " sharcEnabledNow=" + (sharcEnabled() ? "1" : "0") +
+        " (SHaRC 的缓冲/管线在 init 创建 ⇒ 生效需重启客户端)"
+    );
+
+    return JNI_TRUE;
+}
+
+extern "C"
+JNIEXPORT jint JNICALL Java_com_example_vulkan_NativeVulkan_getIndirectMode(
+    JNIEnv*,
+    jclass)
+{
+    return static_cast<jint>(
+        g_indirectModeOverride.load(std::memory_order_relaxed));
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setSparseRatePercent(
+    JNIEnv*,
+    jclass,
+    jint percent)
+{
+    if(percent < 0 || percent > 100)
+    {
+        return JNI_FALSE;
+    }
+
+    g_sparseRatePercentOverride.store(
+        static_cast<int>(percent),
+        std::memory_order_relaxed
+    );
+
+    return JNI_TRUE;
+}
+
+extern "C"
+JNIEXPORT jint JNICALL Java_com_example_vulkan_NativeVulkan_getSparseRatePercent(
+    JNIEnv*,
+    jclass)
+{
+    return static_cast<jint>(sparseRatePercent());
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setRtdiReuseInactive(
+    JNIEnv*,
+    jclass,
+    jboolean enabled)
+{
+    g_rtxdiReuseInactiveOverride.store(
+        enabled != JNI_FALSE ? 1 : 0,
+        std::memory_order_relaxed
+    );
+
+    return JNI_TRUE;
+}
+
+
 // 2026-10-22 UE 风格体积云八项（设置界面滑条）。
 // 纯状态拷贝：只写全局原子量，下一帧 updateCamera 经 populateUeCloudParams 拷进
 // CameraUBO.ueCloudA / ueCloudB（偏移 1536 / 1552），不产生任何 Vulkan 调用。
@@ -50310,6 +56716,78 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudLightPar
         std::min(std::max(static_cast<float>(values[3]), 0.0f), 1.0f));
 
     g_volumetricCloudHistoryNeedsClear.store(true);
+    return JNI_TRUE;
+}
+
+// 2026-10-25 v5（HP）全参数：一次写入 28 个值（CameraUBO 尾块 hpShapeA..hpMiscA）。
+// 只做有限性校验 + 关键项的范围钳制；语义上"全部由 Java 侧滑条决定"，
+// 负值在这里不特殊处理（滑条不会产生负值，未写入时 Java 侧本来就不调用本函数）。
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudHpParams(
+    JNIEnv* env, jclass, jfloatArray params)
+{
+    if(params == nullptr || env->GetArrayLength(params) < 28) return JNI_FALSE;
+    jfloat values[28];
+    env->GetFloatArrayRegion(params, 0, 28, values);
+    for(int i = 0; i < 28; ++i)
+    {
+        if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
+    }
+    auto sat = [](float v) { return std::min(std::max(v, 0.0f), 1.0f); };
+    g_hpDetailStrengthCu.store(std::max(values[0], 0.0f));
+    g_hpDetailStrengthTcu.store(std::max(values[1], 0.0f));
+    g_hpDetailStrengthCb.store(std::max(values[2], 0.0f));
+    g_hpBottomSmoothHeight.store(std::max(values[3], 0.0f));
+    g_hpWispyEdgeWidth.store(std::max(values[4], 0.0f));
+    g_hpWispyReach.store(std::max(values[5], 0.0f));
+    g_hpWispyTopHeight.store(sat(values[6]));
+    g_hpWispyTopHardness.store(std::max(values[7], 0.0f));
+    g_hpWispyWeight.store(std::max(values[8], 0.0f));
+    g_hpBillowyWeight.store(std::max(values[9], 0.0f));
+    g_hpLoCoverTopMax.store(std::max(values[10], 1.0f));
+    g_hpLoCoverTopStr.store(sat(values[11]));
+    g_hpCovMapScale.store(std::max(values[12], 0.01f));
+    g_hpScWorleyStrength.store(sat(values[13]));
+    g_hpScHeightScale.store(std::max(values[14], 0.01f));
+    g_hpScCellThickStr.store(sat(values[15]));
+    g_hpForwardEcc.store(sat(values[16]));
+    g_hpBackwardEcc.store(sat(values[17]));
+    g_hpPhiFwdIntensity.store(std::max(values[18], 0.0f));
+    g_hpPhiFwdDepthPow.store(std::max(values[19], 0.0f));
+    g_hpPhiFwdDepthBias.store(values[20]);
+    g_hpPhiFwdCompress.store(std::max(values[21], 0.0f));
+    g_hpScatterOdScale.store(std::max(values[22], 0.0f));
+    g_hpScatterCurvePow.store(std::max(values[23], 0.0f));
+    g_hpMsEccentricity.store(sat(values[24]));
+    g_hpAoUpwardScale.store(std::max(values[25], 0.0f));
+    g_hpFadeStart.store(std::min(std::max(values[26], 0.0f), 0.95f));
+    g_hpPowderIntensity.store(sat(values[27]));
+
+    g_volumetricCloudHistoryNeedsClear.store(true);
+    return JNI_TRUE;
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_getCloudHpParams(
+    JNIEnv* env, jclass, jfloatArray out)
+{
+    if(out == nullptr || env->GetArrayLength(out) < 28) return JNI_FALSE;
+    const float values[28] = {
+        g_hpDetailStrengthCu.load(), g_hpDetailStrengthTcu.load(),
+        g_hpDetailStrengthCb.load(), g_hpBottomSmoothHeight.load(),
+        g_hpWispyEdgeWidth.load(), g_hpWispyReach.load(),
+        g_hpWispyTopHeight.load(), g_hpWispyTopHardness.load(),
+        g_hpWispyWeight.load(), g_hpBillowyWeight.load(),
+        g_hpLoCoverTopMax.load(), g_hpLoCoverTopStr.load(),
+        g_hpCovMapScale.load(), g_hpScWorleyStrength.load(),
+        g_hpScHeightScale.load(), g_hpScCellThickStr.load(),
+        g_hpForwardEcc.load(), g_hpBackwardEcc.load(),
+        g_hpPhiFwdIntensity.load(), g_hpPhiFwdDepthPow.load(),
+        g_hpPhiFwdDepthBias.load(), g_hpPhiFwdCompress.load(),
+        g_hpScatterOdScale.load(), g_hpScatterCurvePow.load(),
+        g_hpMsEccentricity.load(), g_hpAoUpwardScale.load(),
+        g_hpFadeStart.load(), g_hpPowderIntensity.load()};
+    env->SetFloatArrayRegion(out, 0, 28, values);
     return JNI_TRUE;
 }
 
@@ -51217,7 +57695,7 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setPerformanceSe
     jint aoNearSamples, jint aoMidSamples, jint giBounces, jint sunShadowSamples,
     jint localLightRisCandidates, jint localLightAreaSamples,
     jint waterReflectionInterval, jint glossyFullDistance, jint dynamicRtasInterval,
-    jfloat rtSpp)
+    jfloat rtSpp, jint volumetricRestir)
 {
     if(aoNearSamples < 0 || aoNearSamples > 4 ||
        aoMidSamples < 0 || aoMidSamples > 2 ||
@@ -51229,7 +57707,8 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setPerformanceSe
        glossyFullDistance < 16 || glossyFullDistance > 96 ||
        dynamicRtasInterval < 1 || dynamicRtasInterval > 8 ||
        !std::isfinite(static_cast<float>(rtSpp)) ||
-       rtSpp < 0.5f || rtSpp > 4.0f)
+       rtSpp < 0.5f || rtSpp > 4.0f ||
+       volumetricRestir < 0 || volumetricRestir > 1)
     {
         return JNI_FALSE;
     }
@@ -51242,6 +57721,10 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setPerformanceSe
     g_perfWaterReflectionInterval.store(static_cast<uint32_t>(waterReflectionInterval));
     g_perfGlossyFullDistance.store(static_cast<uint32_t>(glossyFullDistance));
     g_perfDynamicRtasInterval.store(static_cast<uint64_t>(dynamicRtasInterval));
+    // 2026-10-26：体积光 ReSTIR 的 GUI 开关（0/1）。写覆盖量，下一次
+    // recordVolumeRestir 就会看到；首次打开时那一帧会建资源与管线。
+    g_volRestirGuiOverride.store(
+        volumetricRestir != 0 ? 1u : 0u, std::memory_order_relaxed);
     g_perfRtSpp.store(static_cast<float>(rtSpp));
     return JNI_TRUE;
 }
@@ -53949,8 +60432,39 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     ubo->cameraFov =
         static_cast<float>(cameraFov);
 
-    ubo->cameraParamsPadding =
-        g_noDirectLightAmbient.load();
+    // 2026-10-27：环境光基础亮度的下限。
+    //
+    // shader 侧 getSurfaceAmbientBase() 直接把本值当作 base 相乘
+    // （rt_test.rgen:5058-5064）。Java 的 RTXSettingsConfig 默认 0.01 会覆盖
+    // C++ 的 0.10 ⇒ 环境光只剩 1% ⇒ 所有背光面接近纯黑；透过玻璃看阴影时
+    // behindRadiance≈0，玻璃就退化成"纯玻璃色"的实心块（用户报的侧面实）。
+    //
+    // 这里只加下限，不封锁上限：用户仍可在设置里调高；把
+    // ORION_AMBIENT_FLOOR 设 0 可回到"完全按用户值"的行为。
+    // 2026-10-27：默认值已改为 0（见下面的 return），用户设 0.0001 才真的生效。
+    {
+        static const float ambientFloor = []() -> float
+        {
+            const char* raw = std::getenv("ORION_AMBIENT_FLOOR");
+
+            if(raw != nullptr && raw[0] != '\0')
+            {
+                const float requested = static_cast<float>(std::atof(raw));
+                return requested > 0.0f ? requested : 0.0f;
+            }
+
+            // 2026-10-27：默认从 0.08 改为 0。用户要求把环境底光降到 0.0001；
+            // 只要下限还是 0.08，任何小于它的用户值都会被抬回去（这正是
+            // "暗处好亮"的来源）。0 表示完全按用户值。需要旧行为时设
+            // ORION_AMBIENT_FLOOR=0.08。
+            return 0.0f;
+        }();
+
+        const float requestedAmbient = g_noDirectLightAmbient.load();
+
+        ubo->cameraParamsPadding =
+            requestedAmbient > ambientFloor ? requestedAmbient : ambientFloor;
+    }
 
     // GLSL CameraProperties.historyParams.z
     // Dynamic POM depth from RTX settings.
@@ -53974,9 +60488,63 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     // 所以启用后的第一帧走旧路径，第二帧才切过去，这是刻意的缓一步。
     ubo->giHalfParams[0] =
         (giHalfEnabled() && g_giHalfView != VK_NULL_HANDLE) ? 1.0f : 0.0f;
-    ubo->giHalfParams[1] = 0.0f;
-    ubo->giHalfParams[2] = 0.0f;
-    ubo->giHalfParams[3] = 0.0f;
+    // y = 半图相位是否轮转（rt_test.rgen 的 giHalfPhase 读它）。
+    // 默认 0 = 固定相位：轮转会让每个 texel 代表的世界位置每帧平移一个像素，
+    // RR 的时间累积因此失效（2026-10-25 实测满屏闪点）。见 giHalfRotateEnabled。
+    ubo->giHalfParams[1] =
+        (giHalfEnabled() && giHalfRotateEnabled()) ? 1.0f : 0.0f;
+    // z = GI 射线跳过 POM（含自阴影）。ORION_GI_NO_POM=1 时置 1。
+    ubo->giHalfParams[2] = giNoPomEnabled() ? 1.0f : 0.0f;
+    // w = 光泽反射按粗糙度降速（ORION_GLOSSY_ROUGH_LOD）。
+    ubo->giHalfParams[3] = glossyRoughLodEnabled() ? 1.0f : 0.0f;
+
+    // 2026-10-25 近场 GI 采样率（CameraUBO.giRayParams.x）：0 全速 / 1 半速 / 2 四分一。
+    ubo->giRayParams[0] = static_cast<float>(giNearRateLevel());
+    ubo->giRayParams[1] = 0.0f;
+    ubo->giRayParams[2] = 0.0f;
+    ubo->giRayParams[3] = 0.0f;
+
+    // 2026-10-26：HP 全参数**逐帧**刷新。之前只在初始化里写过一次，
+    // 所以面板里那 28 条滑条（侵蚀强度 / 云底平滑 / wispy 权重 / 覆盖度标定 / 淡出起点…）
+    // 怎么调都没反应。
+    populateHpParams(ubo);
+
+    // 2026-10-26 直接光模式 + 稀疏渲染（CameraUBO.sparseParams）：
+    // x = 0 传统 RIS / 1 RTXDI 式时域 reservoir；
+    // y = 稀疏活跃率 %（0=关）—— 2026-10-27 起是 **有效** 采样率：界面百分比
+    //     经 Remix 的 calculateSamplingRate 换算（按分辨率自适应、上限 0.75、
+    //     无 RR 关闭），见 sparseSamplingRateEffective()；
+    // z = 非活跃像素 reservoir 验证/老化（自创，Remix 无此机制）；
+    // w = 保留（空间重用档位）。
+    // 2026-10-27：直接光估计量切换（传统 RIS <-> 时域 reservoir）同样要重置历史。
+    // Remix 没有 RTXDI 总开关的热切换逻辑可抄（useRTXDI 只在冷路径判定），但它的
+    // integrateIndirectMode 切换会强制 m_resetHistory（rtx_context.cpp:409-413）：
+    // 同类口径，估计量换了旧历史就不可复用。与 1.4 共用同一个 reset 标志。
+    const int directLightModeCurrent = directLightMode();
+
+    static int previousDirectLightMode = directLightModeCurrent;
+
+    if(directLightModeCurrent != previousDirectLightMode)
+    {
+        previousDirectLightMode = directLightModeCurrent;
+        g_sparseRateHistoryReset.store(true, std::memory_order_relaxed);
+    }
+
+    ubo->sparseParams[0] = static_cast<float>(directLightModeCurrent);
+    const float sparseRateForMask = sparseSamplingRateEffective();
+
+    // 2026-10-27 mask pass 的输入：与 UBO 里 y 同一个值，避免两处各算一遍。
+    g_sparseEffectiveRate.store(sparseRateForMask, std::memory_order_relaxed);
+    g_sparseEffectiveFrameIndex.store(
+        static_cast<uint32_t>(nextFrame),
+        std::memory_order_relaxed);
+
+    ubo->sparseParams[1] = sparseRateForMask * 100.0f;
+    ubo->sparseParams[2] = static_cast<float>(rtxdiReuseInactiveEnabled());
+    // w = 稀疏历史是否有效（0 = 本帧必须全写；1 = 非活跃像素可保留上一帧）。
+    // 消费者：rt_test.rgen 末尾的 sparseWriteImage 判据。
+    ubo->sparseParams[3] =
+        g_sparseHistoryValid.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
 
     // GLSL CameraProperties.historyParams.w. This lane is the *only* input of the
     // time-driven sun-direction functions (rgen / rmiss / sun_shadow.glsl all read
@@ -54068,11 +60636,13 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
         (g_waterSimOriginValid &&
          (nowInWater || g_waterSimPendingImpulse ||
           g_waterSimKeepAliveSeconds > 0.0f ||
-          kWaterWindStrength > 0.0f)) ? 1u : 0u;
+          waterWindStrength() > 0.0f)) ? 1u : 0u;
     ubo->waterSimImpulsePending =
         g_waterSimPendingImpulse ? 1u : 0u;
     ubo->cameraInWater =
         cameraInWater > 0.5f ? 1u : 0u;
+    // 渲染线程要用同一个判断（决定体积光 ReSTIR 是否让位给旧光柱 pass）。
+    g_cameraInWater.store(ubo->cameraInWater, std::memory_order_relaxed);
     ubo->waterSimImpulseX = g_waterSimPendingImpulseX;
     ubo->waterSimImpulseZ = g_waterSimPendingImpulseZ;
     ubo->waterSimImpulseStrength = g_waterSimPendingImpulseStrength;
@@ -54170,6 +60740,31 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     populateFogExtrasParams(ubo->fogExtrasParams);
     populateCloudTemporalParams(ubo->cloudTemporalParams);
     populateCloudAerialParams(ubo->cloudAerialParams);
+
+    // 2026-10-26 21:1x 泡沫路线回退：下面这段原先把 pomParams.yzw /
+    // cloudAerialParams.w 当泡沫图的发布通道；回退后这两处 lane 不再被写，
+    // rgen 也不再读 binding 73/74（UBO 布局与 lane 语义一并还原）。
+#if 0
+    // 2026-10-26 持久泡沫图：pomParams.y/z = 图原点 XZ，w = 纹素世界尺寸（0 =
+    // 未就绪/关闭 ⇒ rgen 不采样 binding 73、也不向 binding 74 原子写）。
+    // cloudAerialParams.w = 已发布的读层（0/1）：泡沫 compute 每 tick 写另一层，
+    // 这里只发布"已经写完并做过屏障"的那层 ⇒ RT 永远不会读到正在写的层。
+    // 初始化时 available=false ⇒ 写全 0（与 populateCloudAerialParams 的默认一致）。
+    {
+        const bool foamPublished =
+            g_waterFoamAvailable.load() &&
+            g_waterFoamLayoutReady &&
+            g_waterFoamOriginValid;
+        ubo->pomParams[1] = foamPublished ? g_waterFoamOriginX : 0.0f;
+        ubo->pomParams[2] = foamPublished ? g_waterFoamOriginZ : 0.0f;
+        ubo->pomParams[3] =
+            foamPublished ? WATER_FOAM_TEXEL_WORLD_SIZE : 0.0f;
+        ubo->cloudAerialParams[3] = foamPublished
+            ? static_cast<float>(g_waterFoamReadLayer)
+            : 0.0f;
+    }
+#endif
+
     populateCloudSkyHueParams(ubo->cloudSkyHueParams);
     populateCloudPhysicsParams(ubo->cloudPhysicsParams);
     populateUeCloudParams(ubo->ueCloudA, ubo->ueCloudB);
@@ -54235,6 +60830,9 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
 
     g_cameraHistoryValid = true;
     g_lastCameraFrame = nextFrame;
+
+    // 本帧 UBO 已经按"旧的有效位"写好：下一帧起非活跃像素可以保留本帧写出的值。
+    g_sparseHistoryValid.store(true, std::memory_order_relaxed);
 }
 extern "C"
 JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_setSerEnabledNative(
@@ -54674,6 +61272,12 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_initDeviceHandlesNat
             }
 
             check(createPipe(g_device,VK_NULL_HANDLE,rtPipelineCache,1,&pci,nullptr,&g_rayTracingPipeline),"Failed to create RT pipeline");
+
+            // 2026-10-25：RT 管线（几十 MB 驱动 blob）编完立刻落盘。
+            // 周期的 maybePersistSharedPipelineCache() 只在 60/1860/3660… 帧触发，
+            // 与这里的惰性创建时机不重合 ⇒ 实测整局缓存字节数一次都没变过
+            // （restored == saved == 8.1MB），每次启动都得重编 2–3 分钟。
+            persistSharedPipelineCache();
             RTLog(
                 "[RT TRANSLUCENT SPV]"
                 " group3=rt_test_translucent.rchit+rahit"
@@ -54749,6 +61353,15 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_initDeviceHandlesNat
             << std::endl;
         // 2026-10-19 参考重做：依赖 FFT 斜率图（上面的模块必须先建好）。
         createWaterCausticMapResources();
+
+        // 2026-10-26 21:1x 泡沫回退：整块调用屏蔽（创建代码见 46756 起的 #if 0）。
+#if 0
+        std::cout
+            << "[WATER FOAM] create persistent foam map"
+            << std::endl;
+        // 2026-10-26 路线 B：依赖 FFT 斜率图 + 水模拟状态（两者都必须先建好）。
+        createWaterFoamResources();
+#endif
 
         std::cout
             << "[WATER CAUSTIC] create wavefront-area caustic pipeline"
@@ -60494,9 +67107,132 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
                 }
             }
 
+            // 2026-10-28 玻璃 alpha blend 的选层抖动诊断（rgen 玻璃链起点读）：
+            //   lane 5 = randomThreshold 钉 0 ⇒ 恒选第一层
+            //   lane 6 = randomThreshold 钉 1 ⇒ 恒选最后一层
+            // 判据：颗粒消失 ⇒ 根因是 update() 的逐帧随机选层。删文件即恢复。
+            {
+                std::ifstream marker(ResolveRTXRuntimePath("glass_layer_first.flag"));
+
+                if(marker.good())
+                {
+                    RTLog("[GLASS DBG] lane 5 = 选层钉第一层 (glass_layer_first.flag)");
+                    return 5u;
+                }
+            }
+
+            {
+                std::ifstream marker(ResolveRTXRuntimePath("glass_layer_last.flag"));
+
+                if(marker.good())
+                {
+                    RTLog("[GLASS DBG] lane 6 = 选层钉最后一层 (glass_layer_last.flag)");
+                    return 6u;
+                }
+            }
+
+            // 2026-10-28 写入通路探针：绕过全部玻璃逻辑，无条件写 74 号图。
+            {
+                std::ifstream marker(ResolveRTXRuntimePath("glass_write_probe.flag"));
+
+                if(marker.good())
+                {
+                    RTLog("[GLASS DBG] lane 7 = 无条件写 74 号图 (glass_write_probe.flag)");
+                    return 7u;
+                }
+            }
+
+            // 2026-10-28 behindRadiance 三项逐项杀掉（玻璃后面那个接收面的辐射）。
+            // 链路修好（SURFACE_RADIANCE=1）之后，这几档才是有效判决。
+            {
+                std::ifstream marker(ResolveRTXRuntimePath("glass_kill_local.flag"));
+
+                if(marker.good())
+                {
+                    RTLog("[GLASS DBG] lane 8 = 只杀 localEntityIrradiance (glass_kill_local.flag)");
+                    return 8u;
+                }
+            }
+
+            {
+                std::ifstream marker(ResolveRTXRuntimePath("glass_kill_direct.flag"));
+
+                if(marker.good())
+                {
+                    RTLog("[GLASS DBG] lane 9 = 只杀 directAndEmission (glass_kill_direct.flag)");
+                    return 9u;
+                }
+            }
+
+            {
+                std::ifstream marker(ResolveRTXRuntimePath("glass_kill_ambient.flag"));
+
+                if(marker.good())
+                {
+                    RTLog("[GLASS DBG] lane 10 = 只杀 ambientTerm (glass_kill_ambient.flag)");
+                    return 10u;
+                }
+            }
+
+            {
+                std::ifstream marker(ResolveRTXRuntimePath("glass_kill_all.flag"));
+
+                if(marker.good())
+                {
+                    RTLog("[GLASS DBG] lane 11 = behind 三项全杀 (glass_kill_all.flag)");
+                    return 11u;
+                }
+            }
+
             return 0u;
         }();
         ablateUbo->perfAblationStage[3] = surfaceDebugLane;
+        // 2026-10-25：把 JNI 收到并校验过的性能设置搬进 UBO lane。
+        // 缺这一步时 Java 侧所有性能滑条都失效（lane 恒 0），
+        // 而 shader 侧照样读它们 —— 表现为“设置怎么调都不动”。
+        ablateUbo->perfAoNearSamples =
+            g_perfAoNearSamples.load();
+        ablateUbo->perfAoMidSamples =
+            g_perfAoMidSamples.load();
+        ablateUbo->perfGiBounces =
+            g_perfGiBounces.load();
+        ablateUbo->perfSunShadowSamples =
+            g_perfSunShadowSamples.load();
+        ablateUbo->perfLocalLightRisCandidates =
+            g_perfLocalLightRisCandidates.load();
+        ablateUbo->perfLocalLightAreaSamples =
+            g_perfLocalLightAreaSamples.load();
+        // 2026-10-25：perf lane 只在值变化时打一行 —— 用来确认
+        // "GUI 设置 → JNI → g_perf* → CameraUBO" 这条链真的通了。
+        {
+            static uint32_t loggedPerfLaneHash = 0u;
+            const uint32_t laneHash =
+                ablateUbo->perfGiBounces * 73856093u ^
+                ablateUbo->perfAoNearSamples * 19349663u ^
+                ablateUbo->perfAoMidSamples * 83492791u ^
+                ablateUbo->perfSunShadowSamples * 2654435761u ^
+                ablateUbo->perfLocalLightRisCandidates;
+
+            if(laneHash != loggedPerfLaneHash)
+            {
+                loggedPerfLaneHash = laneHash;
+
+                RTLog(
+                    "[PERF LANE] giBounces=" + std::to_string(ablateUbo->perfGiBounces) +
+                    " aoNear=" + std::to_string(ablateUbo->perfAoNearSamples) +
+                    " aoMid=" + std::to_string(ablateUbo->perfAoMidSamples) +
+                    " sunShadow=" + std::to_string(ablateUbo->perfSunShadowSamples) +
+                    " risCand=" + std::to_string(ablateUbo->perfLocalLightRisCandidates) +
+                    " areaSamples=" + std::to_string(ablateUbo->perfLocalLightAreaSamples));
+            }
+        }
+
+
+        ablateUbo->perfWaterReflectionInterval =
+            g_perfWaterReflectionInterval.load();
+        ablateUbo->perfGlossyFullDistance =
+            g_perfGlossyFullDistance.load();
+
 
         // 2026-10-08（B）：水 LOD 帧时间反馈环的输入**也**写在这里 —— 这一块是
         // "每帧上传前"的 CPU 副本（见上面的 Perf-L10.2 注释），写在这里就能保证
@@ -61563,6 +68299,14 @@ if(!g_dlssGFeatureInitialized)
     );
 
 
+    // 2026-10-26 半透明 alpha blend 的 4 张全屏图（渲染分辨率）。
+    // 与 RR guide 同尺寸、同生命周期；尺寸不变时本函数第一行就返回。
+    createGlassAlphaBlendImages(
+        renderWidth,
+        renderHeight
+    );
+
+
     createVPTDirectHistoryBuffers(
         renderWidth,
         renderHeight
@@ -61963,18 +68707,29 @@ if(rrGuideBarrierCount > 0)
     recordWaterSimulation(cmd);
 
     // 2026-10-23：wsim scope 拆分（见 enum 处说明）。
-    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_WFFT);
+    // 2026-10-28 修正：这里原来写的是 WFFT，与枚举顺序（WSIM→WFFT→WCAUS→CAUS）
+    // 错开了一位 ⇒ `wfft` 段恒为 0（相邻边界差为负被丢弃），而 `wsim` 与 `caus`
+    // 各含一次焦散图重建，日志里表现为 wsim≈caus≈7.8ms 的"两个大段"，实际是
+    // 同一个 pass 被算了两次。写入顺序必须与枚举语义逐字一致。
+    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_WSIM);
 
     // 2026-10-03 FFT 频谱海面：按 rateHz 限频更新（默认 30 Hz ⇒ 全帧摊销 ~0.05 ms）
     recordWaterFftUpdate(cmd);
 
-    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_WCAUS);
+    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_WFFT);
 
     // 2026-10-19 折射焦散图：与 FFT 同一个 30 Hz 时钟（内部靠
     // g_waterFftUpdatedThisFrame 判断本帧是否需要重建），必须在 FFT 之后录。
     recordWaterCausticMap(cmd);
 
-    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_WSIM);
+    // 2026-10-26 持久泡沫图：30 Hz 自有钟，白浪输入是上面刚更新的 FFT 斜率；
+    // 岸线注入消费的是上一帧 RT 写的覆盖率。必须排在 RT 之前。
+    // 21:1x 用户不要泡沫 ⇒ 回退（录帧不再派发，资源代码见 46756 起的 #if 0）。
+#if 0
+    recordWaterFoam(cmd);
+#endif
+
+    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_WCAUS);
 
     // Dormant: 自然焦散已由上面的折射网格图（binding 69）承担，旧的解析 256²
     // 窗口 pass 保持退役；翻 kWATER_CAUSTIC_PASS_ENABLED 只用于 A/B。
@@ -61986,6 +68741,8 @@ if(rrGuideBarrierCount > 0)
     writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_CAUS);
 
     perfL10CpuPhaseAdvance(PERF_L10_CPU_P_RT);
+
+    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_CLOUDPIPE);
     // =====================================================================
     // 2026-10-17 顿卡定位（仪器化，只在超阈值时打一行）
     //
@@ -62063,20 +68820,28 @@ if(rrGuideBarrierCount > 0)
         {
             cloudPassWidth = std::max(1u, cloudPassWidth / cloudDownscale);
             cloudPassHeight = std::max(1u, cloudPassHeight / cloudDownscale);
-            const uint32_t cloudFloorPercent = g_cloudResFloorPercent.load();
-            if(cloudFloorPercent > 0u &&
-               g_dlssOutputWidth > 0u && g_dlssOutputHeight > 0u)
-            {
-                const uint32_t floorWidth =
-                    (g_dlssOutputWidth * cloudFloorPercent + 99u) / 100u;
-                const uint32_t floorHeight =
-                    (g_dlssOutputHeight * cloudFloorPercent + 99u) / 100u;
-                // 只在需要时抬分辨率；上限钳到输出分辨率（不越过显示口径）。
-                cloudPassWidth = std::min(
-                    std::max(cloudPassWidth, floorWidth), g_dlssOutputWidth);
-                cloudPassHeight = std::min(
-                    std::max(cloudPassHeight, floorHeight), g_dlssOutputHeight);
-            }
+        }
+
+        // ⚠ 2026-10-27 **代码漏了**：分辨率下限原来只写在 else 分支里，
+        // 而 postRrCloud（远云脱离 RR 合成，默认路径）走的是上面那个分支 ⇒
+        // 「云分辨率下限」这个设置**在 default 路径上完全无效**。
+        // 于是开了 DLSS-RR 之后云一直按 RR 内部渲染分辨率（可能只有显示的 1/2~1/3）
+        // 走 march，再被 RR 上采样 ⇒ 逐像素静态抖动被放大成 **2×2 / 3×3 的方块阵列**，
+        // 也就是用户报的"矩形一块一块挤在一起"。预览器是全分辨率、不做 RR 上采样，
+        // 所以同一份着色器在预览里完全看不到这个现象。
+        // 现在下限对两条路径都生效（上限仍钳到显示分辨率）。
+        const uint32_t cloudFloorPercent = g_cloudResFloorPercent.load();
+        if(cloudFloorPercent > 0u &&
+           g_dlssOutputWidth > 0u && g_dlssOutputHeight > 0u)
+        {
+            const uint32_t floorWidth =
+                (g_dlssOutputWidth * cloudFloorPercent + 99u) / 100u;
+            const uint32_t floorHeight =
+                (g_dlssOutputHeight * cloudFloorPercent + 99u) / 100u;
+            cloudPassWidth = std::min(
+                std::max(cloudPassWidth, floorWidth), g_dlssOutputWidth);
+            cloudPassHeight = std::min(
+                std::max(cloudPassHeight, floorHeight), g_dlssOutputHeight);
         }
         createVolumetricCloudPipeline(cloudPassWidth, cloudPassHeight);
     }
@@ -62141,6 +68906,9 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
 
     setPerfL10GpuRenderSize(renderWidth, renderHeight);
     recordSkyAtmosphere(cmd);
+
+    // 2026-10-26：体积光 froxel + ReSTIR（ORION_VOL_RESTIR=1 才生效）
+    recordVolumeRestir(cmd, renderWidth, renderHeight);
     rtSpikeSky = rtMark();
 
     writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_SKY);
@@ -62155,6 +68923,7 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
     // 代价照 SHARC 的教训（新增 pass 的固定开销不便宜）：空跑门禁 < 0.5ms。
     // =====================================================
     recordGiHalfPass(cmd, renderWidth, renderHeight);
+    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_GI);
 
     // recordGiHalfPass 绑过自己的管线与描述符集 ⇒ 主 trace 之前必须绑回主管线。
     vkCmdBindPipeline(
@@ -62173,6 +68942,14 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
         nullptr
     );
 
+    // 2026-10-27：稀疏活跃像素掩码必须在主 trace 之前生成 —— rt_test.rgen 的
+    // vptSparsePixelIsActive 直接读 binding 78（Remix 的 isActivePixelFromMask）。
+    recordSparseActiveMask(cmd, renderWidth, renderHeight);
+
+    // 2026-10-26：半透明 alpha blend 的旁路图必须在主 trace **之前**准备好
+    // （layout -> GENERAL + 74 号图清 0）。清 0 是正确性要求，理由见函数注释。
+    recordGlassAlphaBlendPrepare(cmd);
+
     trace(
         cmd,
         &g_raygenRegion,
@@ -62184,6 +68961,13 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
         1
     );
     rtSpikeTrace = rtMark();
+    writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_TRACE);
+
+    // 2026-10-26：半透明 alpha blend 的 [2] 取光/合成 + [3] 写回。
+    // 位置有讲究：必须紧跟 trace —— 它是 rtOutput 的**最终色**的最后一道工序，
+    // 之后的所有 pass（SHaRC resolve / 云 / 体积光 / RR）都应当看到合成后的颜色，
+    // 与 Remix 的 "alpha blend composite 先于 denoise" 一致。
+    recordGlassAlphaBlend(cmd, renderWidth, renderHeight);
 
     // 2026-10-11 5b-1：SHaRC 的 Resolve pass 紧跟在 RT pass 之后、**rt 时间戳边界之前**
     // —— 这样 SHaRC 的全部成本都记进 `[PERF L10 GPU]` 的 rt 段，而不会污染 cloud 段。
@@ -63386,9 +70170,17 @@ if(dlssLayoutBarrierCount > 0)
         // （探针 maxAbs=5.875px），官方口径要求 mvecScale = 1/renderW, 1/renderH。
         // 档位 1/2/3 只用于排查（2=y 取反，3=旧的 1,1），默认 1。
         {
-            // 2026-10-22：shader 已改为输出 **UV 位移**（dense MV，含相机运动），
-            // 官方 §6.0 规定"值落在 [-1,1] ⇒ mvecScale = {1,1}"。
-            // 旧的像素/UV 档位开关保留只为排查，默认即为 {1,1}。
+            // 2026-10-26（已回退）：曾按 sl_consts.h 的 "normalize to [-1,1]"
+            // 推断 UV(=NDC*0.5) 需要 scale=2，实测改为 {2,2} 后出现**拖影**
+            // （过度补偿）⇒ UV 位移与 {1,1} 本就是正确配对，恢复之。
+            // 原始说明：shader 写的是 **UV 位移**
+            //   rt_test.rgen:19345  (prevNdc - curNdc) * vec2(0.5, -0.5)
+            // 而 Streamline 要求 MV 落在 NDC [-1,1]（sl_consts.h:204：
+            //   "scale factors used to normalize motion vectors so the values
+            //    are in [-1,1] range"）。
+            // UV = NDC * 0.5 ⇒ scale 必须是 2 才能还原；此前的 {1,1} 让
+            // DLSS 只收到真实位移的一半，削弱时域累积（运动时残留拖影）。
+            // 档位 2/3 保留仅为排查（把 UV 误当像素的两种变体）。
             const uint32_t mvMode = g_mvScaleMode.load();
             const bool haveSize = g_motionWidth > 0u && g_motionHeight > 0u;
             const float invW = haveSize
@@ -63467,8 +70259,13 @@ if(dlssLayoutBarrierCount > 0)
             g_fgForceOffFrames.store(2u);
         }
 
+        // 2026-10-27：Remix rtx_context.cpp:415-420 的等价物 —— 采样率变化时
+        // 强制 reset 一次，让 RR 从新速率重新收敛（旧历史的 1/rate 口径不匹配）。
+        const bool sparseRateChanged =
+            g_sparseRateHistoryReset.exchange(false, std::memory_order_relaxed);
+
         constants.reset =
-            (!g_hasPrevCameraMatrices || resetByShapeChange)
+            (!g_hasPrevCameraMatrices || resetByShapeChange || sparseRateChanged)
                 ? sl::Boolean::eTrue
                 : sl::Boolean::eFalse;
 
@@ -64209,7 +71006,12 @@ sl::ResourceTag outputTag(
         // 2026-10-06 远云剥离 RR：云合成录在这里 —— RR 已经写完了 g_dlssOutputView，
         // 而在它被 AE / 显示变换读走之前。放在失败守卫之前：RR 失败时这张图本来
         // 就是坏的，没必要让云跟着消失。
-        recordCloudComposite(cmd);
+        // 2026-10-26 S4：体积光 ReSTIR 的屏幕积分。位置有讲究 —— 必须在云 pass 与
+    // 旧体积光之后（否则被旧 pass 写的"中性值"覆盖），且在 recordCloudComposite
+    // 之前（它要把 scene 乘上本 pass 输出的透射率）。
+    recordVolumeRestirScreenComposite(cmd);
+
+    recordCloudComposite(cmd);
 
 
         if(dlssResult != sl::Result::eOk)
@@ -64879,6 +71681,31 @@ vkCmdBindDescriptorSets(
     postPush.gainR = g_postGainR.load();
     postPush.gainG = g_postGainG.load();
     postPush.gainB = g_postGainB.load();
+    // 2026-10-26 色彩分级 24 lane（全中性值 = 着色器整块跳过 ⇒ 逐位不变）
+    postPush.manualEV = g_cgExposureEV.load();
+    postPush.blackPoint = g_cgBlackPoint.load();
+    postPush.whitePoint = g_cgWhitePoint.load();
+    postPush.gradeContrast = g_cgContrast.load();
+    postPush.gradePivot = g_cgPivot.load();
+    postPush.liftR = g_cgLiftR.load();
+    postPush.liftG = g_cgLiftG.load();
+    postPush.liftB = g_cgLiftB.load();
+    postPush.gradeGammaR = g_cgGammaR.load();
+    postPush.gradeGammaG = g_cgGammaG.load();
+    postPush.gradeGammaB = g_cgGammaB.load();
+    postPush.gradeGainR = g_cgGainR.load();
+    postPush.gradeGainG = g_cgGainG.load();
+    postPush.gradeGainB = g_cgGainB.load();
+    postPush.shadowHue = g_cgShadowHue.load();
+    postPush.shadowStrength = g_cgShadowStrength.load();
+    postPush.highlightHue = g_cgHighlightHue.load();
+    postPush.highlightStrength = g_cgHighlightStrength.load();
+    postPush.vibrance = g_cgVibrance.load();
+    postPush.fade = g_cgFade.load();
+    postPush.vignette = g_cgVignette.load();
+    postPush.vignetteRadius = g_cgVignetteRadius.load();
+    postPush.hueRotate = g_cgHueRotate.load();
+    postPush.tintGreen = g_cgTintGreen.load();
     vkCmdPushConstants(
         cmd,
         g_sdrPostPipelineLayout,
@@ -65749,6 +72576,85 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_cleanup(JNIEnv*,jcla
         );
 
 
+        // 2026-10-27 蓝噪声表（与设备同生命周期）。
+        if(g_glassBlueNoiseBuffer)
+        {
+            vkDestroyBuffer(g_device, g_glassBlueNoiseBuffer, nullptr);
+            g_glassBlueNoiseBuffer = VK_NULL_HANDLE;
+        }
+
+        if(g_glassBlueNoiseMemory)
+        {
+            vkFreeMemory(g_device, g_glassBlueNoiseMemory, nullptr);
+            g_glassBlueNoiseMemory = VK_NULL_HANDLE;
+        }
+
+        g_glassBlueNoiseReady = false;
+
+        // 2026-10-27 稀疏活跃像素掩码（与设备同生命周期）。
+        if(g_sparseActiveMaskPipeline)
+        {
+            vkDestroyPipeline(g_device, g_sparseActiveMaskPipeline, nullptr);
+            g_sparseActiveMaskPipeline = VK_NULL_HANDLE;
+        }
+
+        if(g_sparseActiveMaskPipelineLayout)
+        {
+            vkDestroyPipelineLayout(g_device, g_sparseActiveMaskPipelineLayout, nullptr);
+            g_sparseActiveMaskPipelineLayout = VK_NULL_HANDLE;
+        }
+
+        if(g_sparseActiveMaskPool)
+        {
+            vkDestroyDescriptorPool(g_device, g_sparseActiveMaskPool, nullptr);
+            g_sparseActiveMaskPool = VK_NULL_HANDLE;
+            g_sparseActiveMaskSet = VK_NULL_HANDLE;
+        }
+
+        if(g_sparseActiveMaskSetLayout)
+        {
+            vkDestroyDescriptorSetLayout(g_device, g_sparseActiveMaskSetLayout, nullptr);
+            g_sparseActiveMaskSetLayout = VK_NULL_HANDLE;
+        }
+
+        if(g_sparseActiveMaskShader)
+        {
+            vkDestroyShaderModule(g_device, g_sparseActiveMaskShader, nullptr);
+            g_sparseActiveMaskShader = VK_NULL_HANDLE;
+        }
+
+        destroySparseActiveMaskImage();
+
+        // 2026-10-26 半透明 alpha blend 的 4 张图（与 RR guide 同生命周期）。
+        destroyHistoryImage(
+            g_alphaBlendGbufferImage,
+            g_alphaBlendGbufferMemory,
+            g_alphaBlendGbufferView,
+            g_alphaBlendGbufferLayout
+        );
+
+        destroyHistoryImage(
+            g_alphaBlendMetaImage,
+            g_alphaBlendMetaMemory,
+            g_alphaBlendMetaView,
+            g_alphaBlendMetaLayout
+        );
+
+        destroyHistoryImage(
+            g_alphaBlendLightImage,
+            g_alphaBlendLightMemory,
+            g_alphaBlendLightView,
+            g_alphaBlendLightLayout
+        );
+
+        destroyHistoryImage(
+            g_alphaBlendRadianceImage,
+            g_alphaBlendRadianceMemory,
+            g_alphaBlendRadianceView,
+            g_alphaBlendRadianceLayout
+        );
+
+
         destroyHistoryImage(
             g_rrStableRadianceImage,
             g_rrStableRadianceMemory,
@@ -65960,6 +72866,13 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_cleanup(JNIEnv*,jcla
 
 
         destroyVolumetricCloudResources();
+        // 2026-10-26：深度采样器是会话级资源（云的描述符集 + 体积雾 composite 共用），
+        // 与云的资源一起在这里释放；运行期（froxel 尺寸变化）不再销毁。
+        if(g_volDepthSampler != VK_NULL_HANDLE)
+        {
+            vkDestroySampler(g_device, g_volDepthSampler, nullptr);
+            g_volDepthSampler = VK_NULL_HANDLE;
+        }
         destroySunShadowResources();
         destroySunShadowFarResources();
         destroyTerrainHeightResources();
@@ -65974,6 +72887,11 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_cleanup(JNIEnv*,jcla
         destroyWaterCausticResources();
         // 2026-10-19：焦散图引用了 FFT 斜率图视图，必须在 destroyWaterFftResources 之前。
         destroyWaterCausticMapResources();
+        // 2026-10-26：泡沫图引用了水模拟 / FFT 斜率图视图，必须排在两者之前。
+        // 21:1x 用户不要泡沫 ⇒ 回退（资源整块在 46756 起的 #if 0 里，无资源可销毁）。
+#if 0
+        destroyWaterFoamResources();
+#endif
         destroyWaterSimulationResources();
         destroyWaterFftResources();
         destroyVoxyLodAtlasResources();
@@ -70009,6 +76927,29 @@ static bool rebuildWorldGeometry(
             );
         }
 
+        // =====================================================
+        // 2026-10-24 可见性图快照（语义见 SPATIAL_SECTION_KEY_MASK 附近的说明）。
+        // 每帧一次加锁拷贝，循环内只做无锁二分 —— 逐实例加锁会把一个 O(log n)
+        // 的查表变成锁争用。
+        // =====================================================
+        const int visCullMode = visibleSectionCullMode();
+
+        static std::vector<uint64_t> s_visibleSectionKeysLocal;
+
+        static int s_visCullCandidateCount = 0;
+
+        s_visibleSectionKeysLocal.clear();
+
+        if(visCullMode > 0)
+        {
+            std::lock_guard<std::mutex> visLock(g_visibleSectionKeysMutex);
+
+            s_visibleSectionKeysLocal.assign(
+                g_visibleSectionKeys.begin(),
+                g_visibleSectionKeys.end()
+            );
+        }
+
 
         for(
             uint32_t instanceIndex = 0;
@@ -70110,6 +77051,10 @@ static bool rebuildWorldGeometry(
                             " frustumCulled=" + std::to_string(diagFrustumCulled) +
                             " casterCulled=" + std::to_string(diagCasterCulled) +
                             " primaryMasked=" + std::to_string(s_cullPrimaryMaskedCount) +
+                            " visKeys=" + std::to_string(
+                                g_visibleSectionKeyCount.load()) +
+                            " visCand=" + std::to_string(s_visCullCandidateCount) +
+                            " visMode=" + std::to_string(visibleSectionCullMode()) +
                             " cullDist=" + std::to_string(diagCullLimit) +
                             " mode=" + std::to_string(tlasCullModeValue) +
                             " casterPlanes=" + std::to_string(s_casterPlaneCount) +
@@ -70129,6 +77074,7 @@ static bool rebuildWorldGeometry(
                     diagFrustumCulled = 0;
                     diagCasterCulled = 0;
                     s_cullPrimaryMaskedCount = 0;
+                    s_visCullCandidateCount = 0;
                 }
 
                 // =================================================
@@ -70212,6 +77158,43 @@ static bool rebuildWorldGeometry(
                         {
                             primaryMaskCull = true;
                             break;
+                        }
+                    }
+                }
+
+                // =================================================
+                // 2026-10-24 项 1：可见性图主射线掩码剔除。
+                //
+                // 判据三层：
+                //   ① diagWorldHeightSection —— **必须**。voxy / DH LOD 与实体
+                //      聚合（entity / localPlayer / particle）的 spatialKey 不是
+                //      世界坐标，永远不在原版可见性图里；少了这一条它们会被当成
+                //      "不可见"整体清掉主射线位，实机表现就是实体、玩家自身、
+                //      粒子、远场全部从主画面消失。
+                //   ② cullGuardKeepsSection —— 近场保底原样保留。清 bit0 本来
+                //      不影响次级射线，但这一条把触发面压到最小。
+                //   ③ sunShadowKeepsSection **不**参与判断：那个盒子是为了让
+                //      遮挡体留在 TLAS 里给太阳阴影射线用，而本条改动不删实例、
+                //      只清主射线位，阴影射线（0xff / 0x04）逐位不变。
+                // =================================================
+                if(visCullMode > 0 &&
+                   diagWorldHeightSection &&
+                   !cullGuardKeepsSection)
+                {
+                    const bool visibleInGraph =
+                        std::binary_search(
+                            s_visibleSectionKeysLocal.begin(),
+                            s_visibleSectionKeysLocal.end(),
+                            spatialKey
+                        );
+
+                    if(!visibleInGraph)
+                    {
+                        s_visCullCandidateCount += 1;
+
+                        if(visCullMode >= 2)
+                        {
+                            primaryMaskCull = true;
                         }
                     }
                 }
@@ -70372,7 +77355,10 @@ static bool rebuildWorldGeometry(
             // 2026-10-24 mode 5：主射线掩码剔除。
             // 判定在上面的逐实例诊断块里算好（primaryMaskCull），这里只做动作 ——
             // instance.mask 在这个位置才最终确定（上面每个 class 都会重写它）。
-            if(cullPrimaryMaskActive && primaryMaskCull)
+            // 2026-10-24：条件收窄到 primaryMaskCull 本身 —— mode 5 的
+            // cullPrimaryMaskActive 已经在设置它的那个块里判断过了（:70198），
+            // 项 1 则有自己的一套判据。两条来源在这里统一成一次动作。
+            if(primaryMaskCull)
             {
                 instance.mask &= 0xfeu;
                 s_cullPrimaryMaskedCount += 1;

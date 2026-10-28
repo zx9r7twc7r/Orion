@@ -1,0 +1,245 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// ===========================================================================
+// vol_restir_composite.comp —— 体积光 ReSTIR（S4：屏幕积分）
+//
+//   initial → temporal → spatial → visibility → integrate → screen composite
+//                                                          ^^^^^^^^^^^^^^^^ 本文件
+//
+// 职责：全分辨率逐像素沿视线步进，采样 integrate 写出的 froxel 辐亮度 3D 图，
+// 累积成 {rgb = 入散射, a = 透射率}，输出给现有的 god_ray_composite.comp 做
+// `scene * a + rgb` —— 合成链完全复用，本 pass 不碰场景图。
+//
+// **水上水下同一套代码**：介质由一个分支切换，没有第二条 march。
+// 这与 RTX Remix 的架构一致 —— 它的 shaders 树里 "underwater" 零命中，
+// 体积光只有一套（rtx/pass/volumetrics/），介质由场景的 volume 参数提供。
+// 本工程原先让旧 volumetric_light.comp 单独管水下，结果是两套介质、两套
+// 曝光标定，且两者写同一张 g_godRayTargetImage 互相覆盖。2026-10-26 起
+// 旧 pass 整体停用，水下并入本链。
+//
+// 采样口径对齐 RTX Remix `rtx/utility/froxel.slangh:165-175
+// screenUVViewZToFroxelUVW`：
+//   uvw = vec3(screenUV, viewZToDepthSlice(viewZ) / depthSlices)
+// 步进用与 froxel 切片相同的指数分布，步长按 viewZ 累加（不是按射线长度），
+// 否则屏幕边缘与中心的有效层数会不一致。
+//
+// 介质（两套，逐项照抄旧实现，见各处注释）
+//   水上：fog_density_common.glsl 的高度剖面（标量，三通道相同）
+//   水下：volumetric_light.comp:297-332 / 693-735 的水色三件套 + 出水 bound
+//
+// binding（set 0）
+//   0 CameraProperties
+//   1 sceneDepth（reverse-Z）
+//   2 froxel 辐亮度（sampler3D）
+//   3 输出 rgba16f image2D
+// ===========================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+#include "fog_density_common.glsl"
+
+layout(set = 0, binding = 1) uniform sampler2D sceneDepth;
+layout(set = 0, binding = 2) uniform sampler3D froxelRadiance;
+layout(rgba16f, set = 0, binding = 3) uniform writeonly image2D volCompositeOut;
+
+layout(push_constant) uniform VolRestirCompositePush
+{
+    // x = 最远距离(格), y = 深度指数, z = 步数, w = 消光缩放
+    vec4 params;
+    // x = froxel 宽, y = froxel 高, z = 层数, w = 保留
+    ivec4 grid;
+} pc;
+
+// ---- 水介质常量（照抄 volumetric_light.comp:297-307）----
+const float WATER_GODRAY_MAX_DISTANCE = 48.0;
+const float WATER_GODRAY_SCATTER_SCALE = 0.35;
+const float WATER_GODRAY_WAVE_AMPLITUDE = 0.25;
+
+// 水色三件套（照抄 volumetric_light.comp:311-332，那里注明真源在 rt_test.rgen）。
+vec3 waterAbsorptionColor()
+{
+    return mix(
+        vec3(0.18, 0.055, 0.018),
+        vec3(0.24, 0.045, 0.055),
+        clamp(cam.waterStyleParams0.y, 0.0, 1.0)
+    ) * clamp(cam.waterStyleParams0.z, 0.25, 4.0);
+}
+
+vec3 waterScatterColor()
+{
+    return mix(
+        vec3(0.05, 0.22, 0.28),
+        vec3(0.05, 0.34, 0.30),
+        clamp(cam.waterStyleParams0.y, 0.0, 1.0)
+    );
+}
+
+float waterScatteringAmount()
+{
+    return mix(0.3076923, 0.38, clamp(cam.waterStyleParams0.y, 0.0, 1.0));
+}
+
+// Reverse-Z scene depth → 沿视线的线性距离。
+// 逐行照抄 volumetric_light.comp:451-463（两侧必须同口径，否则体积光与雾对
+// "墙在哪"的判断会差一截）。
+float sceneDistanceForDepth(vec2 ndc, float depthValue)
+{
+    if(depthValue <= 1.0e-5)
+    {
+        return 1.0e30;
+    }
+
+    vec4 sceneViewPosition = cam.projInverse * vec4(ndc, depthValue, 1.0);
+    if(abs(sceneViewPosition.w) <= 1.0e-6)
+    {
+        return 1.0e30;
+    }
+
+    return length(sceneViewPosition.xyz / sceneViewPosition.w);
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(volCompositeOut);
+
+    if(any(greaterThanEqual(pixel, size)))
+    {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+    vec2 ndc = uv * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+
+    // ---- 视线与几何截断 ----
+    vec4 viewPosition = cam.projInverse * vec4(ndc, 1.0, 1.0);
+    vec3 viewTarget = abs(viewPosition.w) > 1.0e-6
+        ? viewPosition.xyz / viewPosition.w
+        : viewPosition.xyz;
+    vec3 worldDirection = normalize(
+        (cam.viewInverse * vec4(normalize(viewTarget), 0.0)).xyz);
+
+    vec3 cameraPosition = cam.viewInverse[3].xyz;
+    vec3 cameraForward = -normalize(cam.viewInverse[2].xyz);
+    float cosAngle = max(dot(worldDirection, cameraForward), 1.0e-3);
+
+    float depthValue = textureLod(sceneDepth, uv, 0.0).r;
+    float sceneDistance = sceneDistanceForDepth(ndc, depthValue);
+
+    float nearPlane = max(cam.cameraParams.x, 1.0e-3);
+    float maxViewZ = max(pc.params.x, nearPlane + 1.0);
+    float depthExponent = max(pc.params.y, 1.0);
+    int stepCount = int(clamp(pc.params.z, 1.0, 64.0));
+    float depthSlices = float(max(pc.grid.z, 1));
+    float extinctionScale = max(pc.params.w, 0.0);
+
+    // ---- 介质选择 ----
+    // waterSimState = (readLayer, enabled, impulsePending, cameraInWater)
+    // —— C++ 的 CameraUBO.waterSimState.w，见 VulkanCore.cpp:3895-3898。
+    const bool underwater = cam.waterSimState.w != 0u;
+
+    vec3 sigmaUniform;
+    if(underwater)
+    {
+        // 水的消光是逐通道的（红先死）：吸收 + 散射都进消光。
+        sigmaUniform = waterAbsorptionColor() +
+            waterScatterColor() * waterScatteringAmount() * WATER_GODRAY_SCATTER_SCALE;
+    }
+    else
+    {
+        float fogAmount = clamp(cam.cloudParams7.y, 0.0, 4.0);
+        sigmaUniform = vec3(VFOG_DENSITY * fogAmount);
+    }
+
+    // ---- march 末端 ----
+    float marchDistance = min(sceneDistance, maxViewZ / cosAngle);
+
+    // 2026-10-28：末端留半个深度切片。照抄 Remix 的 depthOffset
+    // （rtx_global_volumetrics.h:178，默认 0.5，注释原文 "Depth offset to avoid
+    // volumetric light leaking."；用法见 volume_composite_helpers.slangh:118-121
+    // 的 `hitDistance - (froxelMaxDistance/froxelDepthSlices) * depthOffset`）。
+    // 不减这一下，最后一段（一个切片厚，96 格 / 64 层 ⇒ 末端 1.5~3 格）的入散射
+    // 会被整段铺在刚撞上的那个表面上，表现为"贴着墙/地板的一圈光"。
+    // sceneDistance == 1e30（天空）不偏移 —— 与原文 `primaryMiss ? maxDistance : …` 同构。
+    {
+        const float depthOffset = 0.5;
+        const float sliceLength = pc.params.x / max(depthSlices, 1.0);
+
+        if(sceneDistance < 1.0e29)
+        {
+            marchDistance = max(marchDistance - sliceLength * depthOffset, 0.0);
+        }
+    }
+
+    if(underwater)
+    {
+        marchDistance = min(marchDistance, WATER_GODRAY_MAX_DISTANCE);
+
+        // 出水 bound（照抄 volumetric_light.comp:706-714）：视线朝上时 march
+        // 必须在水面停下，水面之上是空气，不属于水下介质。
+        if(worldDirection.y > 1.0e-4)
+        {
+            float surfaceExit = (cam.waterSimSurfaceAndOrigin.x +
+                WATER_GODRAY_WAVE_AMPLITUDE - cameraPosition.y) / worldDirection.y;
+            marchDistance = min(marchDistance, max(surfaceExit, 0.0));
+        }
+    }
+
+    // 几何截断换算到 viewZ 空间：沿射线的距离 × cos = 前向上的深度。
+    float marchViewZ = min(maxViewZ, marchDistance * cosAngle);
+
+    vec3 accumulated = vec3(0.0);
+    vec3 transmittance = vec3(1.0);
+    float previousViewZ = nearPlane;
+
+    for(int step = 1; step <= stepCount; ++step)
+    {
+        float sliceT = float(step) / float(stepCount);
+        float viewZ = nearPlane + pow(sliceT, depthExponent) * maxViewZ;
+
+        if(viewZ > marchViewZ)
+        {
+            break;
+        }
+
+        float rayStep = (viewZ - previousViewZ) / cosAngle;
+        previousViewZ = viewZ;
+
+        // screenUVViewZToFroxelUVW（Remix froxel.slangh:165-175）
+        float depthSlice = pow(clamp((viewZ - nearPlane) / maxViewZ, 0.0, 1.0),
+            1.0 / depthExponent) * depthSlices;
+        float froxelW = (depthSlice + 0.5) / depthSlices;
+
+        vec3 radiance = textureLod(froxelRadiance, vec3(uv, froxelW), 0.0).rgb;
+
+        vec3 sigma = sigmaUniform;
+        if(!underwater)
+        {
+            // 高度剖面（水上）：离 [0,96] 带越远越稀。
+            vec3 worldPosition = cameraPosition + worldDirection * (viewZ / cosAngle);
+            float density = fogDensityAt(worldPosition, 0.0,
+                clamp(cam.cloudParams7.y, 0.0, 4.0),
+                clamp(cam.weatherParams.x, 0.0, 1.0), 96.0, 0.0);
+            sigma = vec3(density);
+        }
+
+        sigma = max(sigma * extinctionScale, vec3(0.0));
+        vec3 stepTransmittance = exp(-sigma * rayStep);
+
+        // 该段内的解析积分（常密度）：∫ σ L e^{-σ s} ds = L (1 - e^{-σ Δ})
+        accumulated += transmittance * radiance * (vec3(1.0) - stepTransmittance);
+        transmittance *= stepTransmittance;
+    }
+
+    // 输出 alpha = 透射率。水上三通道相同；水下取平均（合成时 scene * a 是标量乘法）。
+    float alpha = clamp(dot(transmittance, vec3(1.0 / 3.0)), 0.0, 1.0);
+
+    imageStore(volCompositeOut, pixel, vec4(accumulated, alpha));
+}

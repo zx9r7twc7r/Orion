@@ -237,7 +237,7 @@
     //   y = 地面大气透视强度（#2 载体；0 = 关 = 现网 AP_BASE_EXTINCTION_SCALE）
     //   z = 地面大气透视遮挡衰减（#2；沿视线查远影图求"被地形挡住的比例"，
     //       削掉阴影段产生的 in-scatter。0 = 不衰减）
-    //   w = 保留（宿主写 0）
+    //   w = 保留（0；2026-10-26 泡沫读层 lane 已随泡沫回退作废）
     vec4 cloudAerialParams;
 
     // SHaRC 缓存缓冲的 64 位设备地址（偏移 1424）。buffer_reference 按地址访问内存，
@@ -286,7 +286,7 @@
     // 不移动任何已读偏移。唯一消费者：rt_test.rchit（不透明地形 POM）。
     //   x = 0（默认 / 旧 DLL）＝ 平滑：双线性高度场
     //       > 0.5        ＝ 锐利：单纹素 texelFetch（PARALLAX_MODE1）
-    //   yzw 保留。
+    //   yzw = 保留（0；2026-10-26 泡沫原点/纹素 lane 已随泡沫回退作废）
     // 只切换高度场采样，不动位移 / 深度 / 自阴影口径。
     // ---------------------------------------------------------------------
     vec4 pomParams;
@@ -330,8 +330,64 @@
     //   x = 0（默认 / 旧 DLL）＝ 旧路径：主 raygen 自己跑全分辨率 GI 回路。
     //       > 0.5            ＝ 新路径：主 raygen 从 giHalfImage 上采样，GI 由
     //       独立 pass 在半分辨率执行（宿主 ORION_GI_HALF=1 时 dispatch）。
-    //   yzw 保留。
+    //   y = 半图相位是否按帧轮转（2026-10-25：默认 0 = 固定相位；轮转会让每个
+    //       texel 代表的世界位置每帧平移一个像素，RR 的时间累积失效 ⇒ 闪点）
+    //   z = GI 射线跳过 POM（含 POM 自阴影，2026-10-25 A/B；宿主 ORION_GI_NO_POM）
+    //   w = 光泽反射按粗糙度降速（2026-10-25；宿主 ORION_GLOSSY_ROUGH_LOD）
     // ⚠ 两个变体共用同一份 UBO，这一格是**唯一**开关；宿主在资源没建好 / 设备
     //   不支持 ray tracing 时必须写 0，否则主变体会去读未写描述符。
     // ---------------------------------------------------------------------
     vec4 giHalfParams;
+
+    // ---------------------------------------------------------------------
+    // 2026-10-25 近场 GI 采样率（偏移 1584，尾追加不动任何已读偏移）。
+    //   x = 0 全速 / 1 半速 / 2 四分之一（宿主 ORION_GI_NEAR_RATE）
+    //       消费者：rt_test.rgen 的 rtLodDiffuseGiEnabled 之后那一段
+    //   yzw 保留（宿主写 0）
+    // ---------------------------------------------------------------------
+    vec4 giRayParams;
+
+    // ---------------------------------------------------------------------
+    // 2026-10-25 v5（HPVolumeCloud 移植）全参数尾块，偏移 1600..1712 ——
+    // 尾追加不动任何已读偏移。唯一消费者：volumetric_clouds_v5.comp
+    //（写进 cloud_v5_core.glsl 的 HPCloudConfig）。
+    //
+    // 哨兵语义与其他尾块一致：**负值 = 未写入** ⇒ 保留 hpDefaultConfig 的出厂值。
+    // 28 项顺序（Java 侧 setCloudHpParams 的数组顺序必须一致）：
+    //   hpShapeA = detailStrengthCu / detailStrengthTcu / detailStrengthCb / bottomSmoothHeight
+    //   hpShapeB = wispyEdgeWidth / wispyReach / wispyTopHeight / wispyTopHardness
+    //   hpShapeC = wispyWeight / billowyWeight / loCoverTopMax / loCoverTopStr
+    //   hpShapeD = covMapScale / scWorleyStrength / scHeightScale / scCellThickStr
+    //   hpLightA = forwardEcc / backwardEcc / phiFwdIntensity / phiFwdDepthPow
+    //   hpLightB = phiFwdDepthBias / phiFwdCompress / scatterODScale / scatterCurvePow
+    //   hpMiscA  = msEccentricity / aoUpwardScale / fadeStart / powderIntensity(保留)
+    // ---------------------------------------------------------------------
+    vec4 hpShapeA;
+    vec4 hpShapeB;
+    vec4 hpShapeC;
+    vec4 hpShapeD;
+    vec4 hpLightA;
+    vec4 hpLightB;
+    vec4 hpMiscA;
+
+    // ---------------------------------------------------------------------
+    // 2026-10-26 直接光模式 + 稀疏渲染（HANDOFF-2026-10-26-RTDI-SPARSE.md），
+    // 偏移 1712，尾追加不动任何已读偏移。消费者：rt_test.rgen。
+    //   x = 直接光采样模式：0 = 传统单帧 RIS（默认 = 逐位旧画面）；
+    //       1 = RTXDI 式时域 reservoir（重投影上一帧 reservoir + 灯身份验证
+    //       （世界坐标+类型）+ 本帧 RIS 候选 WRS 合并 + 1 条可见性射线）。
+    //       灯数组 revision（localLightBuffer.header.y）变化 ⇒ reservoir 重置。
+    //   y = 稀疏渲染活跃采样率（%）：0 = 关（默认 = 逐位旧画面）；
+    //       >0 时每像素白噪声抽签（pcg_hash(pixel,frame) ≤ rate/100），
+    //       非活跃像素跳过次级射线段（RTAO / 太阳软影 / 本地光 / GI / glossy），
+    //       但 depth / MV / guides / 天空照常全量写。与被证伪的 rtSpp=0.5
+    //       棋盘（整像素不写 ⇒ guides 全陈旧）本质不同：这里 guides 每帧
+    //       新鲜密集，只有 MC 类辐射度稀疏，DLSS-RR 重建（Remix sparse
+    //       rendering 同构：per_pixel_rate.slangh 白噪声默认 + composite 的
+    //       密集 guide / radianceScale 语义）。
+    //   z = RTXDI×稀疏联动：1（默认）= 非活跃像素仍做廉价 reservoir 验证/老化、
+    //       不发着色射线（对齐官方 rtx.sparseRendering.enableRtxdiReuseFor-
+    //       InactivePixels=true，防再激活闪烁）；0 = 非活跃像素完全跳过。
+    //   w = 保留（RTXDI 空间重用档位，本期不实现；宿主写 0）。
+    // ---------------------------------------------------------------------
+    vec4 sparseParams;

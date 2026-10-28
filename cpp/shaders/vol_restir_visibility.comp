@@ -1,0 +1,126 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_ray_query : require
+
+// ===========================================================================
+// vol_restir_visibility.comp —— 体积光 ReSTIR（S3b：可见性）
+//
+// 插在 spatial 之后、integrate 之前：
+//
+//   initial → temporal → spatial → visibility → integrate → composite
+//                                   ^^^^^^^^^^ 本文件
+//
+// 为什么必须有它：spatial 之后每个 reservoir 都拿着一盏"统计上最亮的灯"，
+// 但没有任何东西检查这盏灯与该点之间有没有墙。缺了这一步，火把隔着厚墙也能
+// 把整条走廊的雾照亮 —— 这不是调参能盖住的，是结构性错误。
+//
+// 为什么放在 spatial 之后而不是 initial 之后：射线数量按 restir texel 计
+// （22×12×64 ≈ 17k 条/帧）。若在 initial 之后做，temporal/spatial 会把新样本
+// 合并进来，那些样本没经过验证；放在最后则**只验证最终会被积分的那一个样本**，
+// 一条射线一份有效结果。
+//
+// 被挡的处理：把该 texel 的 reservoir 整体写成空（M = 0）。integrate 看到
+// M = 0 就不写辐亮度，该 froxel 那一片就是黑的 —— 正是"墙后无光"。
+//
+// 射线约定（与生产端一致）：TerminateOnFirstHit | SkipClosestHitShader，
+// 只判定"有没有相交"，不取着色结果。cull mask 取 0xFF（全部几何）：玻璃等
+// 透明体挡光在体积散射里是正确的，光子确实被折射走了。
+//
+// 已知边界：太阳（lightIndex = 0）本阶段没有候选，因此没有太阳可见性检验。
+//
+// binding（set 0）
+//   0  CameraProperties
+//   1  reservoir（restir 网格，读写）
+//   2  场景 TLAS
+//   12 本地光表 / 13 空间网格
+// ===========================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+#include "local_light_grid_common.glsl"
+#include "vol_restir_common.glsl"
+
+layout(rgba32ui, set = 0, binding = 1) uniform uimage3D volReservoirInOut;
+layout(set = 0, binding = 2) uniform accelerationStructureEXT sceneTlas;
+
+layout(push_constant) uniform VolRestirVisibilityPush
+{
+    ivec4 froxelSize;
+    vec4 volumeParams;
+} pc;
+
+void main()
+{
+    ivec3 restirCoord = ivec3(gl_GlobalInvocationID);
+    ivec3 restirSize = ivec3(imageSize(volReservoirInOut));
+
+    if(any(greaterThanEqual(restirCoord, restirSize)))
+    {
+        return;
+    }
+
+    VolReservoir reservoir = volRestirUnpack(imageLoad(volReservoirInOut, restirCoord));
+
+    // 空样本或太阳（本阶段无太阳候选）→ 不做检验。
+    if(reservoir.sampleCount == 0u || reservoir.lightIndex == 0u)
+    {
+        return;
+    }
+
+    uint tableIndex = reservoir.lightIndex - 1u;
+    if(tableIndex >= fogLightBuffer.header.x)
+    {
+        imageStore(volReservoirInOut, restirCoord, uvec4(0u));
+        return;
+    }
+
+    LocalLightGPU light = fogLightBuffer.lights[tableIndex];
+
+    int restirDownscale = max(pc.froxelSize.w, 1);
+    vec3 froxelCenter = volRestirFroxelCenter(
+        restirCoord, restirSize, vec2(pc.froxelSize.xy), restirDownscale,
+        pc.volumeParams.x, pc.volumeParams.y);
+
+    vec3 toLight = light.worldPosEmission.xyz - froxelCenter;
+    float distanceToLight = length(toLight);
+
+    if(distanceToLight <= 1.0e-3)
+    {
+        return;
+    }
+
+    vec3 rayDirection = toLight / distanceToLight;
+
+    // 起点偏移：避免自相交（0.05 格，与 sun_shadow.glsl 的口径同量级）。
+    const float originBias = 0.05;
+    float tMin = originBias;
+    float tMax = distanceToLight - originBias;
+
+    if(tMax <= tMin)
+    {
+        return;
+    }
+
+    rayQueryEXT rayQuery;
+    rayQueryInitializeEXT(rayQuery, sceneTlas,
+        gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+        0xFFu,
+        froxelCenter + rayDirection * originBias, tMin,
+        rayDirection, tMax);
+
+    while(rayQueryProceedEXT(rayQuery))
+    {
+    }
+
+    if(rayQueryGetIntersectionTypeEXT(rayQuery, true) !=
+        gl_RayQueryCommittedIntersectionNoneEXT)
+    {
+        // 被几何挡住：清空样本，integrate 跳过该 froxel。
+        imageStore(volReservoirInOut, restirCoord, uvec4(0u, 0u, 0u, 0u));
+    }
+}

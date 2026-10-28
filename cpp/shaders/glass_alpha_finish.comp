@@ -1,0 +1,136 @@
+#version 460
+
+// ============================================================================
+// glass_alpha_finish.comp —— 半透明合成（**逐字照抄** Remix 的合成式）
+//
+// 原文：_ref/dxvk-remix/src/dxvk/shaders/rtx/pass/composite/composite.comp.slang
+//   :520   backgroundAlpha = surface.backgroundTransparency;
+//   :812   return vec4(radianceOutput * backgroundAlpha + alphaBlendOutput, 1.f);
+//
+// 分工：
+//   glass_alpha_blend.comp   产出 alphaBlendOutput（= surfaceLight * color.a，
+//                            原文 composite_alpha_blend.comp.slang:273）
+//   本 pass                  做 radianceOutput * backgroundAlpha + alphaBlendOutput
+//   backgroundAlpha 存在 74 号图的 x 通道（AlphaBlendSurface.backgroundTransparency）
+//
+// 为什么必须单独一个 pass：邻居搜索要读 rtOutput 的**邻居格**（取邻像素光照），
+// 而合成要写本格。同一 dispatch 跨格读 + 写同一张 storage image 是竞态。
+// 本 pass 只做"本格读 + 本格写"，没有跨格依赖。
+//
+// 判据用 hitT（74 号图 y 通道）：AlphaBlendSurface::isValid() == hitT > 0
+// （alpha_blend_surface.slangh:95-98）。空槽由宿主清成 (bgT=1, hitT=0)。
+// ============================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// 与 glass_alpha_blend.comp 共用同一个 set layout（宿主只建一份）。
+layout(rgba16f, set = 0, binding = 0) uniform image2D sceneColor;
+layout(rgba16f, set = 0, binding = 1) uniform image2D alphaBlendGbuffer;
+layout(rgba16f, set = 0, binding = 2) uniform image2D alphaBlendMeta;
+layout(rgba16f, set = 0, binding = 3) uniform image2D alphaBlendAux;
+layout(rgba16f, set = 0, binding = 4) uniform image2D alphaBlendRadiance;
+layout(r32f,    set = 0, binding = 5) uniform image2D sceneDepth;
+layout(rgba16f, set = 0, binding = 6) uniform image2D sceneNormalRoughness;
+layout(rgba16f, set = 0, binding = 7) uniform image2D sceneDiffuseAlbedo;
+
+layout(push_constant) uniform GlassAlphaBlendPush
+{
+    uint  extentX;
+    uint  extentY;
+    uint  searchIterations;
+    uint  frameIndex;
+    float initialSearchRadius;
+    float radiusExpand;
+    float normalSimilarity;
+    float depthDifference;
+    float planarDifference;
+    float shMaxDistance;
+    float shDepthExponent;
+    float shValid;
+    uint  useNeighborSearch;
+    uint  useRadianceVolume;
+    uint  searchTheSameObject;
+    uint  shareNeighbors;
+    uint  shFroxelW;
+    uint  shFroxelH;
+    uint  shFroxelDepth;
+    uint  dbgMode;
+} pc;
+
+void main()
+{
+    const ivec2 extent = ivec2(int(pc.extentX), int(pc.extentY));
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if(pixel.x < 0 || pixel.y < 0 || pixel.x >= extent.x || pixel.y >= extent.y)
+    {
+        return;
+    }
+
+    const vec4 meta = imageLoad(alphaBlendMeta, pixel);
+
+    // =====================================================
+    // 2026-10-28 探针：这两档必须**先于** meta 判据执行。
+    //
+    // 起因：之前所有档都写在 `meta.y <= 0 → return` 之后，于是
+    //   "这个像素没有 alpha blend 数据" 这一整类情况**在任何档下都看不出变化**，
+    //   表现为"改了十几轮一点变化都没有"。这里把两件事变成肉眼可见：
+    //
+    //   14 = 整屏强制涂红（不看 meta、不看任何图）
+    //        整屏红   ⇒ 本 pass 确实在写最终图（部署/顺序都对）
+    //        只有玻璃红 ⇒ 玻璃像素存在，只是数据可能无效
+    //        完全不变 ⇒ 输出被后续 pass 覆盖，或本 pass 没被 dispatch
+    //   1  = 输出 radiance 图（含 blend 对"无数据"像素涂的洋红）
+    //        洋红     ⇒ 该像素**没有** alpha blend 数据（没走这条链）
+    //        彩色     ⇒ 走了链（R=bgT G=a B=层数/8）
+    // =====================================================
+    if(pc.dbgMode == 14u)
+    {
+        imageStore(sceneColor, pixel, vec4(1.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    if(pc.dbgMode == 1u)
+    {
+        imageStore(
+            sceneColor,
+            pixel,
+            vec4(imageLoad(alphaBlendRadiance, pixel).rgb, 1.0));
+        return;
+    }
+
+    // isValid() == hitT > 0 —— 不是 alpha blend 面就一个字节都不动。
+    if(meta.y <= 0.0)
+    {
+        return;
+    }
+
+    // 诊断模式：blend 已经把三个量写成颜色，这里不再合成。
+    // 模式 9：纯背景输出（bgT 视为 1，不加表面项）。
+    if(pc.dbgMode == 9u)
+    {
+        imageStore(
+            sceneColor,
+            pixel,
+            vec4(max(imageLoad(sceneColor, pixel).rgb, vec3(0.0)), 1.0));
+        return;
+    }
+
+    if(pc.dbgMode >= 1u && pc.dbgMode <= 6u)
+    {
+        imageStore(
+            sceneColor,
+            pixel,
+            vec4(imageLoad(alphaBlendRadiance, pixel).rgb, 1.0));
+        return;
+    }
+
+    // 原文 composite.comp.slang:812
+    const vec3 radianceOutput = imageLoad(sceneColor, pixel).rgb;
+    const vec3 alphaBlendOutput = imageLoad(alphaBlendRadiance, pixel).rgb;
+    const float backgroundAlpha = clamp(meta.x, 0.0, 1.0);
+
+    imageStore(
+        sceneColor,
+        pixel,
+        vec4(max(radianceOutput * backgroundAlpha + alphaBlendOutput, vec3(0.0)), 1.0));
+}

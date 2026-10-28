@@ -26,7 +26,12 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-// 2026-10-03 后处理参数（宿主每帧随 dispatch 推送；20 字节）
+// 2026-10-03 后处理参数（宿主每帧随 dispatch 推送）。
+//
+// 2026-10-26：**扩到 32 lane = 128 字节**（Vulkan 对 push constant 的保底上限就是
+// 128），后 24 lane 是新的「色彩分级」组（设置页「色彩映射与调色」）。全部恒等时
+// main() 里整块跳过 ⇒ 老存档的画面逐位不变。宿主侧
+// cpp/VulkanCore.cpp 的 PostProcessingPush 必须与之逐 lane 对齐。
 layout(push_constant) uniform PostPush
 {
     int tonemapMode;         // 见文件头 mode 表
@@ -38,6 +43,32 @@ layout(push_constant) uniform PostPush
     float gainR;
     float gainG;
     float gainB;
+
+    // ===== 2026-10-26 色彩分级 24 lane（1 / 0 之类的"中性值"见每条注释）=====
+    float manualEV;          // 手动曝光（档，0 = 恒等；±4 约 ±4 档）
+    float blackPoint;        // 黑点（0 = 恒等）
+    float whitePoint;        // 白点（1 = 恒等；<1 提前削白=更平）
+    float gradeContrast;     // 显示域对比（1 = 恒等）
+    float gradePivot;        // 对比支点（0.18 线性灰）
+    float liftR;             // ASC-CDL offset（0 = 恒等）
+    float liftG;
+    float liftB;
+    float gradeGammaR;       // ASC-CDL 1/power（1 = 恒等）
+    float gradeGammaG;
+    float gradeGammaB;
+    float gradeGainR;        // ASC-CDL slope（1 = 恒等）
+    float gradeGainG;
+    float gradeGainB;
+    float shadowHue;         // 阴影分离色调色相（度）
+    float shadowStrength;    // 0 = 关
+    float highlightHue;      // 高光分离色调色相（度）
+    float highlightStrength; // 0 = 关
+    float vibrance;          // 自然饱和度（0 = 恒等；负 = 收彩）
+    float fade;              // 褪色/发灰（0 = 恒等；抬黑 + 压白）
+    float vignette;          // 暗角强度（0 = 关）
+    float vignetteRadius;    // 暗角起始半径（0.6 起暗）
+    float hueRotate;         // 全色相旋转（度，0 = 恒等；绕灰轴，保中性色）
+    float tintGreen;         // 绿/品红微调（0 = 恒等；>0 偏青绿，<0 偏品红）
 } postPush;
 
 // Analytic pane radiance that the raygen withheld from DLSS RR, added back
@@ -1038,6 +1069,40 @@ vec3 aces2Debug(vec3 linearSrgb, int stage)
     return rgb * 0.25;
 }
 
+// ===========================================================================
+// 2026-10-26 色彩分级的小件（设置页「色彩映射与调色」）
+// 全部作用在**显示域**（已 tonemap + 已做 gamma 的 [0,1] 值）—— 与 Resolve 的
+// 一级调色同一口径：Lift/Gamma/Gain、黑白场、支点对比、分离色调、暗角。
+// ===========================================================================
+
+const vec3 GRADE_LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+// 色调轮：hue 度 → 纯色（HSV 的 S=1 V=1，六段式）。
+vec3 gradeHueColor(float deg)
+{
+    return clamp(abs(mod(deg / 60.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
+}
+
+// 绕灰轴 (1,1,1)/√3 旋转色相（Rodrigues）。灰轴上的颜色（R=G=B）旋转后不变，
+// 所以中性灰不会被染色 —— 这正是想要的：只把"有彩"的部分往冷/暖推。
+vec3 gradeHueRotate(vec3 c, float deg)
+{
+    const vec3 axis = vec3(0.57735026919);
+    float a = radians(deg);
+    float cs = cos(a);
+    float sn = sin(a);
+    return c * cs + cross(axis, c) * sn + axis * dot(axis, c) * (1.0 - cs);
+}
+
+// 分离色调：把"当前色相相对灰轴的色度偏移"按亮度掩码加到画面上。
+// 用加色度（而不是乘法）是为了保持亮度不变：strength 只推色相，不动明暗。
+vec3 gradeSplitTone(vec3 c, float hue, float strength, float mask)
+{
+    vec3 tint = gradeHueColor(hue);
+    vec3 chroma = tint - vec3(dot(tint, GRADE_LUMA));
+    return c + chroma * (strength * mask * 0.35);
+}
+
 void main()
 {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
@@ -1086,6 +1151,9 @@ void main()
     // ⇒ 等效相机白平衡；三通道独立，可以当色温/色调/自定义染色用。
     exposed *= vec3(postPush.gainR, postPush.gainG, postPush.gainB);
 
+    // 2026-10-26 手动曝光（档）。exp2(0) 严格等于 1 ⇒ 默认逐位不变。
+    exposed *= exp2(postPush.manualEV);
+
     // 色彩映射（各模式输出**线性**值）
     vec3 displayLinear;
     if(postPush.tonemapMode == 1)
@@ -1125,6 +1193,128 @@ void main()
     vec3 displayColor = pow(max(displayLinear, vec3(0.0)), vec3(1.0 / postPush.gamma));
     const float luma = dot(displayColor, vec3(0.2126, 0.7152, 0.0722));
     displayColor = mix(vec3(luma), displayColor, postPush.saturation);
+
+    // =======================================================================
+    // 2026-10-26 色彩分级（设置页「色彩映射与调色」，24 lane）
+    //
+    // 作用点：显示域 [0,1]（tonemap + gamma + 饱和度之后）。这一段是新加的，
+    // **全部参数取中性值时整块跳过** ⇒ 老存档 / 没调过的人画面逐位不变。
+    //
+    // 顺序（与 Resolve 一级调色一致，改顺序会改变观感，别随手挪）：
+    //   黑白场 → 支点对比 → 逐通道 Lift/Gamma/Gain → 色相旋转 →
+    //   分离色调（阴影/高光）→ 自然饱和度 → 褪色 → 绿/品红 → 暗角
+    // =======================================================================
+    bool cgActive =
+        postPush.blackPoint != 0.0 ||
+        postPush.whitePoint != 1.0 ||
+        postPush.gradeContrast != 1.0 ||
+        postPush.liftR != 0.0 || postPush.liftG != 0.0 || postPush.liftB != 0.0 ||
+        postPush.gradeGammaR != 1.0 || postPush.gradeGammaG != 1.0 ||
+        postPush.gradeGammaB != 1.0 ||
+        postPush.gradeGainR != 1.0 || postPush.gradeGainG != 1.0 ||
+        postPush.gradeGainB != 1.0 ||
+        postPush.shadowStrength != 0.0 ||
+        postPush.highlightStrength != 0.0 ||
+        postPush.vibrance != 0.0 ||
+        postPush.fade != 0.0 ||
+        postPush.vignette != 0.0 ||
+        postPush.hueRotate != 0.0 ||
+        postPush.tintGreen != 0.0;
+
+    if(cgActive)
+    {
+        // ① 黑白场（levels）：把 [blackPoint, whitePoint] 拉回 [0,1]。
+        const float cgSpan = max(postPush.whitePoint - postPush.blackPoint, 1.0e-3);
+        displayColor =
+            max((displayColor - vec3(postPush.blackPoint)) / cgSpan, vec3(0.0));
+
+        // ② 支点对比：以 gradePivot 为轴拉伸/压缩。
+        displayColor =
+            max((displayColor - vec3(postPush.gradePivot)) * postPush.gradeContrast
+                + vec3(postPush.gradePivot), vec3(0.0));
+
+        // ③ ASC-CDL：out = (in * slope + offset) ^ (1/power)。
+        //    这里 slope = gradeGain、offset = lift、power = gradeGamma。
+        //    逐通道 ⇒ 可以把阴影压青、高光留暖（或反过来），是三通道旋钮做不到的。
+        const vec3 cdGain =
+            vec3(postPush.gradeGainR, postPush.gradeGainG, postPush.gradeGainB);
+        const vec3 cdLift =
+            vec3(postPush.liftR, postPush.liftG, postPush.liftB);
+        const vec3 cdGamma =
+            vec3(postPush.gradeGammaR, postPush.gradeGammaG, postPush.gradeGammaB);
+
+        if(cdGain != vec3(1.0) || cdLift != vec3(0.0) || cdGamma != vec3(1.0))
+        {
+            displayColor =
+                pow(max(displayColor * cdGain + cdLift, vec3(0.0)), 1.0 / cdGamma);
+        }
+
+        // ④ 全色相旋转（绕灰轴，中性色不动）。
+        if(postPush.hueRotate != 0.0)
+        {
+            displayColor = gradeHueRotate(displayColor, postPush.hueRotate);
+        }
+
+        // ⑤ 分离色调：暗部推冷、亮部留中性 —— "孤独感"主要靠这一步 + 色温。
+        if(postPush.shadowStrength != 0.0 || postPush.highlightStrength != 0.0)
+        {
+            const float tl = dot(displayColor, GRADE_LUMA);
+            const float shadowMask = 1.0 - smoothstep(0.0, 0.55, tl);
+            const float highMask = smoothstep(0.45, 1.0, tl);
+
+            if(postPush.shadowStrength != 0.0)
+            {
+                displayColor = gradeSplitTone(
+                    displayColor, postPush.shadowHue, postPush.shadowStrength, shadowMask);
+            }
+            if(postPush.highlightStrength != 0.0)
+            {
+                displayColor = gradeSplitTone(
+                    displayColor, postPush.highlightHue, postPush.highlightStrength, highMask);
+            }
+        }
+
+        // ⑥ 自然饱和度：彩色越多的地方越少动（与 ⑤ 相反，收彩时保住高彩细节）。
+        if(postPush.vibrance != 0.0)
+        {
+            const float vl = dot(displayColor, GRADE_LUMA);
+            const float mx = max(displayColor.r, max(displayColor.g, displayColor.b));
+            const float mn = min(displayColor.r, min(displayColor.g, displayColor.b));
+            const float chroma = max(mx - mn, 0.0);
+            const float amount = postPush.vibrance * (1.0 - smoothstep(0.0, 0.7, chroma));
+            displayColor =
+                mix(vec3(vl), displayColor, clamp(1.0 + amount, 0.0, 2.0));
+        }
+
+        // ⑦ 褪色（fade）：抬黑 + 压白 = 胶片那种"发灰的远"。
+        if(postPush.fade != 0.0)
+        {
+            displayColor = displayColor * (1.0 - 0.30 * postPush.fade)
+                         + vec3(0.11 * postPush.fade);
+        }
+
+        // ⑧ 绿/品红微调（一次性整体偏色，比三通道增益更容易压出"青绿感"）。
+        if(postPush.tintGreen != 0.0)
+        {
+            displayColor *=
+                vec3(1.0 - 0.05 * postPush.tintGreen,
+                     1.0 + 0.07 * postPush.tintGreen,
+                     1.0 - 0.05 * postPush.tintGreen);
+        }
+
+        // ⑨ 暗角：按"到中心的归一化距离"压边角。radius 越大起始越靠外。
+        if(postPush.vignette != 0.0)
+        {
+            const vec2 halfSize = vec2(size) * 0.5;
+            const vec2 q = (vec2(p) + vec2(0.5) - halfSize) / max(halfSize.x, 1.0);
+            const float radial = length(q) / max(length(vec2(1.0, halfSize.y / max(halfSize.x, 1.0))), 1.0e-3);
+            const float falloff =
+                smoothstep(postPush.vignetteRadius, 1.0, radial);
+            displayColor *= (1.0 - postPush.vignette * falloff);
+        }
+
+        displayColor = clamp(displayColor, vec3(0.0), vec3(1.0));
+    }
 
     imageStore(
         rrOutputImage,

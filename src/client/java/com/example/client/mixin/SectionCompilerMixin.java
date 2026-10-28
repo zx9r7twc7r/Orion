@@ -551,6 +551,19 @@ public class SectionCompilerMixin {
                                 vertexCount,
                                 stride
                         );
+
+                        // 2026-10-26（对齐 Remix）：Remix 的 translucent 层没有
+                        // "几何反推 owner 方块"这一步 —— 材质由绘制状态的 blend
+                        // 决定，正反面一视同仁。上面那次反推一失败就把 byte27 留成
+                        // 0，该面在 native 侧落回**不透明地形**，于是出现
+                        // "正面透明、侧面是色块"。
+                        // 这里整层兜底：仍然没有标记的 quad 统一标成半透明体
+                        // （marker 2）；水（1）与玻璃族（3..18）保持不动。
+                        matchedTranslucentQuads += fillUntaggedTranslucentQuads(
+                                vertexBuffer,
+                                vertexCount,
+                                stride
+                        );
                         scTagNanos += System.nanoTime() - scTTag;
                     } else {
                         // Fused pass: reads every quad once and applies both
@@ -576,8 +589,41 @@ public class SectionCompilerMixin {
                         scFusedNanos += System.nanoTime() - scTFused;
                     }
 
+                    // =================================================
+                    // 2026-10-24 项 2：透明层内部共享面剔除。
+                    //
+                    // 位置有硬约束：必须在 tagTranslucentQuads 之后（压缩要带上
+                    // 已写好的 byte27 marker）、在 uploadChunk 之前（native 是
+                    // 同步 memcpy，缓冲只在本次调用内有效）。
+                    //
+                    // vertexCount 随之改写 ⇒ 后面的去重哈希、上传计数、
+                    // record() 全部自动跟着压缩后的值走。
+                    // =================================================
+                    ByteBuffer scCulledBuffer = null;
+
+                    if (translucentLayer) {
+                        final ByteBuffer[] scCullOut = new ByteBuffer[1];
+                        final int scCulledVerts = cullInteriorGlassFaces(
+                                sectionPos,
+                                region,
+                                vertexBuffer,
+                                vertexCount,
+                                stride,
+                                scCullOut
+                        );
+
+                        if (scCulledVerts >= 0) {
+                            scCulledBuffer = scCullOut[0];
+                            vertexCount = scCulledVerts;
+                        }
+                    }
+
                     long pointer =
-                            MemoryUtil.memAddress(vertexBuffer);
+                            MemoryUtil.memAddress(
+                                    scCulledBuffer != null
+                                            ? scCulledBuffer
+                                            : vertexBuffer
+                            );
 
                     // 2026-10-24：内容哈希去重 —— 相同内容不必进 native。
                     long scChunkHash = 0L;
@@ -1125,6 +1171,62 @@ public class SectionCompilerMixin {
     // vertex that already carries a marker (water = 1, written by
     // FluidRendererMixin during mesh baking) is left alone.
     // =====================================================
+    /**
+     * 2026-10-26：TRANSLUCENT 层的整层兜底标记。
+     *
+     * <p>Remix 里 translucent 层的材质来自绘制状态（blend state）与逐 texel
+     * 的贴图 alpha，不存在"猜这个 quad 属于哪个方块"这一步；本工程拿不到绘制
+     * 状态，只能由 {@link #tagTranslucentQuads} 用几何反推。反推失败的面会带着
+     * byte27 = 0 进入 native，被当作不透明地形渲染 —— 表现为同一个玻璃方块的
+     * 正面透明、侧面是纯色块。
+     *
+     * <p>这里把仍然为 0 的顶点一律标成半透明体 marker 2（水 = 1、玻璃族 3..18
+     * 不动），使"是不是半透明"这一判断不再依赖几何反推是否命中。
+     *
+     * @return 本次新标记的顶点数
+     */
+    private static int fillUntaggedTranslucentQuads(
+            ByteBuffer vertexBuffer,
+            int vertexCount,
+            int stride
+    ) {
+        if (vertexBuffer == null ||
+                !vertexBuffer.isDirect() ||
+                stride != 28 ||
+                vertexCount <= 0) {
+            return 0;
+        }
+
+        final ByteBuffer vertices =
+                vertexBuffer
+                        .duplicate()
+                        .order(
+                                ByteOrder.nativeOrder()
+                        );
+
+        int tagged = 0;
+
+        for (int vertex = 0; vertex < vertexCount; ++vertex) {
+            final int markerOffset =
+                    vertex * stride + 27;
+
+            if ((vertices.get(markerOffset) & 0xFF) != 0) {
+                // 水（1）与玻璃族（3..18）已有正确身份，不覆盖。
+                continue;
+            }
+
+            vertices.put(
+                    markerOffset,
+                    (byte) RT_MARKER_GENERIC_TRANSLUCENT
+            );
+
+            ++tagged;
+        }
+
+        // duplicate() 共享底层数据，写入已直接生效；这里显式声明意图。
+        return tagged;
+    }
+
     private static int tagTranslucentQuads(
             SectionPos sectionPos,
             net.minecraft.client.renderer.chunk.RenderSectionRegion region,
@@ -1555,6 +1657,244 @@ public class SectionCompilerMixin {
         }
 
         return matchedTranslucentQuads;
+    }
+
+    // =====================================================
+    // 2026-10-24 项 2：透明层内部共享面剔除
+    //
+    // 原版 mesher 对 SOLID / CUTOUT 层做邻面剔除，但 **TRANSLUCENT 层不做** ——
+    // 玻璃墙连成片时，每一对相邻方块的共享面会被两个方块各渲染一次，两份都进
+    // RT 的 BLAS，并且参与每一次可见性射线与透射射线。
+    //
+    // 判据刻意收到最窄：
+    //   · 只处理玻璃家族（byte 27 的 marker >= 2，见 isGlassFamilyMarker）。
+    //     水（marker = 1）与 foliage / 火焰 / 栏杆一律不碰 —— 水的染色依赖
+    //     界面数、栏杆形状根本没有"共享面"；
+    //   · A / B 两侧必须是**同一个 Block**；
+    //   · 两侧都必须是满方块碰撞形状 ⇒ 玻璃板 / 玻璃栏杆自动排除
+    //     （相邻时并不共享一个面）。
+    //
+    // 语义代价（必须知道）：玻璃是半透明的，剔掉中间界面后，光穿过 n 层玻璃
+    // 遇到的界面数从 2n 降到 2 ⇒ 染色累积变淡、菲涅尔次数减少。这是**更接近
+    // 真实**的方向（现实里玻璃墙也只有内外两个界面），但观感确实会变，
+    // 所以留了开关：-Drtx.glassInteriorCull=false 可关掉。
+    // =====================================================
+    // 诊断计数：本进程累计被内部面剔除吞掉的透明层顶点数。编译发生在 worker
+    // 线程上，所以用 AtomicLong；只进日志，不参与任何判定。
+    private static final java.util.concurrent.atomic.AtomicLong SC_GLASS_CULLED_VERTS =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    private static final ThreadLocal<ByteBuffer> GLASS_CULL_SCRATCH =
+            ThreadLocal.withInitial(() -> ByteBuffer.allocateDirect(0));
+
+    private static boolean glassInteriorCullEnabled() {
+        final String raw = System.getProperty("rtx.glassInteriorCull");
+
+        return raw == null || !"false".equalsIgnoreCase(raw);
+    }
+
+    private static ByteBuffer glassCullScratch(int bytes) {
+        ByteBuffer buffer = GLASS_CULL_SCRATCH.get();
+
+        if (buffer.capacity() < bytes) {
+            buffer = ByteBuffer.allocateDirect(bytes);
+            GLASS_CULL_SCRATCH.set(buffer);
+        }
+
+        buffer.clear();
+        buffer.limit(bytes);
+
+        return buffer;
+    }
+
+    private static boolean isInteriorSharedGlassFace(
+            net.minecraft.client.renderer.chunk.RenderSectionRegion region,
+            BlockPos a,
+            BlockPos b
+    ) {
+        if (a.equals(b)) {
+            return false;
+        }
+
+        final BlockState stateA = region.getBlockState(a);
+        final BlockState stateB = region.getBlockState(b);
+
+        if (stateA == stateB || stateA.getBlock() != stateB.getBlock()) {
+            return false;
+        }
+
+        // 满方块形状这一条同时排除了玻璃板、玻璃栏杆、台阶形玻璃：
+        // 它们相邻时并不共享一个完整平面，剔掉会真的丢几何。
+        return stateA.isCollisionShapeFullBlock(region, a)
+                && stateB.isCollisionShapeFullBlock(region, b);
+    }
+
+    /**
+     * 第二遍：把落在玻璃内部的共享面压缩掉。
+     *
+     * 不改原缓冲（它仍属于原版 MeshData，可能被别处使用），而是整块拷进
+     * 线程本地 scratch 后在 scratch 上做原地压缩（write 指针 <= read 指针，
+     * 同缓冲压缩安全），再把压缩后的缓冲交给 uploadChunk。
+     *
+     * @return 压缩后的顶点数；未启用 / 无需剔除时返回 -1，调用方沿用原缓冲。
+     */
+    private static int cullInteriorGlassFaces(
+            SectionPos sectionPos,
+            net.minecraft.client.renderer.chunk.RenderSectionRegion region,
+            ByteBuffer vertexBuffer,
+            int vertexCount,
+            int stride,
+            ByteBuffer[] outBuffer
+    ) {
+        outBuffer[0] = null;
+
+        if (!glassInteriorCullEnabled() ||
+                region == null ||
+                vertexBuffer == null ||
+                !vertexBuffer.isDirect() ||
+                stride != 28 ||
+                vertexCount <= 0 ||
+                (vertexCount % 4) != 0) {
+            return -1;
+        }
+
+        final int quadCount = vertexCount / 4;
+
+        // 快速前置：至少要有两个玻璃家族 quad 才可能存在共享面（一个孤立方块
+        // 没有邻居）。绝大多数 Section 没有玻璃，这一遍只读 1 字节/quad，
+        // 换来的是省掉下面那一次整块 memcpy。
+        final ByteBuffer markerReader = vertexBuffer
+                .duplicate()
+                .order(ByteOrder.nativeOrder());
+        int glassQuads = 0;
+
+        for (int quad = 0; quad < quadCount; ++quad) {
+            if (isGlassFamilyMarker(markerReader.get((quad * 4) * stride + 27) & 0xFF)) {
+                if (++glassQuads >= 2) {
+                    break;
+                }
+            }
+        }
+
+        if (glassQuads < 2) {
+            return -1;
+        }
+
+        final int byteCount = vertexCount * stride;
+        final ByteBuffer source = vertexBuffer
+                .duplicate()
+                .order(ByteOrder.nativeOrder());
+        source.position(0);
+        source.limit(byteCount);
+
+        final ByteBuffer out = glassCullScratch(byteCount);
+        out.put(source);
+        out.position(0);
+
+        final int minX = sectionPos.minBlockX();
+        final int minY = sectionPos.minBlockY();
+        final int minZ = sectionPos.minBlockZ();
+
+        final float[] vx = new float[4];
+        final float[] vy = new float[4];
+        final float[] vz = new float[4];
+        final BlockPos.MutableBlockPos candidateA = new BlockPos.MutableBlockPos();
+        final BlockPos.MutableBlockPos candidateB = new BlockPos.MutableBlockPos();
+
+        int writeQuad = 0;
+        int culledQuads = 0;
+
+        for (int quad = 0; quad < quadCount; quad++) {
+            final int marker = out.get((quad * 4) * stride + 27) & 0xFF;
+
+            boolean drop = false;
+
+            if (isGlassFamilyMarker(marker)) {
+                float centerX = 0.0f;
+                float centerY = 0.0f;
+                float centerZ = 0.0f;
+
+                for (int vertex = 0; vertex < 4; ++vertex) {
+                    final int base = (quad * 4 + vertex) * stride;
+
+                    vx[vertex] = out.getFloat(base);
+                    vy[vertex] = out.getFloat(base + 4);
+                    vz[vertex] = out.getFloat(base + 8);
+
+                    centerX += vx[vertex];
+                    centerY += vy[vertex];
+                    centerZ += vz[vertex];
+                }
+
+                centerX *= 0.25f;
+                centerY *= 0.25f;
+                centerZ *= 0.25f;
+
+                final float edge1X = vx[1] - vx[0];
+                final float edge1Y = vy[1] - vy[0];
+                final float edge1Z = vz[1] - vz[0];
+                final float edge2X = vx[2] - vx[0];
+                final float edge2Y = vy[2] - vy[0];
+                final float edge2Z = vz[2] - vz[0];
+
+                final float normalX = edge1Y * edge2Z - edge1Z * edge2Y;
+                final float normalY = edge1Z * edge2X - edge1X * edge2Z;
+                final float normalZ = edge1X * edge2Y - edge1Y * edge2X;
+                final float lengthSquared =
+                        normalX * normalX + normalY * normalY + normalZ * normalZ;
+
+                if (lengthSquared > 1.0e-12f) {
+                    final float inverseLength =
+                            1.0f / (float)Math.sqrt(lengthSquared);
+
+                    // 与 tagTranslucentQuads 同一个 ±0.01 探测口径：
+                    // 面正好落在整数边界时 floor() 会有歧义。
+                    final float probe = 0.01f;
+
+                    candidateA.set(
+                            minX + (int)Math.floor(centerX - normalX * inverseLength * probe),
+                            minY + (int)Math.floor(centerY - normalY * inverseLength * probe),
+                            minZ + (int)Math.floor(centerZ - normalZ * inverseLength * probe)
+                    );
+                    candidateB.set(
+                            minX + (int)Math.floor(centerX + normalX * inverseLength * probe),
+                            minY + (int)Math.floor(centerY + normalY * inverseLength * probe),
+                            minZ + (int)Math.floor(centerZ + normalZ * inverseLength * probe)
+                    );
+
+                    drop = isInteriorSharedGlassFace(region, candidateA, candidateB);
+                }
+            }
+
+            if (drop) {
+                ++culledQuads;
+                continue;
+            }
+
+            if (writeQuad != quad) {
+                MemoryUtil.memCopy(
+                        MemoryUtil.memAddress(out) + (long)quad * 4L * stride,
+                        MemoryUtil.memAddress(out) + (long)writeQuad * 4L * stride,
+                        4L * stride
+                );
+            }
+
+            ++writeQuad;
+        }
+
+        if (culledQuads == 0) {
+            return -1;
+        }
+
+        final int newVertexCount = writeQuad * 4;
+
+        out.position(0);
+        out.limit(newVertexCount * stride);
+        outBuffer[0] = out;
+
+        SC_GLASS_CULLED_VERTS.addAndGet(vertexCount - newVertexCount);
+
+        return newVertexCount;
     }
 
     // Marker 23 is consumed only by VulkanCore while expanding the 28-byte

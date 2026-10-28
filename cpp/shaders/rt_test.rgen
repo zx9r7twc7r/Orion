@@ -260,6 +260,114 @@ uniform image2D rrTransparencyHintImage;
 layout(binding = 72, set = 0, rgba16f)
 uniform image2D giHalfImage;
 
+// ============================================================================
+// 2026-10-26 持久泡沫图（路线 B，Crest 移植；见 water_foam.comp 头注释）
+//
+// binding 73：512² RGBA16F、2 层、6 级 mip，宿主 30 Hz 累积/耗散。.r = 泡沫量。
+//   采样坐标来自 CameraUBO.pomParams.yzw = 原点 x/z / 纹素世界尺寸（0 = 未就绪）。
+//   已发布的读层是 CameraUBO.cloudAerialParams.w（0/1，尾块复用，见 camera_ubo.glsl）。
+// binding 74：岸线覆盖率注入图（r32ui）。主光线在水下接收面深度 < ~1.35 格时
+//   把覆盖率原子写进对应泡沫纹素；water_foam.comp 每 tick 取走并清零。
+//   用 r32ui 而不是 r16f：正浮点位序与 uint 单调一致，才能用 imageAtomicMax。
+//
+// 2026-10-26 21:1x 用户不要泡沫 ⇒ 路线回退：两个 binding 随宿主布局（缩回
+// 0..72）一起摘掉，采样/注入/着色三处代码在下方 #if 0 里屏蔽保留。
+// ============================================================================
+#if 0
+layout(binding = 73, set = 0) uniform sampler2DArray waterFoamMap;
+
+layout(binding = 74, set = 0, r32ui)
+uniform uimage2D waterFoamInjection;
+#endif
+
+// ============================================================================
+// 2026-10-26：半透明 alpha blend 的**旁路输出**（binding 73/74/75）
+// 设计：docs/decisions/alpha-blend-pass-split.md §3.1 / §7.1（本轮按 §7.4 执行）
+//
+// 73 gbuffer : rgb = SUM_i tint_i*a_i*PI_{j<i}(1-a_j)   （不含光照的"表面色"）
+//              a   = a_0（相机直接命中的那一层）
+// 74 meta    : rgb = PI_{1..N}(1-a_i)（链内逐通道透射率，来自 any-hit 累乘）
+//              a   = 第一层玻璃面到相机的距离（格）；0 = 本帧这一格没有半透明面
+// 75 light   : rgb = E_bg（接收面的入射辐照度，已除以 albedo 解调）
+//              a   = 1 = 本帧确实写过
+//
+// 消费方是 glass_alpha_blend.comp / glass_alpha_finish.comp（独立 descriptor set）。
+// 本文件**不再**在 rgen 里把玻璃合成进颜色：颜色由 75 号图 + 73 号图在屏幕空间
+// 重新合成（Remix 的 alpha_blend composite 结构），于是"邻居搜索"与"5x5 滤波"
+// 这两件就地合成永远做不到的事才有落点。
+//
+// ⚠ 74 号图的 a 通道**必须由宿主每帧清 0**（未写 = 非半透明面）。判据不能换成
+//   73 号图的 a：全透明层的 a_0 可以是 0，但它照样要往颜色里加 E。
+// ⚠ 73/74 历史上是水泡沫的两张图（2026-10-26 回退后整段在 #if 0 里），
+//   宿主布局同期从 b[73] 扩到 b[76]，其余 72 个 binding 编号一个都没动。
+// ============================================================================
+layout(binding = 73, set = 0, rgba16f)
+uniform image2D glassAlphaBlendGbufferImage;
+
+layout(binding = 74, set = 0, rgba16f)
+uniform image2D glassAlphaBlendMetaImage;
+
+layout(binding = 75, set = 0, rgba16f)
+uniform image2D glassAlphaBlendLightImage;
+
+// 2026-10-27：radiance volume 兜底（体素面辐照度缓存换算值，见写入点注释）。
+layout(binding = 77, set = 0, rgba16f)
+uniform image2D glassAlphaBlendVolumeImage;
+
+// =====================================================
+// 2026-10-27 稀疏渲染的活跃像素掩码（R8_UINT）。
+//
+// 生产者：sparse_active_mask.comp（宿主在 trace 之前 dispatch；4x2 像素块
+// 打包进一个 uint 的低 8 位，bit = y*4 + x）。
+// 消费者：vptSparsePixelIsActive —— 与 Remix 的 isActivePixelFromMask 同款，
+// 判定不再由本 pass 自己抽签，保证与任何下游消费者逐位一致。
+// =====================================================
+layout(binding = 78, set = 0, r8ui)
+uniform readonly uimage2D sparseActiveMaskImage;
+
+// =====================================================
+// 2026-10-27：Remix 的**时空蓝噪声**（严格搬）
+//
+// 原文 utility/noise.slangh:161-249
+//   #define RNG_SEED_FRAME_RANGE 64
+//   struct RNG { uvec2 pixelIdx; uint seed; uint temporalIdx; };
+//   float getNextSampleBlueNoise(inout RNG rng)
+//   { const uint oldSeed = rng.seed++;
+//     uvec2 seedOffset = uvec2(R2(oldSeed) * uvec2(128, 128));
+//     float value = texelFetch(BlueNoise, ivec3((rng.pixelIdx.x + seedOffset.x) & 127,
+//                                               (rng.pixelIdx.y + seedOffset.y) & 127,
+//                                               (rng.temporalIdx) & (RNG_SEED_FRAME_RANGE - 1)), 0).r;
+//     return min(value, 1.0f - 1.0f / 255.0f); }
+//   vec2 R2(uint index) { const float g = 1.32471795724474602596f;      // :149-157
+//                         return fract(vec2(float(index) / g, float(index) / (g * g))); }
+//
+// 数据：_ref/dxvk-remix/src/util/util_blueNoise_128x128x64.h（MIT），
+// 已原样导出为 shaders/blue_noise_128x128x64.r8 并由宿主上传为 storage buffer。
+// texelFetch 本就是 NEAREST 取单个 texel ⇒ 这里按字节索引与它逐位等价。
+// =====================================================
+layout(binding = 76, set = 0, std430) readonly buffer GlassBlueNoiseBuffer
+{
+    uint words[64u * 128u * 128u / 4u];
+} glassBlueNoise;
+
+vec2 glassBlueNoiseR2(uint index)
+{
+    const float g = 1.32471795724474602596;
+    return fract(vec2(float(index) / g, float(index) / (g * g)));
+}
+
+float glassBlueNoiseSample(uvec2 pixelIdx, uint temporalIdx, uint seedIndex)
+{
+    const uvec2 seedOffset = uvec2(glassBlueNoiseR2(seedIndex) * vec2(128.0));
+    const uint x = (pixelIdx.x + seedOffset.x) & 127u;
+    const uint y = (pixelIdx.y + seedOffset.y) & 127u;
+    const uint layer = temporalIdx & 63u;
+    const uint byteIndex = 16384u * layer + 128u * y + x;
+    const uint word = glassBlueNoise.words[byteIndex >> 2u];
+    const uint raw = (word >> ((byteIndex & 3u) * 8u)) & 0xFFu;
+    return min(float(raw) * (1.0 / 255.0), 1.0 - 1.0 / 255.0);
+}
+
 // Analytic (zero-variance) radiance the denoiser must not touch.  Written by
 // this raygen with the pane's mirror lobe + solar gloss removed from every
 // other pixel, read back by the display transform after DLSS RR.  See
@@ -474,28 +582,111 @@ void sharcProbeWriteBack()
 // 的 HashGridGetVoxelSize），把 sceneScale 调大 ⇒ 体素更细 ⇒ 每个体素要攒到
 // SHARC_SAMPLE_NUM_THRESHOLD 个样本就更难。而更新是"挂在渲染本来就要算的 GI 上"的
 // （零额外射线），提高比例几乎只多花哈希插入与原子累加的钱。
+// 2026-10-28：2 -> 4（覆盖率 25% -> 6.25%）。成本 ∝ 1/BLOCK²，实测 2 时 sharcup 5.54ms。
+// 2026-10-28（按性能收益对齐 Remix）：4 -> 5。Remix Ultra 预设的 downscaleFactor=5
+// （rtx_spatially_hashed_radiance_cache.h:77），即 1/25 = 4% 覆盖率；原来 1/16 = 6.25%，
+// 1080p 下 129,600 条 update 路径/帧，比 Remix Ultra 的 82,944 多付 56%，且分辨率越高越贵。
+// 覆盖率下降的代价由 update 侧关轮盘 + firefly clamp 100× 补（先把方差压下来）。
+// 必须与 VulkanCore.cpp 的 sharcUpdateBlock 一致（dispatch 尺寸由宿主按同一个块算）。
 #define SHARC_UPDATE_BLOCK 5
 
-bool sharcUpdatePixelSelected()
+// 2026-10-25（对齐 RTX Remix 的 SHaRC 口径）：update pass 改为**块级 dispatch**。
+//
+// 旧实现：宿主发满渲染分辨率（640x360 = 230,400 线程），本函数让每 5x5 块只有
+// 一个像素返回 true，其余 96% 的线程在读完 UBO、算完哈希后立刻 return —— 实测
+// sharcup 单独 5.35ms，净亏。
+// 新实现：宿主只发 ceil(w/5) x ceil(h/5) 个线程（640x360 -> 128x72 = 9,216），
+// 每个线程对应一个块，块内偏移由哈希选出唯一像素。哈希常数与覆盖顺序与旧实现
+// 完全相同 ⇒ 缓存填充速度、空间分布逐位不变，只有空跑线程消失。
+//
+// 为什么不做"直接把 dispatch 缩小、让 shader 按归一化坐标撒点"（参考实现的做法）：
+// 本工程 rgen 的射线取自**绑定图像**（imageSize(image)），不是按 DispatchRays
+// Dimensions 归一化，缩小 dispatch 只会覆盖屏幕左上角。所以必须显式做
+// 块坐标 -> 像素坐标的映射。
+// 2026-10-25（对齐 RTX Remix）：update 路径的 firefly clamp。
+// 照抄 rtx/shaders/rtx/pass/sharc/sharc_integrator_utilities.slangh:54-81。
+// 与参考的差别（必要）：参考只判 INVALID 索引，因为它的 SharcUpdateHit 保证
+// 索引有效；本工程在 miss 分支调用时索引可能尚未建立，故再挡一次
+// `cacheIndex >= capacity` —— 上一版缺这一条时进世界 6 秒 GPU 挂死。
+#ifndef SHARC_FIREFLY_CLAMP_MULTIPLIER
+// 2026-10-28：0.0 -> 100.0（对齐 Remix 默认，rtx_spatially_hashed_radiance_cache.h:108）。
+// 历史：2026-10-25 首次开启时进世界 6 秒 GPU 挂死，根因是 SharcUpdateHit 之前
+// cacheIndices[0] 尚未建立（HASH_GRID_INVALID_CACHE_INDEX）却没被挡；守卫已在下面
+// 补了两道（INVALID 索引 + >= capacity），所以现在可以开。
+// 成本：每个 update 顶点多一次 SharcGetVoxelData（resolved 读）+ 亮度比较。
+// 收益：把"单样本远高于该体素历史均值"的萤火虫按 100× 夹住，缓存方差显著下降 ⇒
+// 同样的收敛速度可以用更低的 update 覆盖率达到，这是净性能收益。
+// 回退 = -DSHARC_FIREFLY_CLAMP_MULTIPLIER=0（逐位回到旧行为）。
+#define SHARC_FIREFLY_CLAMP_MULTIPLIER 100.0
+#endif
+
+vec3 sharcClampUpdateRadiance(
+    SharcParameters params,
+    HashGridIndex cacheIndex,
+    vec3 radiance,
+    vec3 sampleWeight,
+    float multiplier)
 {
-    const ivec2 sharcBlock = ivec2(gl_LaunchIDEXT.xy) / SHARC_UPDATE_BLOCK;
-    const ivec2 sharcPixelInBlock =
-        ivec2(gl_LaunchIDEXT.xy) - sharcBlock * SHARC_UPDATE_BLOCK;
+    if(multiplier <= 0.0 || cacheIndex == HASH_GRID_INVALID_CACHE_INDEX)
+    {
+        return radiance;
+    }
+
+    if(uint(cacheIndex) >= params.hashGridData.capacity)
+    {
+        return radiance;
+    }
+
+    SharcVoxelData cell = SharcGetVoxelData(params.resolvedBuffer, cacheIndex);
+    if(cell.accumulatedSampleNum <= SHARC_SAMPLE_NUM_THRESHOLD)
+    {
+        return radiance;
+    }
+
+    float meanLuminance = SharcRadianceLuma(cell.accumulatedRadiance);
+    if(meanLuminance <= 1e-6)
+    {
+        return radiance;
+    }
+
+    float sampleLuminance = SharcLuma(radiance * sampleWeight);
+    float maxLuminance = meanLuminance * multiplier;
+    if(sampleLuminance > maxLuminance)
+    {
+        radiance *= maxLuminance / sampleLuminance;
+    }
+
+    return radiance;
+}
+
+ivec2 sharcUpdateBlockOffset(const ivec2 sharcBlock)
+{
     const uint sharcBlockArea =
         uint(SHARC_UPDATE_BLOCK) * uint(SHARC_UPDATE_BLOCK);
 
-    // (帧号, 块坐标) 的三元哈希 → 块内偏移。常数是常见的质数混合，末尾两步
-    // xor-shift + 乘法保证低位也参与，避免"块坐标相邻 ⇒ 选中同一格"。
     uint sharcHash = uint(sharcBlock.x) * 73856093u ^
-                     uint(sharcBlock.y) * 19349663u ^
-                     cam.frameCount * 83492791u;
+        uint(sharcBlock.y) * 19349663u ^
+        cam.frameCount * 83492791u;
     sharcHash ^= sharcHash >> 13u;
     sharcHash *= 0x5bd1e995u;
     sharcHash ^= sharcHash >> 15u;
 
-    return (uint(sharcPixelInBlock.y) * uint(SHARC_UPDATE_BLOCK) +
-            uint(sharcPixelInBlock.x)) ==
-        (sharcHash % sharcBlockArea);
+    const uint sharcIndex = sharcHash % sharcBlockArea;
+
+    return ivec2(
+        int(sharcIndex % uint(SHARC_UPDATE_BLOCK)),
+        int(sharcIndex / uint(SHARC_UPDATE_BLOCK)));
+}
+
+// 真实渲染尺寸。SHARC_UPDATE 的 dispatch 是块级（远小于屏幕），
+// 所以 update 变体里不能拿 gl_LaunchSizeEXT 做屏幕归一化。
+ivec2 rtLaunchSize()
+{
+#if SHARC_UPDATE
+    return imageSize(image);
+#else
+    return ivec2(gl_LaunchSizeEXT.xy);
+#endif
 }
 
 // The natural Gerstner band set and the persistent interaction field are shared
@@ -512,6 +703,9 @@ bool sharcUpdatePixelSelected()
 // 玻璃电介质（真折射）数学：解析式平板出射点、非偏振 Fresnel、按格 Beer-Lambert。
 // 自包含，不依赖本文件里的任何函数（GLSL 单遍编译，故放在所有声明之前）。
 #include "glass_dielectric_common.glsl"
+// 2026-10-25：物理薄片（Remix thin-walled）滤波，与 glass_dielectric_common 分离
+// 以便单独 A/B（-DORION_GLASS_THINWALL_V2=0）。
+#include "glass_thinwall_common.glsl"
 
 // =====================================================
 // Perf-L10.1 - runtime GPU feature-isolation predicates
@@ -595,7 +789,9 @@ bool perfL10DisableLocalEmitterHitScan()
 // =====================================================
 layout(binding = 46) buffer PerfL10RayStatsBuf
 {
-    uint perfRayStatCount[12];
+    // 2026-10-28: 12 -> 15，与 VulkanCore.cpp 的 PERF_L10_RAY_STAT_COUNT 同步。
+    // [12] 本地光可见性 / [13] 太阳软影 / [14] 光泽反射
+    uint perfRayStatCount[15];
 };
 
 bool perfRayStatsOn()
@@ -619,6 +815,19 @@ bool perfL10DisableVoxelDda()
 // Stage 8: cap the diffuse-GI path at one bounce, so the difference against the
 // baseline window is the cost of the second bounce alone.  In normal play
 // (stage 0) the value comes from the user "GI 跳数" setting (perfPrimary.z).
+// 2026-10-28 修正：下面这段 2026-10-25 的判断**是错的**，它导致过一次误判
+//（据此断言用户设的 4 跳不生效）。`perfPrimary.z` 一直有写入方：
+//   Java 的 giBounces → JNI（VulkanCore.cpp:57398 的 g_perfGiBounces.store）
+//   → 每帧 ubo->perfGiBounces（:60100），而 C++ 结构体里
+//   perfAoNearSamples / perfAoMidSamples / perfGiBounces / perfSunShadowSamples
+//   这四连正好就是 GLSL `uvec4 perfPrimary` 的 x/y/z/w。
+// 实测回执：[PERF LANE] giBounces=4 aoNear=1 aoMid=1 sunShadow=1 … 证明用户设置送达。
+// 因此 GI_BOUNCE_CAP_DEFAULT 只是 perfPrimary.z == 0 时的兜底；
+// 它的默认值 2 **不**代表实际跑 2 跳。改跳数请走设置项，不要改这个宏。
+#ifndef GI_BOUNCE_CAP_DEFAULT
+#define GI_BOUNCE_CAP_DEFAULT 2
+#endif
+
 int perfL10GiBounceCap()
 {
     if(perfL10Stage() == 8u)
@@ -629,7 +838,11 @@ int perfL10GiBounceCap()
     // 生效），2 跳时没有可截断的深度 ⇒ 实测 A/B 打平（arm A 21.49ms vs arm B
     // 21.49ms）。参考样本的 UI 对跳数不设上限（PathtracerUi 的 spp/bounce 都是
     // 滑条），这里按本工程步进给到 4。
-    return clamp(int(cam.perfPrimary.z), 0, 4);
+    const int perfGiFromUbo = int(cam.perfPrimary.z);
+
+    return perfGiFromUbo > 0
+        ? min(perfGiFromUbo, 4)
+        : GI_BOUNCE_CAP_DEFAULT;
 }
 
 // Stage 9: cap near-field RTAO at two rays instead of four.
@@ -671,6 +884,31 @@ bool perfL10EnableGiRoulette()
         return false;
     }
     return cam.rtSampleParams.y > 0.5;
+}
+
+// ============================================================================
+// 2026-10-28：俄罗斯轮盘在**变体级**的闸门（按性能收益对齐 Remix）
+//
+// 参考：_ref/dxvk-remix/src/dxvk/rtx_render/rtx_spatially_hashed_radiance_cache.cpp:128-129
+//        sharcArgs.updateAllowRussianRoulette = false;   // "disabling russian roulette to match NRC"
+//       _ref/dxvk-remix/src/dxvk/shaders/rtx/algorithm/path_state.slangh:503-508
+//        if (isSharcUpdate) useRussianRoulette = useRussianRoulette && cb.sharcArgs.updateAllowRussianRoulette;
+//
+// 为什么 update 变体必须关：SHaRC 的 update 把"本段的 throughput"乘进每个已记录顶点的
+// sampleWeights（SharcCommon.h:716-722 的 SharcSetThroughput）。轮盘一旦终止，路径按 1/p
+// 放大 throughput、并以 (1-p) 的概率整条消失 ⇒ 写进缓存的样本方差被放大 p 倍量级，而缓存
+// 只有 10 帧累积窗口（sharc_ubo.glsl:130）去摊平它。方差上去后要维持同样观感只能提高
+// update 覆盖率，等于**白付 update 成本**。渲染侧不受影响（它本来就要靠轮盘省钱）。
+//
+// 渲染变体逐位不变：只有 SHARC_UPDATE 这个翻译单元返回 false。
+// ============================================================================
+bool giRouletteEnabledForVariant()
+{
+#if SHARC_UPDATE
+    return false;
+#else
+    return perfL10EnableGiRoulette();
+#endif
 }
 
 // 2026-10-07：太阳透射 march 的步数改成**按距离自适应**。
@@ -736,6 +974,29 @@ float perfGiTraceMaxDistance(float baseMax)
 
     return limit > 0.0 ? min(baseMax, limit) : baseMax;
 }
+
+// =====================================================
+// 2026-10-24 项 3：次级射线背面剔除
+//
+// 只给**辐射类**次级射线（反射 / 透射 / 漫反射 GI）加上
+// gl_RayFlagsCullBackFacingTrianglesEXT；可见性类射线
+// （TerminateOnFirstHit：AO / 局部光遮挡 / 阴影 / 雨探针）保持双面不变。
+//
+// 为什么这个分段是安全的：
+//   · ray flag 只是"允许"剔除，真正生效取决于实例的
+//     VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE。宿主侧**只有**
+//     SECTION_AS_CLASS_OMM 桶摘掉了 DISABLE（见 VulkanCore.cpp 的
+//     instance.flags），不透明 / 水 / 玻璃 / 实体 / 粒子桶全部保留
+//     ⇒ 本条只可能影响 cutout 几何。
+//   · 原版 cutout 层本来就是单面 authored、cross 模型正反两份共面 quad
+//     （见主射线那里的长注释），任何方向都有一份正面朝向来射
+//     ⇒ 剔背面不会丢内容。
+//   · 可见性射线必须保持双面：太阳方向的可见性取正反两份的并集，用来填补
+//     草丛底部影子的漏光缝隙（宿主侧 instance.flags 那段说明）。
+// =====================================================
+const uint SECONDARY_TRAVERSE_FLAGS =
+    gl_RayFlagsNoneEXT |
+    gl_RayFlagsCullBackFacingTrianglesEXT;
 
 // Binding 34 (the old 256x256 wavefront-area caustic map) is deliberately no
 // longer declared here.  Water caustics are analytic now; see
@@ -999,6 +1260,13 @@ struct VPTDirectHistory
     vec4 radianceAndSampleCount;
     vec4 hitPositionAndValid;
     vec4 normalAndPadding;
+    // 2026-10-26 RTXDI 直接光 WRS reservoir（仅第 4 lane；EMA 路径不读不写，
+    // v0/v1/v2 语义与旧版逐位一致）。WRS 布局：
+    //   v0 = (selectedSample.xyz, emission*8 + typeCode)
+    //   v1 = (W, M, lightRevision, 2.0)  // 2.0 = WRS 标签；EMA 在 v1.w 写 1.0
+    //   v2 = (receiverPosition.xyz, valid)
+    //   v3 = (receiverNormal.xyz, 0)
+    vec4 reservoirNormalAndPadding;
 };
 
 layout(std430, binding = 26, set = 0) buffer VPTDirectHistoryBuffer0
@@ -1235,9 +1503,12 @@ const bool DBG_MARK_VLI_EMITTER = false;
 #define DBG_BEHIND_SPLIT_MACRO 0
 #endif
 const bool DBG_BEHIND_SPLIT = (DBG_BEHIND_SPLIT_MACRO != 0);
-const bool DBG_KILL_BEHIND_AMBIENT = false;
+const bool DBG_KILL_BEHIND_AMBIENT = false;  // 2026-10-28 临时判决
+// 2026-10-28 判决结果：置 true 后橙色玻璃掠射面的绿色颗粒**毫无变化** ⇒
+// 该颗粒与 localEntityIrradiance（本地光 RIS + 8 帧屏幕空间历史）无关。
+// 本轮为"三项全杀"诊断，临时置 true。
 const bool DBG_KILL_BEHIND_LOCAL = false;
-const bool DBG_KILL_BEHIND_DIRECT = false;
+const bool DBG_KILL_BEHIND_DIRECT = false;   // 2026-10-28 临时判决
 
 // =====================================================
 // 判决实验 GLASSTINT（2026-09-22 21:06）：直接读出摄像面玻璃透射率。
@@ -2656,11 +2927,32 @@ uint vptRisProposalCount()
 #endif
 }
 
+// 2026-10-26 RTXDI 式直接光 reservoir 的合并/可见性尾段。定义在
+// evaluateVPTCandidateDirectTemporal 之后（重投影与抖动补偿helper 都在那里），
+// 这里先给原型 —— 与文件里 getDLSSFrameJitter 的前向声明同一手法。
+vec3 evaluateVPTDirectLightReservoirTail(
+    vec3 hitPos,
+    vec3 N,
+    vec3 hitAlbedo,
+    bool waterColumnReceiver,
+    bool geometricFaceKnown,
+    vec3 geometricFaceRecovered,
+    float currentWeightSum,
+    vec3 currentContribution,
+    vec3 currentSample,
+    uint currentEmission,
+    uint currentTypeCode,
+    bool shadingActive,
+    inout uint rngState
+);
+
 vec3 evaluateVPTRISDirectLightingSingle(
     vec3 hitPos,
     vec3 hitNormal,
     vec3 hitAlbedo,
     vec3 geometricFaceNormal,
+    bool useTemporalReservoir,
+    bool shadingActive,
     inout uint rngState
 )
 {
@@ -2881,10 +3173,18 @@ vec3 evaluateVPTRISDirectLightingSingle(
             ? normalize(geometricFaceRecovered)
             : vptDominantBlockFaceNormal(N));
 #endif
+#if !VPT_LOCAL_GEOMETRIC_COSINE_BOUND
+    // WRS 尾段按统一签名接收这两个量；关闭几何面余弦上界时它们不参与计算。
+    bool geometricFaceKnown = false;
+    vec3 geometricFaceRecovered = vec3(0.0);
+#endif
 
     vec3 selectedContribution = vec3(0.0);
     vec3 selectedSample = vec3(0.0);
     ivec3 selectedBlock = ivec3(0);
+    // 灯的持久身份（WRS 历史只存世界坐标/发射强度/类型，不存临时索引）。
+    uint selectedEmission = 0u;
+    uint selectedTypeCode = 0u;
     float weightSum = 0.0;
     uint directoryBase = receiverPage * VPT_SOURCE_DIRECTORY_ENTRIES_PER_PAGE;
     uint sourceSectionCount = min(
@@ -3121,7 +3421,34 @@ vec3 evaluateVPTRISDirectLightingSingle(
             selectedContribution = contribution;
             selectedSample = emitterSample;
             selectedBlock = emitterBlock;
+            selectedEmission = emission;
+            selectedTypeCode = typeCode;
         }
+    }
+
+    // =====================================================
+    // 2026-10-26 RTXDI 式时域 reservoir（设置项：直接光模式 = 1）。
+    //
+    // 放在 weightSum <= 0 的早退**之前**：本帧提案全部落空时，上一帧的
+    // reservoir 仍要参与合并（官方 RTXDI 也是先合并、后判可见性）。
+    // =====================================================
+    if(useTemporalReservoir && cam.sparseParams.x >= 0.5)
+    {
+        return evaluateVPTDirectLightReservoirTail(
+            hitPos,
+            N,
+            hitAlbedo,
+            waterColumnReceiver,
+            geometricFaceKnown,
+            geometricFaceRecovered,
+            weightSum,
+            selectedContribution,
+            selectedSample,
+            selectedEmission,
+            selectedTypeCode,
+            shadingActive,
+            rngState
+        );
     }
     if(weightSum <= 0.0)
     {
@@ -3563,10 +3890,46 @@ vec3 evaluateVPTRISDirectLighting(
     // —— 与旧版 Orion 的行为一致。代价：>56 格的像素也要跑候选搜索 + 1 条可视
     // 性射线；如果帧时间不可接受，再谈别的限距方案（不用概率）。
     vec3 voxelDirect = evaluateVPTRISDirectLightingSingle(
-        hitPos, hitNormal, hitAlbedo, geometricFaceNormal, rngState);
+        hitPos, hitNormal, hitAlbedo, geometricFaceNormal, false, true, rngState);
 
     // 2026-10-07 动态光源（移动光源）：**相加**，不并进上面那次 RIS —— 理由见函数上方
     // 那段说明。条数为 0 时这里立刻返回 0，整条链逐位回到改动前。
+    return voxelDirect + evaluateDynamicLightRISDirect(
+        hitPos, hitNormal, hitAlbedo, receiverCameraDistance,
+        f0, metallic, roughness, rngState);
+}
+
+// 2026-10-26：主表面直射的运行时入口（唯一允许 RTXDI WRS 的调用点）。
+// GI 顶点 NEE / 透明接收路径仍走上面的 evaluateVPTRISDirectLighting。
+vec3 evaluateVPTRISDirectLightingPrimary(
+    vec3 hitPos,
+    vec3 hitNormal,
+    vec3 hitAlbedo,
+    vec3 geometricFaceNormal,
+    vec3 f0,
+    float metallic,
+    float roughness,
+    bool temporalReservoir,
+    bool shadingActive,
+    inout uint rngState
+)
+{
+    vec3 cameraPosition =
+        (cam.viewInverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+    float receiverCameraDistance = length(hitPos - cameraPosition);
+
+    vec3 voxelDirect = evaluateVPTRISDirectLightingSingle(
+        hitPos, hitNormal, hitAlbedo, geometricFaceNormal,
+        temporalReservoir, shadingActive, rngState);
+
+    // 2026-10-26 稀疏渲染：动态光源没有可老化的 reservoir，非活跃像素
+    // 直接跳过（与本地光的 enableRtxdiReuseForInactivePixels 语义对齐 ——
+    // 那条复用只对灯表 reservoir 成立）。
+    if(!shadingActive)
+    {
+        return voxelDirect;
+    }
+
     return voxelDirect + evaluateDynamicLightRISDirect(
         hitPos, hitNormal, hitAlbedo, receiverCameraDistance,
         f0, metallic, roughness, rngState);
@@ -3625,7 +3988,7 @@ vec3 evaluateVPTRISDirectLightingMultiSample(
         ++sampleIndex)
     {
         voxelDirect += evaluateVPTRISDirectLightingSingle(
-            hitPos, hitNormal, hitAlbedo, geometricFaceNormal, rngState);
+            hitPos, hitNormal, hitAlbedo, geometricFaceNormal, false, true, rngState);
     }
     voxelDirect *= 1.0 / float(VPT_TRANSPARENT_RECEIVER_RIS_SAMPLES);
 
@@ -5157,7 +5520,7 @@ float vptJitterCompensatedPositionEpsilon(vec3 hitPosition)
 
     // 一个渲染像素在该视深上的世界尺寸：focalPixels = H / (2 tan(fov/2))。
     float focalPixels =
-        float(gl_LaunchSizeEXT.y) /
+        float(rtLaunchSize().y) /
         (2.0 * max(tan(cam.cameraParams.z * 0.5), 0.05));
 
     // 相机前向 = -Z（viewInverse 是 camera->world，与宿主 cameraFwd 同约定）。
@@ -5182,6 +5545,9 @@ bool vptPrimaryHistoryMatches(
 )
 {
     return history.hitPositionAndValid.w > 0.5 &&
+        // 2026-10-26：WRS reservoir 条目在 v1.w 写 2.0；EMA 只认 < 1.5。
+        // 模式 0 下历史里全是 EMA 条目（w = 1.0），该判据不改变任何结果。
+        history.hitPositionAndValid.w < 1.5 &&
         history.radianceAndSampleCount.w > 0.0 &&
         length(history.hitPositionAndValid.xyz - hitPosition) <= positionEpsilon &&
         dot(normalize(history.normalAndPadding.xyz), hitNormal) >= VPT_SCREEN_NORMAL_COSINE;
@@ -5589,7 +5955,7 @@ vec3 evaluateTransparentReceiverDirectLighting(
         hitAlbedo,
         receiverGeometricNormal,
         ivec2(gl_LaunchIDEXT.xy),
-        ivec2(gl_LaunchSizeEXT.xy)
+        ivec2(rtLaunchSize())
     );
 #else
     // The pre-2026-09-25 stream, kept bit-exact so -D...TEMPORAL=0 is a true
@@ -5695,6 +6061,9 @@ vec3 evaluateVPTCandidateDirectTemporal(
 #endif
         positionOk =
             previousHistory.hitPositionAndValid.w > 0.5 &&
+            // 2026-10-26：排除 WRS reservoir 条目（v1.w = 2.0），模式切换后
+            // 不会把灯样本误当成 EMA 辐射度。模式 0 下 w 恒为 1.0。
+            previousHistory.hitPositionAndValid.w < 1.5 &&
             previousHistory.radianceAndSampleCount.w > 0.0 &&
             length(previousHistory.hitPositionAndValid.xyz - identityPosition) <=
                 vptJitterCompensatedPositionEpsilon(identityPosition);
@@ -5857,6 +6226,12 @@ vec3 evaluateVPTCandidateDirectTemporal(
             (1.0 + max(slipPixels - 1.5, 0.0) * 8.0);
     }
 #endif
+    // 2026-10-25（回退轮补丁）：封顶下限 8 帧。纯封顶在快速转视角时把历史压到
+    // ~1 帧 ⇒ 透过玻璃的内容几乎裸 1spp（用户实测"非常大的噪点"）。下限 8 保留
+    // ~1/2.8 的时域平滑；拖尾权重 (7/8)^n 在 8 帧后剩 0.34、16 帧后剩 0.12
+    // ⇒ 拖尾仍然只有 ~0.13-0.27 秒，第四轮要修的"残影滞留"不会回来。
+    historyCap =
+        max(historyCap, 8.0);
     float nextCount = min(oldCount + 1.0, historyCap);
     float alpha = 1.0 / nextCount;
     // 只有真的携带到历史（位置判据通过）时才混合；硬清零那一路保持"当帧即结果"。
@@ -5902,6 +6277,821 @@ vec3 evaluateVPTCandidateDirectTemporal(
     outputHistory.normalAndPadding = vec4(matchNormal, 0.0);
     vptWritePrimaryHistory(currentIndex, outputHistory);
     return filteredRadiance;
+}
+
+
+// =====================================================
+// 2026-10-26 RTXDI 式直接光时域 reservoir（设置项：直接光模式 = 1）
+//
+// 结构照 RTX Remix 的 RTXDI 调用序列搬运：
+//   rtxdi_initial_sampling.comp.slang：
+//     RTXDI_EmptyReservoir → 提案采样 → RTXDI_CombineReservoirs(..., targetPdf)
+//     →（延迟的）RTXDI_UpdateSelectedReservoirVisibility ← 合并后只发 1 条可见性射线
+//   rtxdi_temporal_reuse.comp.slang：
+//     RAB_LoadReservoir → RTXDI_TemporalResampling（重投影 + 深度/法线判据
+//     + maxHistoryLength）→ RAB_StoreReservoir
+//
+// RTXDI SDK 本体不在仓里（_ref/dxvk-remix/submodules/rtxdi 是未初始化的空
+// 子模块），所以合并公式按 Remix 调用侧暴露的契约本地等价实现：
+//   weightSum = Σ target/pdf，M = 候选数，W = weightSum/(M·target)。
+// 读历史时先用**当前接收面**重算该样本的 target，把 W 还原成 weightSum，
+// 再按 weightSum 占比二选一 —— 与 RTXDI_CombineReservoirs 的语义一致。
+//
+// 与 2026-09-29/09-30 两次被否的跨帧 EMA 本质不同：那条混的是**颜色**
+// （辐射度），输出支撑集被上一帧颜色改写 ⇒ 结构性噪点；这里混的是
+// **选哪个灯**（reservoir），输出仍是"一个样本 × 无偏权重"，样本来自更长的
+// 候选集。这也是官方 ReSTIR DI 与"时间降噪"的分界。
+//
+// 失效：灯内容 revision（localLightBuffer.header.y，即宿主
+// g_localLightRevision，内容不变时不递增）与历史不同 ⇒ 丢弃历史。官方用
+// light hash 做逐灯身份验证；本工程的 block emitter 没有稳定 light index，
+// 改用整表 revision + 世界坐标/类型/发射强度重建，开关灯的陈旧上限 = 1 帧。
+// =====================================================
+// 2026-10-26 完全对齐 dxvk-remix 的 RTXDI 调用契约。
+//
+// maxHistoryLength = 4（rtx_rtxdi_rayquery.h:79）与"每帧 M = 1"
+// （rtxdi_initial_sampling.comp.slang:115 `state.M = 1`）是**一对**参数：
+// M 是候选数，每帧只 +1 ⇒ 4 就是 4 帧历史。我们此前每帧按提案数（16）计入 M，
+// 又没有在钳位时缩放 weightSum ⇒ W 逐帧上涨、画面被降噪器钳成萤火虫。
+#ifndef VPT_DIRECT_WRS_HISTORY_LENGTH
+// RTXDI 的 rtx.di.maxHistoryLength 默认值。
+#define VPT_DIRECT_WRS_HISTORY_LENGTH 4.0
+#endif
+#ifndef VPT_DIRECT_WRS_NORMAL_COSINE
+// rtxdi_temporal_reuse.comp.slang:123 tparams.normalThreshold = 0.8
+#define VPT_DIRECT_WRS_NORMAL_COSINE 0.8
+#endif
+// 空间复用（rtxdi_spatial_reuse.comp.slang:118-131 + rtx_rtxdi_rayquery.h:71-75）
+#ifndef VPT_DIRECT_WRS_SPATIAL_SAMPLES
+#define VPT_DIRECT_WRS_SPATIAL_SAMPLES 2
+#endif
+#ifndef VPT_DIRECT_WRS_SPATIAL_SAMPLES_DISOC
+#define VPT_DIRECT_WRS_SPATIAL_SAMPLES_DISOC 4
+#endif
+#ifndef VPT_DIRECT_WRS_SPATIAL_RADIUS
+// sparams.samplingRadius = 30（像素）
+#define VPT_DIRECT_WRS_SPATIAL_RADIUS 30
+#endif
+#ifndef VPT_DIRECT_WRS_SPATIAL_NORMAL
+// sparams.normalThreshold = 0.5（比时域的 0.8 松，Remix 原值）
+#define VPT_DIRECT_WRS_SPATIAL_NORMAL 0.5
+#endif
+#ifndef VPT_DIRECT_WRS_SPATIAL_DEPTH
+// sparams.depthThreshold = 0.1（按相机距离的相对量）
+#define VPT_DIRECT_WRS_SPATIAL_DEPTH 0.1
+#endif
+#ifndef VPT_DIRECT_WRS_DISOCLUSION_FRAMES
+// rtx.di.disocclusionFrames = 8
+#define VPT_DIRECT_WRS_DISOCLUSION_FRAMES 8
+#endif
+// 时域重投影的探测次数（RTXDI_TemporalResampling :432-467 固定 9 次）。
+// 1 = 旧行为（只试运动矢量像素）。
+#ifndef VPT_DIRECT_WRS_TEMPORAL_ATTEMPTS
+#define VPT_DIRECT_WRS_TEMPORAL_ATTEMPTS 9
+#endif
+// best-light sampling（Remix 的 RtxdiBestLights，见 initial_sampling.comp:102-105）。
+// 0 = 关。⚠ 我们用的是"格锚点像素的上一帧 reservoir"，不是 argmax(照度)，
+// 原因见 tail 里的长注释（没有 per-tile SSBO / 没有 G-buffer）。
+#ifndef VPT_DIRECT_WRS_BEST_LIGHT
+#define VPT_DIRECT_WRS_BEST_LIGHT 1
+#endif
+#ifndef VPT_DIRECT_WRS_BEST_LIGHT_TILE
+// Remix 的 RTXDI_GRAD_FACTOR 是 8 的整数倍口径；这里用 8×8。
+#define VPT_DIRECT_WRS_BEST_LIGHT_TILE 8
+#endif
+// RAY_TRACED bias correction（Remix 的 rtx.di.enableRayTracedBiasCorrection 默认 true）：
+// 选中的历史样本要重验一次可见性，不可见则把它的 p̂ 置 0。
+#ifndef VPT_DIRECT_WRS_RAY_TRACED_BC
+#define VPT_DIRECT_WRS_RAY_TRACED_BC 1
+#endif
+#ifndef VPT_DIRECT_WRS_CONFIDENCE_LENGTH
+// rtxdi_temporal_reuse.comp.slang:144 的 kReprojectionConfidenceHistoryLength。
+// ⚠ 参考仓库里只有这个符号的**用法**（预编译 shader 内联），没有定义 ⇒ 取 8，
+// 与 disocclusionFrames 同值：语义是"连续重投影成功 8 帧视为收敛"。
+#define VPT_DIRECT_WRS_CONFIDENCE_LENGTH 8.0
+#endif
+
+// 按当前接收面重算一个灯样本的无阴影贡献（与 RIS 提案循环的 scale 逐项一致）。
+bool vptLocalEmitterContributionAt(
+    vec3 hitPos,
+    vec3 N,
+    bool waterColumnReceiver,
+    bool geometricFaceKnown,
+    vec3 geometricFaceRecovered,
+    vec3 samplePosition,
+    uint emission,
+    uint typeCode,
+    out vec3 contribution
+)
+{
+    contribution = vec3(0.0);
+    if(emission == 0u)
+    {
+        return false;
+    }
+    vec3 toLight = samplePosition - hitPos;
+    float distanceSquared = dot(toLight, toLight);
+    if(distanceSquared <= 1.0e-6)
+    {
+        return false;
+    }
+    float distanceToLight = sqrt(distanceSquared);
+    float emissionLevel = float(emission);
+    // 距离闸与提案循环同口径（那里量的是**发射体中心**到接收点，不是采样点），
+    // 否则 max range 边缘那一圈采样的 target 会被本函数判 0，合并出一个偏置。
+    vec3 emitterCenter = floor(samplePosition) + vec3(0.5);
+    if(length(emitterCenter - hitPos) > vptLocalLightRange(emissionLevel))
+    {
+        return false;
+    }
+    vec3 lightDirection = toLight / distanceToLight;
+    float cosine = waterColumnReceiver
+        ? 1.0
+        : max(dot(N, lightDirection), 0.0);
+#if VPT_LOCAL_GEOMETRIC_COSINE_BOUND
+    cosine = min(
+        cosine,
+        vptLocalFaceSetCosineBound(
+            geometricFaceKnown,
+            geometricFaceRecovered,
+            hitPos,
+            lightDirection
+        )
+    );
+#endif
+    if(cosine <= 0.0)
+    {
+        return false;
+    }
+    float scale = 3.2 * LOCAL_LIGHT_ENERGY_SCALE * localLightIntensity() *
+        (emissionLevel / 15.0) *
+        vptLocalLightDistanceAttenuation(distanceToLight) *
+        vptLocalLightRangeFade(distanceToLight, emissionLevel);
+    contribution = vliDecodeEmitterColor(typeCode) * scale * cosine;
+    return true;
+}
+
+// 与 RIS 尾部完全相同的可见性/染色模型（见 evaluateVPTRISDirectLightingSingle
+// 的长注释），只对合并后的**一个**样本发一次射线。
+vec3 vptLocalEmitterSampleTransmittance(
+    vec3 hitPos,
+    vec3 selectedSample
+)
+{
+    ivec3 selectedBlock = ivec3(floor(selectedSample));
+    vec3 neeRayDirection = normalize(selectedSample - hitPos);
+    vec3 receiverOrigin = hitPos + neeRayDirection * 0.001;
+
+    bool sampledPointInsideEmitterVoxel =
+        all(greaterThanEqual(selectedSample, vec3(selectedBlock))) &&
+        all(lessThanEqual(
+            selectedSample,
+            vec3(selectedBlock) + vec3(1.0)
+        ));
+    float targetVoxelEntryDistance = vptEmitterVoxelEntryDistance(
+        receiverOrigin, selectedSample, selectedBlock
+    );
+    if(!sampledPointInsideEmitterVoxel || targetVoxelEntryDistance < 0.0)
+    {
+        targetVoxelEntryDistance = distance(selectedSample, receiverOrigin);
+    }
+
+    vec3 transmittance = VPT_LOCAL_NEE_VISIBILITY_RAY
+        ? traceVptLocalLightVisibility(
+            receiverOrigin,
+            selectedSample,
+            targetVoxelEntryDistance,
+            0xffu
+        )
+        : vptTraceGlassTransmissionToEmitter(
+            receiverOrigin,
+            selectedSample,
+            targetVoxelEntryDistance
+        );
+#if VPT_LOCAL_CONSERVATIVE_VOXEL_OCCLUSION
+    if(vptVoxelPathBlocked(
+        receiverOrigin,
+        selectedSample,
+        selectedBlock,
+        targetVoxelEntryDistance
+    ))
+    {
+        return vec3(0.0);
+    }
+#endif
+    return transmittance;
+}
+
+// RTXDI_GetTemporalReprojectionOffset（:397-410）：radius=5，offset∈[-2.5,2.5)，
+// 强转 int 后落在 {-2,-1,0,1,2}。
+ivec2 vptTemporalReprojectionOffset(inout uint rngState)
+{
+    const float radius = 5.0;
+    const vec2 offsetRandom = vec2(rand(rngState), rand(rngState));
+    return ivec2((offsetRandom - vec2(0.5)) * radius);
+}
+
+// 历史条目与当前接收面是否同一个面（= RTXDI_IsValidNeighbor 的世界空间等价判据）。
+bool vptReservoirReceiverMatches(
+    VPTDirectHistory history,
+    vec3 hitPos,
+    vec3 receiverNormal,
+    float positionEpsilon,
+    float normalCosine)
+{
+    return length(history.normalAndPadding.xyz - hitPos) <= positionEpsilon &&
+        dot(normalize(history.reservoirNormalAndPadding.xyz), receiverNormal) >=
+            normalCosine;
+}
+
+// =====================================================
+// 时域重投影探测：RTXDI_TemporalResampling:432-467 的 9 次尝试。
+//
+// 为什么必须 9 次：单次重投影在曲面玻璃、快速转动的边缘、以及深度不连续处几乎
+// 必然失败，历史一丢就退回 1 样本 ⇒ 这就是"RTX DI 很吵"的主因。
+// 第 9 次（i == 8）故意**不做**相似性判据：SDK 原注释说它是给 disocclusion 与
+// 透过曲面玻璃看到的表面准备的兜底。
+// =====================================================
+bool vptProbeTemporalHistory(
+    vec3 hitPos,
+    vec3 receiverNormal,
+    ivec2 pixelCoord,
+    ivec2 renderSize,
+    uint lightRevision,
+    float positionEpsilon,
+    float normalCosine,
+    inout uint rngState,
+    out ivec2 historyCoord,
+    out bool fromMotionVector)
+{
+    historyCoord = ivec2(-1);
+    fromMotionVector = false;
+
+    uint reprojectedIndex = 0u;
+    const bool hasReprojection =
+        vptReprojectPreviousPixel(hitPos, renderSize, reprojectedIndex);
+    const ivec2 reprojectedCoord = ivec2(
+        int(reprojectedIndex % uint(renderSize.x)),
+        int(reprojectedIndex / uint(renderSize.x)));
+
+    for(int attempt = 0; attempt < VPT_DIRECT_WRS_TEMPORAL_ATTEMPTS; ++attempt)
+    {
+        ivec2 coord;
+        bool requireSimilarity = true;
+
+        // 只有"尝试次数 > 1"时，最后一次才是 SDK 的"同像素免判据"兜底；
+        // 置 1 时退化成旧行为（只试运动矢量像素 + 相似性判据）。
+        const bool lastAttempt =
+            (attempt == VPT_DIRECT_WRS_TEMPORAL_ATTEMPTS - 1);
+        if(VPT_DIRECT_WRS_TEMPORAL_ATTEMPTS > 1 && lastAttempt)
+        {
+            coord = pixelCoord;
+            requireSimilarity = false;
+        }
+        else
+        {
+            if(!hasReprojection)
+            {
+                continue;
+            }
+            coord = reprojectedCoord +
+                (attempt == 0 ? ivec2(0) : vptTemporalReprojectionOffset(rngState));
+        }
+
+        if(any(lessThan(coord, ivec2(0))) ||
+           any(greaterThanEqual(coord, renderSize)))
+        {
+            continue;
+        }
+
+        const VPTDirectHistory probe = vptReadPrimaryHistory(
+            uint(coord.y * renderSize.x + coord.x));
+
+        if(abs(probe.hitPositionAndValid.w - 2.0) >= 0.5)
+        {
+            continue;
+        }
+        if(probe.hitPositionAndValid.y < 0.5)
+        {
+            continue;
+        }
+        // 灯表内容变了 ⇒ 灯身份不可验证（对应 SDK 的 TranslateLightIndex 失败）。
+        if(abs(probe.hitPositionAndValid.z - float(lightRevision)) >= 0.5)
+        {
+            continue;
+        }
+        if(requireSimilarity &&
+           !vptReservoirReceiverMatches(
+               probe, hitPos, receiverNormal, positionEpsilon, normalCosine))
+        {
+            continue;
+        }
+
+        historyCoord = coord;
+        fromMotionVector = requireSimilarity;
+        return true;
+    }
+
+    return false;
+}
+
+// =====================================================
+// 2026-10-26：RTXDI 语义的 reservoir 累积状态。
+//
+// 字段与 RTXDI_Reservoir（Reservoir.slangh:24-34）一一对应：
+//   samplePos / sampleIdentity   ≈ lightIdx + uv（我们是一块发射体上的采样点）
+//   weightSum                    combine 阶段的加权和（finalize 前口径）
+//   M                            历史长度，单位**帧**（initial sampling 后 = 1）
+//   targetPdf                    选中样本在**当前接收面**上的 p̂
+//   pi / piSum                   BASIC bias correction 的 MIS 归一分子 / 分母
+// =====================================================
+struct VPTReservoirState
+{
+    vec3 samplePos;
+    uint sampleIdentity;
+    vec3 selectedContribution;
+    float weightSum;
+    float M;
+    float piSum;
+    float targetPdf;
+    float pi;
+    bool selectedPrevious;
+};
+
+VPTReservoirState vptReservoirStateEmpty()
+{
+    VPTReservoirState state;
+    state.samplePos = vec3(0.0);
+    state.sampleIdentity = 0u;
+    state.selectedContribution = vec3(0.0);
+    state.weightSum = 0.0;
+    state.M = 0.0;
+    state.piSum = 0.0;
+    state.targetPdf = 0.0;
+    state.pi = 0.0;
+    state.selectedPrevious = false;
+    return state;
+}
+
+// RTXDI_CombineReservoirs（ResamplingFunctions.slangh:66-95）逐行等价：
+//   risWeight = targetPdf * candidateWeight * candidateM
+//   M += candidateM；weightSum += risWeight；按占比做 WRS 抽取
+bool vptCombineReservoir(
+    inout VPTReservoirState state,
+    vec3 candidateSample,
+    uint candidateIdentity,
+    vec3 candidateContribution,
+    float candidateWeight,
+    float candidateM,
+    float candidateTargetPdf,
+    inout uint rngState)
+{
+    const float risWeight =
+        candidateTargetPdf * candidateWeight * candidateM;
+    if(risWeight <= 0.0)
+    {
+        return false;
+    }
+
+    state.M += candidateM;
+    state.weightSum += risWeight;
+
+    if(rand(rngState) * state.weightSum >= risWeight)
+    {
+        return false;
+    }
+
+    state.samplePos = candidateSample;
+    state.sampleIdentity = candidateIdentity;
+    state.selectedContribution = candidateContribution;
+    state.targetPdf = max(candidateTargetPdf, 1.0e-6);
+    state.selectedPrevious = true;
+    return true;
+}
+
+// 把一个历史 reservoir 合并进当前 state。时域与空间共用这一个入口，差别只有：
+//   · historyClampM > 0 ⇒ 时域，按 maxHistoryLength（单位帧）钳候选 M；
+//   · 空间的 piSum 用**邻居表面**的 p̂（SDK :797-810 同一口径），我们这里就是历史
+//     条目里存的上一帧接收面。
+bool vptMergeReservoirCandidate(
+    inout VPTReservoirState state,
+    ivec2 historyCoord,
+    ivec2 renderSize,
+    vec3 hitPos,
+    vec3 N,
+    vec3 receiverNormal,
+    bool waterColumnReceiver,
+    bool geometricFaceKnown,
+    vec3 geometricFaceRecovered,
+    uint lightRevision,
+    float positionEpsilon,
+    float normalCosine,
+    float historyClampM,
+    bool testVisibility,
+    inout uint rngState,
+    out float candidateConfidence)
+{
+    candidateConfidence = 0.0;
+
+    if(any(lessThan(historyCoord, ivec2(0))) ||
+       any(greaterThanEqual(historyCoord, renderSize)))
+    {
+        return false;
+    }
+
+    const uint historyIndex =
+        uint(historyCoord.y * renderSize.x + historyCoord.x);
+    const VPTDirectHistory history = vptReadPrimaryHistory(historyIndex);
+
+    if(abs(history.hitPositionAndValid.w - 2.0) >= 0.5)
+    {
+        return false;
+    }
+    // 灯表 revision 不同 ⇒ 灯身份不可验证（对应 SDK 的 light hash / TranslateLightIndex）。
+    if(abs(history.hitPositionAndValid.z - float(lightRevision)) >= 0.5)
+    {
+        return false;
+    }
+    if(history.hitPositionAndValid.y < 0.5)
+    {
+        return false;
+    }
+    if(length(history.normalAndPadding.xyz - hitPos) > positionEpsilon)
+    {
+        return false;
+    }
+    if(dot(normalize(history.reservoirNormalAndPadding.xyz), receiverNormal) <
+       normalCosine)
+    {
+        return false;
+    }
+
+    const uint packedIdentity = uint(history.radianceAndSampleCount.w + 0.5);
+    const vec3 candidateSample = history.radianceAndSampleCount.xyz;
+
+    // p̂ 在当前接收面上（= SDK 的 RAB_GetLightSampleTargetPdfForSurface(candidate, surface)）
+    vec3 contributionNow;
+    if(!vptLocalEmitterContributionAt(
+        hitPos,
+        N,
+        waterColumnReceiver,
+        geometricFaceKnown,
+        geometricFaceRecovered,
+        candidateSample,
+        packedIdentity >> 3u,
+        packedIdentity & 7u,
+        contributionNow))
+    {
+        return false;
+    }
+    const float targetNow = max(dot(contributionNow,
+        vec3(0.2126, 0.7152, 0.0722)), 1.0e-6);
+
+    // p̂ 在**上一帧接收面**上（= SDK 的 GetSurfaceForTemporalBiasCorrection + 重新求值）。
+    // 这是 BASIC / RAY_TRACED bias correction 的分母项；求不出来就退化用 targetNow。
+    float targetPreviousSurface = targetNow;
+    {
+        vec3 contributionPreviousSurface;
+        if(vptLocalEmitterContributionAt(
+            history.normalAndPadding.xyz,
+            normalize(history.reservoirNormalAndPadding.xyz),
+            waterColumnReceiver,
+            false,
+            vec3(0.0, 1.0, 0.0),
+            candidateSample,
+            packedIdentity >> 3u,
+            packedIdentity & 7u,
+            contributionPreviousSurface))
+        {
+            targetPreviousSurface = max(dot(contributionPreviousSurface,
+                vec3(0.2126, 0.7152, 0.0722)), 1.0e-6);
+        }
+    }
+
+    const float candidateWeight = max(history.hitPositionAndValid.x, 0.0);
+    float candidateM = max(history.hitPositionAndValid.y, 1.0);
+    if(historyClampM > 0.0 && candidateM > historyClampM)
+    {
+        candidateM = historyClampM;
+    }
+    if(candidateWeight <= 0.0 || candidateM <= 0.0)
+    {
+        return false;
+    }
+
+    // RAY_TRACED bias correction（SDK :598-611）：选中的历史样本重验一次可见性，
+    // 不可见则把 temporalP 置 0 —— 它既影响 pi，也影响 piSum 的分母项。
+    // 代价：每次时域复用最多 +1 条射线；空间复用不做（SDK 的空间那条要每邻域一条）。
+#if VPT_DIRECT_WRS_RAY_TRACED_BC
+    if(testVisibility && targetPreviousSurface > 0.0)
+    {
+        const vec3 previousVisibility = vptLocalEmitterSampleTransmittance(
+            history.normalAndPadding.xyz,
+            candidateSample);
+        if(max(previousVisibility.r,
+               max(previousVisibility.g, previousVisibility.b)) <= 0.0)
+        {
+            targetPreviousSurface = 0.0;
+        }
+    }
+#endif
+
+    // piSum 累加"该候选在自己接收面上"的 p̂×M（SDK :616 与 :810 同一口径）。
+    state.piSum += targetPreviousSurface * candidateM;
+
+    if(vptCombineReservoir(
+        state,
+        candidateSample,
+        packedIdentity,
+        contributionNow,
+        candidateWeight,
+        candidateM,
+        targetNow,
+        rngState))
+    {
+        // 选中的是这个候选 ⇒ 它的 pi 用上一帧接收面上的 p̂（SDK :614）。
+        state.pi = targetPreviousSurface;
+    }
+
+    candidateConfidence = history.reservoirNormalAndPadding.w;
+    return true;
+}
+
+vec3 evaluateVPTDirectLightReservoirTail(
+    vec3 hitPos,
+    vec3 N,
+    vec3 hitAlbedo,
+    bool waterColumnReceiver,
+    bool geometricFaceKnown,
+    vec3 geometricFaceRecovered,
+    float currentWeightSum,
+    vec3 currentContribution,
+    vec3 currentSample,
+    uint currentEmission,
+    uint currentTypeCode,
+    bool shadingActive,
+    inout uint rngState
+)
+{
+    const ivec2 pixelCoord = ivec2(gl_LaunchIDEXT.xy);
+    const ivec2 renderSize = ivec2(rtLaunchSize());
+    const uint currentIndex =
+        uint(pixelCoord.y * renderSize.x + pixelCoord.x);
+    const vec3 luminanceWeights = vec3(0.2126, 0.7152, 0.0722);
+
+    vec3 receiverNormal = geometricFaceKnown
+        ? normalize(geometricFaceRecovered)
+        : N;
+
+    // ---- initial sampling ----
+    // SDK：RTXDI_FinalizeResampling(localState, 1.0, localState.M) 把 weightSum 归一成 W，
+    // 随后 localState.M = 1（ResamplingFunctions.slangh:280-281）。所以每帧的 reservoir
+    // 代表 1 帧历史，weightSum 进入 combine 时是 p̂·W 的口径。
+    const float proposalCount = float(vptRisProposalCount());
+    const float currentTargetPdf =
+        max(dot(currentContribution, luminanceWeights), 1.0e-6);
+    const float initialW =
+        currentWeightSum / max(currentTargetPdf * proposalCount, 1.0e-6);
+
+    VPTReservoirState state = vptReservoirStateEmpty();
+    state.samplePos = currentSample;
+    state.sampleIdentity = (currentEmission << 3u) | currentTypeCode;
+    state.selectedContribution = currentContribution;
+    state.weightSum = currentTargetPdf * initialW;
+    state.M = 1.0;
+    state.piSum = currentTargetPdf;
+    state.targetPdf = currentTargetPdf;
+    state.pi = currentTargetPdf;
+    state.selectedPrevious = false;
+
+    const uint lightRevision = localLightBuffer.header.y;
+    const float receiverPositionEpsilon =
+        vptJitterCompensatedPositionEpsilon(hitPos);
+    const float cameraDistance = length(hitPos - cam.viewInverse[3].xyz);
+
+    float accumulatedConfidence = 0.0;
+    bool historyReprojected = false;
+    float candidateConfidence = 0.0;
+
+    // ---- temporal reuse ----
+    if(cam.historyValid != 0u)
+    {
+        ivec2 historyCoord;
+        bool fromMotionVector = false;
+        if(vptProbeTemporalHistory(
+            hitPos,
+            receiverNormal,
+            pixelCoord,
+            renderSize,
+            lightRevision,
+            receiverPositionEpsilon,
+            VPT_DIRECT_WRS_NORMAL_COSINE,
+            rngState,
+            historyCoord,
+            fromMotionVector))
+        {
+            // historyLimit = maxHistoryLength * state.M（ResamplingFunctions.slangh:485）。
+            // 单位是帧：maxHistoryLength=4、state.M=1 ⇒ 4。
+            const float historyLimit = VPT_DIRECT_WRS_HISTORY_LENGTH * state.M;
+
+            historyReprojected = vptMergeReservoirCandidate(
+                state,
+                historyCoord,
+                renderSize,
+                hitPos,
+                N,
+                receiverNormal,
+                waterColumnReceiver,
+                geometricFaceKnown,
+                geometricFaceRecovered,
+                lightRevision,
+                receiverPositionEpsilon,
+                VPT_DIRECT_WRS_NORMAL_COSINE,
+                historyLimit,
+                /*testVisibility=*/ true,
+                rngState,
+                candidateConfidence);
+
+            // SDK: isGBufferSimilar = (i < 8) —— 只有运动矢量路径命中才算"重投影成功"，
+            // 同像素兜底命中不推进置信度。
+            if(historyReprojected && !fromMotionVector)
+            {
+                historyReprojected = false;
+            }
+        }
+    }
+
+    // ---- spatial reuse ----
+    // SDK：中心样本先 Combine 进来（:682），再按 numSamples 抽邻域（:696-753），
+    // 采样数由 3×3 平均置信决定（rtxdi_spatial_reuse.comp.slang:106-120）。
+#if VPT_DIRECT_WRS_SPATIAL_SAMPLES > 0
+    {
+        float summedConfidence = 0.0;
+        for(int sy = -1; sy <= 1; ++sy)
+        {
+            for(int sx = -1; sx <= 1; ++sx)
+            {
+                ivec2 neighbour = pixelCoord + ivec2(sx, sy);
+                if(any(lessThan(neighbour, ivec2(0))) ||
+                   any(greaterThanEqual(neighbour, renderSize)))
+                {
+                    continue;
+                }
+                summedConfidence += vptReadPrimaryHistory(
+                    uint(neighbour.y * renderSize.x + neighbour.x))
+                    .reservoirNormalAndPadding.w;
+            }
+        }
+        const float historyFrames =
+            summedConfidence * (VPT_DIRECT_WRS_CONFIDENCE_LENGTH / 9.0);
+        const int spatialSampleCount =
+            historyFrames < float(VPT_DIRECT_WRS_DISOCLUSION_FRAMES)
+                ? VPT_DIRECT_WRS_SPATIAL_SAMPLES_DISOC
+                : VPT_DIRECT_WRS_SPATIAL_SAMPLES;
+
+        const float spatialPositionEpsilon = max(
+            receiverPositionEpsilon,
+            VPT_DIRECT_WRS_SPATIAL_DEPTH * max(cameraDistance, 1.0));
+
+        float spatialConfidence = 0.0;
+        for(int tap = 0; tap < spatialSampleCount; ++tap)
+        {
+            const float offsetX = rand(rngState) * 2.0 - 1.0;
+            const float offsetY = rand(rngState) * 2.0 - 1.0;
+            const ivec2 spatialOffset = ivec2(
+                int(round(offsetX * float(VPT_DIRECT_WRS_SPATIAL_RADIUS))),
+                int(round(offsetY * float(VPT_DIRECT_WRS_SPATIAL_RADIUS))));
+
+            vptMergeReservoirCandidate(
+                state,
+                pixelCoord + spatialOffset,
+                renderSize,
+                hitPos,
+                N,
+                receiverNormal,
+                waterColumnReceiver,
+                geometricFaceKnown,
+                geometricFaceRecovered,
+                lightRevision,
+                spatialPositionEpsilon,
+                VPT_DIRECT_WRS_SPATIAL_NORMAL,
+                0.0,
+                /*testVisibility=*/ false,
+                rngState,
+                spatialConfidence);
+        }
+    }
+#endif
+
+    // ---- best-light sampling ----
+    // SDK：RTXDI_SampleSingleLight（ResamplingFunctions.slangh:294-344）把"上一帧该格
+    // 选中的灯"作为**额外一个候选**并入，invSourcePdf = 1.0、weightSum = targetPdf>0 ? 1 : 0。
+    // Remix 在 initial_sampling.comp:102-105 里紧接着 SampleRandomLights 调它。
+    //
+    // ⚠ 偏离（必须保留，别再让人以为这是逐位对齐）：
+    //   Remix 的"best light"是每 RTXDI_GRAD_FACTOR² 格子里**照度最大**的像素
+    //   （RTXDI_FindGradientSampleAndBestLight :1330-1412），由 compute_gradients +
+    //   filter_gradients 两个 pass 写进 per-tile SSBO。本工程没有那块 SSBO，也没有
+    //   G-buffer（reservoir 与 shading 同 dispatch），因此这一版取**格锚点像素**的
+    //   上一帧 reservoir 当代表样本：同样是跨像素样本复用，规则是锚点而非 argmax。
+    //   M 钳到 1（一个候选），piSum 用它自己接收面上的 p̂（helper 内计算）。
+#if VPT_DIRECT_WRS_BEST_LIGHT
+    if(cam.historyValid != 0u)
+    {
+        const ivec2 bestLightAnchor =
+            (pixelCoord / VPT_DIRECT_WRS_BEST_LIGHT_TILE) *
+            VPT_DIRECT_WRS_BEST_LIGHT_TILE;
+        if(bestLightAnchor != pixelCoord)
+        {
+            float bestLightConfidence = 0.0;
+            vptMergeReservoirCandidate(
+                state,
+                bestLightAnchor,
+                renderSize,
+                hitPos,
+                N,
+                receiverNormal,
+                waterColumnReceiver,
+                geometricFaceKnown,
+                geometricFaceRecovered,
+                lightRevision,
+                // 不要求同面：锚点像素几乎必然在另一个面上（SDK 的 best light
+                // 本来也是从格内**别的像素**取样本）。
+                1.0e9,
+                -1.0,
+                // M 钳到 1 帧，避免它压过时域历史。
+                1.0,
+                /*testVisibility=*/ false,
+                rngState,
+                bestLightConfidence);
+        }
+    }
+#endif
+
+    accumulatedConfidence = historyReprojected
+        ? min(candidateConfidence +
+              1.0 / VPT_DIRECT_WRS_CONFIDENCE_LENGTH, 1.0)
+        : 1.0 / VPT_DIRECT_WRS_CONFIDENCE_LENGTH;
+
+    // 稀疏渲染关闭时的旧行为：非活跃像素跳过着色。
+    if(!shadingActive && cam.sparseParams.z <= 0.5)
+    {
+        return vec3(0.0);
+    }
+
+    // ---- finalize（RTXDI_FinalizeResampling，:97-106）----
+    //   weightSum = weightSum * pi / (targetPdf * piSum)
+    // 未选中历史样本时 pi 就是当前样本自己的 p̂（:560/614）。
+    const float piFinal = state.selectedPrevious
+        ? state.pi
+        : state.targetPdf;
+    const float mergedWeightSum = state.weightSum;
+    const float mergedM = max(state.M, 1.0);
+    const float finalW = mergedWeightSum * piFinal /
+        max(state.targetPdf * state.piSum, 1.0e-6);
+
+    const vec3 selectedContribution = state.selectedContribution;
+    const vec3 selectedSample = state.samplePos;
+    const uint selectedEmission = state.sampleIdentity >> 3u;
+    const uint selectedTypeCode = state.sampleIdentity & 7u;
+
+    // reservoir 先落盘、再判可见性：被遮挡的样本下一帧仍可复用并重新测遮挡
+    //（官方 temporal reuse 也是先存 reservoir，可见性只影响着色）。
+    VPTDirectHistory outputHistory;
+    outputHistory.radianceAndSampleCount = vec4(
+        selectedSample,
+        float((selectedEmission << 3u) | selectedTypeCode)
+    );
+    outputHistory.hitPositionAndValid = vec4(
+        finalW,
+        mergedM,
+        float(lightRevision),
+        2.0
+    );
+    // normalAndPadding.w 存 targetPdf（RTXDI_Reservoir 的必填字段，bias correction 要用），
+    // reservoirNormalAndPadding.w 存重投影置信度（ReprojectionConfidence）。
+    outputHistory.normalAndPadding = vec4(hitPos, state.targetPdf);
+    outputHistory.reservoirNormalAndPadding =
+        vec4(receiverNormal, accumulatedConfidence);
+    vptWritePrimaryHistory(currentIndex, outputHistory);
+
+    if(!shadingActive || mergedWeightSum <= 0.0)
+    {
+        return vec3(0.0);
+    }
+
+    // 合并后只发 1 条可见性射线。
+    vec3 transmittance = vptLocalEmitterSampleTransmittance(
+        hitPos, selectedSample);
+    if(max(transmittance.r, max(transmittance.g, transmittance.b)) <= 0.0)
+    {
+        return vec3(0.0);
+    }
+    return applyLocalGlassTint(
+        selectedContribution * finalW *
+            max(hitAlbedo, vec3(0.0)) * 0.92,
+        transmittance
+    );
 }
 
 
@@ -6361,6 +7551,8 @@ bool localLightGridLookupCell(
 
 // 2026-10-20: 结构体单源化，见 hit_payload.glsl（六个 shader 共用同一份布局）。
 #include "hit_payload.glsl"
+// 2026-10-25：透射链的唯一契约（初始化 / 单事件透射率 / 终止判据 / 介质推进）。
+#include "glass_chain_common.glsl"
 
 
 // First-hit surface data for group3.  This is intentionally only the visible
@@ -6547,7 +7739,7 @@ void traceDiffuseSer(vec3 origin, vec3 direction, uint bouncePhase)
         0.001,
         direction,
         perfGiTraceMaxDistance(10000.0),
-        gl_RayFlagsNoneEXT,
+        SECONDARY_TRAVERSE_FLAGS,
         0xff,
         bouncePhase
     );
@@ -6616,6 +7808,24 @@ const uint RT_STATE_NO_SUN_DISK_BIT    = 1u << 14u;
 #define WATER_SKY_SUN_OCCLUSION 1
 #endif
 const uint RT_STATE_NO_SUN_GLOW_BIT    = 1u << 15u;
+// 2026-10-24：粒子命中标记，bit 16 —— 置位者 material_resolve.glsl
+//（isParticleMaterial，makeHitState 之后），消费者 rrParticlePixel（主射线读取，
+// 喂 RR TransparencyHint 治粒子残影）。与 rt_test.rchit 同名同值。
+const uint RT_STATE_PARTICLE_BIT       = 1u << 16u;
+
+// =====================================================
+// 2026-10-25 A/B：GI 射线跳过 POM（bit 17）
+//
+// 病灶：rt_test.rchit 的 POM march 固定 48 步 + 自阴影最多 24 步，且**不区分射线
+// 用途**；GI 射线方向四周散射、图集地址完全不相干 ⇒ 每条 GI 命中可达 25ns，
+// 严重场景下 GI 段 11ms。
+// 置位者：下面 GI 回路（与 traceTransparentLowCostGI）播种 state 时。消费端只有
+// rt_test.rchit 的 getPOMDepthScale()（返回 0 ⇒ 走既有的"POM off"早退分支）。
+// 为什么几乎无损：POM 位移是厘米量级，只对主射线近处掠射有意义；GI 是二阶弹射，
+// 结果还要落回 1/4 甚至 1/9 分辨率再被 RR 重建，厘米位移不可见。
+// 回退：宿主 ORION_GI_NO_POM=0（CameraUBO.giHalfParams.z 写 0）。
+// =====================================================
+const uint RT_STATE_GI_NO_POM_BIT      = 1u << 17u;
 
 const uint RT_PURPOSE_FULL             = 0u;
 const uint RT_PURPOSE_CLASSIFY         = 1u;
@@ -6627,6 +7837,26 @@ const uint RT_PURPOSE_WATER_MEDIUM     = 6u;
 // Primary sky misses use the 16-step volume; secondary misses use the
 // reference low-quality five-step branch without changing their ray type.
 const uint RT_PURPOSE_PRIMARY_SKY      = 7u;
+// 2026-10-25 阶段 D：主射线的透射段（单条射线 + any-hit 逐面累乘，Remix PSR 同构）。
+const uint RT_PURPOSE_PRIMARY_TRANSMISSION = 8u;
+
+// 2026-10-28 修复：主透射链改用**独立 state 位**（bit 18）。
+//
+// 病灶（代码事实，不是推测）：RT_PURPOSE_ 只有 3 位（RT_STATE_PURPOSE_MASK =
+// 0x7u，0..7 全满），而 RT_PURPOSE_PRIMARY_TRANSMISSION = 8 ⇒
+// makeTraceState(8) == (8 & 7) == 0 == RT_PURPOSE_FULL。于是两个 any-hit 里的
+//     getRayPurpose(payload.state) == RT_PURPOSE_PRIMARY_TRANSMISSION
+// 永远为假：2026-10-25 加入的整条玻璃透射链（逐面累乘 / alpha blend 写入）
+// 从未执行过。玻璃面因此在链里被当成不透明遮挡接受，链终止在玻璃的出射面，
+// rgen 拿到的 behindRadiance 退化成 albedo × 环境项 —— 表现为"透过玻璃看到
+// 灰色实心面"：视线恰好多穿过一层玻璃就实，没穿过就透。
+//
+// 位预算：15 NO_SUN_GLOW / 16 PARTICLE / 17 GI_NO_POM 已用，18 空闲。
+// 回退：-DORION_GLASS_CHAIN_BIT=0（逐位回到旧行为）。
+#ifndef ORION_GLASS_CHAIN_BIT
+#define ORION_GLASS_CHAIN_BIT 1
+#endif
+const uint RT_STATE_PRIMARY_TRANSMISSION_BIT = 1u << 18u;
 
 const uint RT_HIT_OPAQUE               = 0u;
 const uint RT_HIT_WATER                = 1u;
@@ -6695,7 +7925,12 @@ vec3 traceVptLocalLightVisibility(
     hit.glassAlpha = 0.0;
     hit.lastGlassFaceT = -1.0;
     hit.glassFaceBudget = 0.0;
+    hit.glassInside = 0.0;
+    hit.glassEntryT = -1.0;
     hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
+
+    // [12] 本地光可见性射线（traceVptLocalLightVisibility 的真实发射点）。
+    perfRayStatAdd(12u, 1u);
 
     traceRayEXT(
         topLevelAS,
@@ -7087,6 +8322,92 @@ uint pcg_hash(inout uint state) {
 
 float rand(inout uint state) {
     return float(pcg_hash(state)) / 4294967296.0;
+}
+
+// =====================================================
+// 2026-10-26 稀疏渲染白噪声。
+//
+// 逐字移植 RTX Remix（_ref/dxvk-remix）：
+//   src/dxvk/shaders/rtx/utility/noise.slangh       uintHash / whiteNoise
+//   src/dxvk/shaders/rtx/utility/packing.slangh     unorm23ToFloat
+//   src/dxvk/shaders/rtx/pass/sparse_rendering/per_pixel_rate.slangh
+//
+// ⚠ 2026-10-27 更正：Remix 的 per-pixel rate **默认是蓝噪声**
+// （Options::perPixelRateNoiseSource 默认 BlueNoise128x128x64x8），
+// 白噪声只是可选项 PerPixelRateNoiseSource::WhiteNoise
+// （whiteNoise(pixelCoordinate, frameIdx, 0u)）。原注释写反了。
+// 下面这条 uintHash 保留：蓝噪声表缺失时的兜底与 A/B 用。
+// =====================================================
+uint uintHash(uint x)
+{
+    x ^= x >> 16;
+    x *= 0x21f0aaadU;
+    x ^= x >> 15;
+    x *= 0x735a2d97U;
+    x ^= x >> 15;
+    return x;
+}
+
+float unorm23ToFloat(uint x)
+{
+    const uint ieeeMantissa = 0x007FFFFFu;
+    const uint ieeeOne = 0x3F800000u;
+    x &= ieeeMantissa;
+    x |= ieeeOne;
+    return uintBitsToFloat(x) - 1.0;
+}
+
+float vptWhiteNoise(uvec2 pixelCoord, uint temporalIdx, uint seed)
+{
+    return unorm23ToFloat(
+        uintHash(
+            uintHash(pixelCoord.x) ^
+            uintHash(pixelCoord.y) ^
+            uintHash(temporalIdx) ^
+            uintHash(seed)
+        )
+    );
+}
+
+// =====================================================
+// 2026-10-27 稀疏渲染判定阈值。逐行照搬 RTX Remix：
+//   per_pixel_rate.slangh  calculatePerPixelRateThreshold()
+//     BlueNoise128x128x64x8 分支：
+//       BlueNoise.Load(int4(pixel.x & 127, pixel.y & 127, frameIdx & 63, 0)).r
+// 数据与玻璃 alpha blend 共用 binding 76 的同一份 128x128x64 R8 表
+// （_ref/dxvk-remix/src/util/util_blueNoise_128x128x64.h，MIT）。
+// 与 Remix 一致：不做 min(x, 1-1/255) 钳制 —— 那是 getNextSampleBlueNoise
+// 的 RNG 口径，不是 per-pixel rate 的口径。
+// =====================================================
+float vptSparseBlueNoiseThreshold(uvec2 pixelCoord, uint frameIdx)
+{
+    const uint x = pixelCoord.x & 127u;
+    const uint y = pixelCoord.y & 127u;
+    const uint layer = frameIdx & 63u;
+    const uint byteIndex = 16384u * layer + 128u * y + x;
+    const uint word = glassBlueNoise.words[byteIndex >> 2u];
+    const uint raw = (word >> ((byteIndex & 3u) * 8u)) & 0xFFu;
+    return float(raw) * (1.0 / 255.0);
+}
+
+// =====================================================
+// 2026-10-27 稀疏辐亮度的无偏缩放。
+// Remix: sparse_rendering.slangh:39-52
+//   clampSamplingRateForRadianceScale(r) = max(r, 1/255)
+//   calculateRadianceScaleFromSamplingRate(r) = 1 / max(r, 1/255)
+// 施加范围见 litColor 处：只乘被稀疏化的辐射度项，不乘自发光/环境底/HitT。
+// rate 为 0（稀疏关）或 1（全采样）时返回 1，与旧画面逐位一致。
+// =====================================================
+float vptSparseRadianceScale()
+{
+    const float rate = clamp(cam.sparseParams.y, 0.0, 100.0) * 0.01;
+
+    if(rate <= 0.0 || rate >= 1.0)
+    {
+        return 1.0;
+    }
+
+    return 1.0 / max(rate, 1.0 / 255.0);
 }
 // =====================================================
 // DLSS frame-level Halton(2,3) jitter
@@ -7613,7 +8934,7 @@ const float WATER_EXTINCTION_DISTANCE =
                 0.02,
                 currentDir,
                 10000.0,
-                gl_RayFlagsNoneEXT,
+                SECONDARY_TRAVERSE_FLAGS,
                 0xff,
                 step
             );
@@ -7623,7 +8944,7 @@ const float WATER_EXTINCTION_DISTANCE =
         {
             traceRayEXT(
                 topLevelAS,
-                gl_RayFlagsNoneEXT,
+                SECONDARY_TRAVERSE_FLAGS,
                 0xff,
                 0,
                 0,
@@ -12003,6 +13324,8 @@ for(
 
                 hit.lastGlassFaceT = -1.0;
                 hit.glassFaceBudget = 0.0;
+                hit.glassInside = 0.0;
+                hit.glassEntryT = -1.0;
                 hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
                 // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
                 // 见 HANDOFF-2026-10-21-VERTEX-32B-TERRAIN.md §8。否则累乘起点是
@@ -12263,7 +13586,7 @@ vec3 traceGlassSceneReflectionOneRay(
             0.02,
             reflectionDirection,
             10000.0,
-            gl_RayFlagsNoneEXT,
+            SECONDARY_TRAVERSE_FLAGS,
             0xff,
             0u
         );
@@ -12273,7 +13596,7 @@ vec3 traceGlassSceneReflectionOneRay(
     {
         traceRayEXT(
             topLevelAS,
-            gl_RayFlagsNoneEXT,
+            SECONDARY_TRAVERSE_FLAGS,
             0xff,
             0,
             0,
@@ -12813,6 +14136,8 @@ vec3 evaluateSecondaryDiffuseLocalLights(
 
             hit.lastGlassFaceT = -1.0;
             hit.glassFaceBudget = 0.0;
+            hit.glassInside = 0.0;
+            hit.glassEntryT = -1.0;
             hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
             // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
             // 见 HANDOFF-2026-10-21-VERTEX-32B-TERRAIN.md §8。否则累乘起点是
@@ -13020,6 +14345,12 @@ vec3 traceTransparentLowCostGI(
 
     hit.state = makeTraceState(RT_PURPOSE_FULL);
 
+    // 2026-10-25 A/B：低代价 GI 射线同样跳过 POM（与主 GI 回路同口径）。
+    if(cam.giHalfParams.z > 0.5f)
+    {
+        hit.state |= RT_STATE_GI_NO_POM_BIT;
+    }
+
 
 #ifdef RT_ENABLE_SER
     // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
@@ -13030,7 +14361,7 @@ vec3 traceTransparentLowCostGI(
             0.02,
             giDirection,
             10000.0,
-            gl_RayFlagsNoneEXT,
+            SECONDARY_TRAVERSE_FLAGS,
             0xff,
             0u
         );
@@ -13040,7 +14371,7 @@ vec3 traceTransparentLowCostGI(
     {
         traceRayEXT(
             topLevelAS,
-            gl_RayFlagsNoneEXT,
+            SECONDARY_TRAVERSE_FLAGS,
             0xff,
             0,
             0,
@@ -13500,7 +14831,7 @@ vec3 causticWaveNormal(vec2 sourceXZ, bool includeInteraction)
     float horizonFade = 1.0 - exp(-4.0 * noV);
     // 2026-10-18 方案 A：焦散与可见水面同源，mip 级也用屏幕足迹定。焦散无命中
     // 距离，用相机→该水面点的距离近似 rayDistance。
-    float projScale = float(gl_LaunchSizeEXT.y)
+    float projScale = float(rtLaunchSize().y)
         / (2.0 * max(tan(cam.cameraParams.z * 0.5), 0.05));
     float causticRayDistance =
         max(length(surfacePos - cam.viewInverse[3].xyz), 1.0e-3);
@@ -13822,7 +15153,7 @@ vec3 evaluatePrimaryWaterReceiverCaustics(
  // 做法：宿主每帧把 FFT 位移网格前向光栅化成接收面焦散图
     //（binding 69），这里只按接收面纹素足迹选 mip 再查一次。自然波的面积比、
     // 3×3 片拼接与三通道 IOR 色散都已经烘在图的 RGB 里。
-    float projScale = float(gl_LaunchSizeEXT.y) /
+    float projScale = float(rtLaunchSize().y) /
         (2.0 * max(tan(cam.cameraParams.z * 0.5), 0.05));
     float receiverRayDistance = max(
         length(receiver.receiverWorldPos - cam.viewInverse[3].xyz),
@@ -14057,6 +15388,132 @@ vec3 evaluateShoreFoam(
     return foamRadiance * foamMask;
 }
 
+// ---- Persistent foam map (Crest route B, 2026-10-26) ----------------------
+// The map is an accumulation buffer, not a render target: water_foam.comp runs
+// at 30 Hz, this file only reads it once per water pixel.  The old additive
+// evaluateShoreFoam() above stays dead code (it cannot accumulate or persist).
+//
+// 2026-10-26 21:1x 用户不要泡沫 ⇒ 回退：三个函数（采样 LOD / 采样 / 岸线注入）
+// 与 binding 73/74 一起屏蔽保留；调用点见下方 #if 0。
+#if 0
+float waterFoamMapLodFromProj(
+    vec3 surfacePos,
+    float rayDistance,
+    float projScale)
+{
+    if(projScale <= 0.0 || cam.pomParams.w <= 0.0)
+    {
+        return 0.0;
+    }
+    vec3 toCam = surfacePos - cam.viewInverse[3].xyz;
+    float dist = max(length(toCam), 1.0e-3);
+    float noV = max(abs(toCam.y) / dist, 0.04);
+    float worldPerPixel = max(rayDistance, 1.0e-3) / (projScale * noV);
+    // +0.5: the foam field is authored as soft blobs, so favour the sharper
+    // mip slightly less than the caustic map's -0.75 bias.
+    return clamp(
+        log2(max(worldPerPixel / cam.pomParams.w, 1.0e-4)) + 0.5,
+        0.0,
+        5.0);
+}
+
+// Crest's black-point dissolve: foam = 1 -> threshold 0 (mostly opaque),
+// foam = 0 -> threshold 1 (nothing). The two-octave field also drifts with
+// time, so a persistent crest patch keeps boiling instead of freezing solid.
+float waterFoamMapSample(
+    vec3 surfacePos,
+    float rayDistance,
+    float projScale)
+{
+    if(cam.pomParams.w <= 0.0)
+    {
+        return 0.0;
+    }
+
+    vec2 uv =
+        (surfacePos.xz - cam.pomParams.yz) /
+        (cam.pomParams.w * 512.0);
+    if(any(lessThanEqual(uv, vec2(0.0))) ||
+       any(greaterThanEqual(uv, vec2(1.0))))
+    {
+        return 0.0;
+    }
+
+    float lod = waterFoamMapLodFromProj(surfacePos, rayDistance, projScale);
+    float layer = floor(cam.cloudAerialParams.w + 0.5);
+    float foam = textureLod(waterFoamMap, vec3(uv, layer), lod).r;
+
+    vec2 edge = min(uv, vec2(1.0) - uv);
+    foam *= smoothstep(0.0, 0.035, min(edge.x, edge.y));
+    foam = clamp(foam, 0.0, 1.0);
+
+    float foamTime = uintBitsToFloat(cam.padding);
+    float noiseField =
+        shoreFoamNoise(surfacePos.xz * 1.9 + foamTime * vec2(0.30, -0.22)) *
+            0.65 +
+        shoreFoamNoise(surfacePos.xz * 4.7 - foamTime * vec2(0.18, 0.34)) *
+            0.35;
+
+    const float FEATHER = 0.40;
+    return clamp(
+        smoothstep(1.0 - foam, 1.0 - foam + FEATHER, noiseField),
+        0.0,
+        1.0);
+}
+
+// Shoreline coverage (Crest _ShorelineFoamMaxDepth analog).  The receiver depth
+// is still a 1 m voxel staircase, but here it only decides how much coverage a
+// foam texel accumulates; the black-point noise above turns the staircase edge
+// into lace, and the map keeps the ribbon for a few seconds after the player
+// moves.  Atomic max, because several pixels can land in one 0.375 m texel.
+void waterFoamInjectShore(
+    vec3 waterSurfacePosition,
+    const in WaterTransmissionInfo receiver)
+{
+    if(cam.pomParams.w <= 0.0)
+    {
+        return;
+    }
+    if(
+        receiver.reachedUnderwaterReceiver <= 0.5 ||
+        dot(receiver.receiverNormal, vec3(0.0, 1.0, 0.0)) < 0.5
+    )
+    {
+        return;
+    }
+
+    float waterDepth =
+        waterSurfacePosition.y - receiver.receiverWorldPos.y;
+    waterDepth *= clamp(receiver.receiverViewDirection.y, 0.55, 1.0);
+    if(waterDepth >= 1.35)
+    {
+        return;
+    }
+
+    float coverage =
+        1.0 - smoothstep(0.15, 1.35, max(waterDepth, 0.0));
+    if(coverage <= 0.01)
+    {
+        return;
+    }
+
+    vec2 local =
+        (waterSurfacePosition.xz - cam.pomParams.yz) / cam.pomParams.w;
+    vec2 texelF = floor(local);
+    if(any(lessThan(texelF, vec2(0.0))) ||
+       any(greaterThanEqual(texelF, vec2(512.0))))
+    {
+        return;
+    }
+
+    imageAtomicMax(
+        waterFoamInjection,
+        ivec2(texelF),
+        floatBitsToUint(coverage)
+    );
+}
+#endif // 2026-10-26 泡沫回退
+
 vec3 tracePrimaryTransparentRadiance(
     vec3 startOrigin,
     vec3 startDirection,
@@ -14139,7 +15596,7 @@ vec3 tracePrimarySimpleGlassRadiance(
             0.01,
             straightDirection,
             10000.0,
-            gl_RayFlagsNoneEXT,
+            SECONDARY_TRAVERSE_FLAGS,
             0xff,
             0u
         );
@@ -14149,7 +15606,7 @@ vec3 tracePrimarySimpleGlassRadiance(
     {
         traceRayEXT(
             topLevelAS,
-            gl_RayFlagsNoneEXT,
+            SECONDARY_TRAVERSE_FLAGS,
             0xff,
             0,
             0,
@@ -14302,6 +15759,64 @@ bool glassMirrorPathIsClear(
     return payload.hitDistance < 0.0;
 }
 
+// ============================================================================
+// 2026-10-26：半透明 alpha blend 拆 pass 的总闸（docs §7.4 步骤 3）
+//
+// 1 = 玻璃分支只**写旁路图**并把**未合成**的背景辐射返回给 rtOutput，
+//     由 glass_alpha_blend.comp + glass_alpha_finish.comp 在屏幕空间合成。
+// 0 = 逐位回到本轮之前的"rgen 就地合成"（下面 transmittedRadiance 那条路）。
+//
+// A/B 口径（两条必须同时满足才生效）：
+//   · VPT_GLASS_ALPHA_BLEND=1（alpha blend 口径本身）
+//   · VPT_GLASS_ALPHA_BLEND_SURFACE_RADIANCE=1（加性合成，第三轮的口径）
+// 只把本宏置 0 时，宿主仍会清 74 号图 ⇒ 新 pass 找不到半透明像素、整条链惰性，
+// 画面 = 旧档逐位不变。这就是 M1/M2 的回退开关。
+//
+// ⚠ PANE_SPECULAR=1 时强制关掉本宏：那一档要叠裸 Fresnel 反射 + 太阳 GGX 高光，
+//   而那两条都在本函数**后半段**（镜面 trace + 解析天空）求和；提前返回会静默
+//   丢掉它们。alpha blend 口径（Remix）本来就没有反射项，所以默认档不受影响。
+// ============================================================================
+// 2026-10-26（第四轮）：定义已上提到 glass_chain_common.glsl —— 两个 rahit
+// 也要看到同一个值（选层语义改在 any-hit 里）。见那里的长注释。
+
+#if VPT_GLASS_ALPHA_BLEND && VPT_GLASS_ALPHA_BLEND_DEFERRED_COMPOSITE
+// 三张旁路图的唯一写点。参数语义与消费方（glass_alpha_blend.comp）逐项对应：
+//   surfaceWeight      = 73.rgb（已乘本层 a 与该层之前的累积透射）
+//   layerAlpha         = 73.a  = a_0
+//   chainTransmittance = 74.rgb = PI(1-a_i)（第 2..N 层，any-hit 累乘）
+//   paneHitT           = 74.a  （邻居搜索的共面/深度判据）
+//   surfaceLight       = 75.rgb = E_bg
+void storeGlassAlphaBlendDeferred(
+    vec3 surfaceWeight,
+    float layerAlpha,
+    vec3 chainTransmittance,
+    float paneHitT,
+    vec3 surfaceLight)
+{
+    const ivec2 alphaBlendPixel =
+        ivec2(gl_LaunchIDEXT.xy);
+
+    imageStore(
+        glassAlphaBlendGbufferImage,
+        alphaBlendPixel,
+        vec4(
+            max(surfaceWeight, vec3(0.0)),
+            clamp(layerAlpha, 0.0, 1.0)));
+
+    imageStore(
+        glassAlphaBlendMetaImage,
+        alphaBlendPixel,
+        vec4(
+            clamp(chainTransmittance, vec3(0.0), vec3(1.0)),
+            max(paneHitT, 1.0e-3)));
+
+    imageStore(
+        glassAlphaBlendLightImage,
+        alphaBlendPixel,
+        vec4(max(surfaceLight, vec3(0.0)), 1.0));
+}
+#endif
+
 vec3 tracePrimaryGenericTransparentRadiance(
     // 入射面命中点（2026-10-05 起回归入射面语义）：镜面反射射线与太阳 GGX
     // 高光的起点。此前电介质模型把出射点传进来，反射线从介质内部出发、
@@ -14426,7 +15941,109 @@ vec3 tracePrimaryGenericTransparentRadiance(
     hit.hitDistance =
         1.0;
 
+#ifndef ORION_GLASS_SINGLE_PASS
+// 2026-10-25 阶段 D（默认 1）：主射线透射不再"跳过玻璃 + 递归处理第二/三层"，
+// 而是像 dxvk-remix 的 geometryPSRResolver（geometry_resolver.slangh:3169-3213）
+// 那样：玻璃在遍历里被消耗（any-hit 逐面乘薄片透射），第一个不透明面才是接收面。
+// 置 0 = 回到 PASSTHROUGH + 递归旧档。
+#define ORION_GLASS_SINGLE_PASS 1
+#endif
+#if ORION_GLASS_SINGLE_PASS
+#if ORION_GLASS_CHAIN_BIT
+    // purpose 用 FULL(0)，链条身份由 bit 18 承载（见常量处说明）。
+    hit.state = makeTraceState(RT_PURPOSE_FULL) |
+        RT_STATE_PRIMARY_TRANSMISSION_BIT;
+#else
+    hit.state = makeTraceState(RT_PURPOSE_PRIMARY_TRANSMISSION);
+#endif
+    // 唯一入口：链状态（累乘量 / 介质状态 / 面预算）只在这里初始化。
+    // 2026-10-25 事故：这三项曾靠手写播种，漏掉后 any-hit 读到垃圾预算，
+    // 第一片玻璃被当遮挡接受 ⇒ 玻璃变不透明。现在只有一个入口。
+    glassChainBegin(hit);
+
+// 2026-10-28：本守卫必须包含 SURFACE_RADIANCE —— 那条宏守卫着 update() 调用
+// 与 77 号图写入，而 reset 只挂 DEFERRED。两者不同值时会出现
+// "reset 每帧把 74 号图写成 invalid、update 被剔除" 的半死状态，
+// 整条 alpha blend 链静默空转（症状：改任何参数画面都不变）。详见共享头注释。
+#if VPT_GLASS_ALPHA_BLEND && VPT_GLASS_ALPHA_BLEND_DEFERRED_COMPOSITE && VPT_GLASS_ALPHA_BLEND_SURFACE_RADIANCE
+    // 原文 geometry_resolver.slangh:3238：链起点处
+    //   alphaBlendSurface.randomThreshold = getNextSampleBlueNoise(randomState);
+    // 本引擎没有蓝噪声纹理 ⇒ 用同源整数哈希（等价物：同分布、逐帧变化，
+    // 但不是同一张蓝噪声图；换真蓝噪声是后续项，已记录在文档）。
+    {
+        // 原文 geometry_resolver.slangh:3238 的 randomThreshold 取值。
+        // randomState 来自 createRNG(pixelIdx, temporalIdx, sampleOffset)，
+        // 其中 rng.seed 初值 = temporalIdx / RNG_SEED_FRAME_RANGE + sampleOffset
+        // （noise.slangh:177）。本引擎每条主射线只有 1 个样本 ⇒ sampleOffset = 0。
+        const uint alphaBlendNoiseSeed =
+            cam.frameCount / 64u;
+
+        float alphaBlendThreshold =
+            glassBlueNoiseSample(
+                uvec2(gl_LaunchIDEXT.xy),
+                cam.frameCount,
+                alphaBlendNoiseSeed);
+
+        // =====================================================
+        // 2026-10-28：选层抖动的**逐项排查档**（免重编，标记文件驱动）
+        //
+        // randomThreshold 逐帧变化 ⇒ update() 每帧可能选中不同的一层
+        // （alpha_blend_surface.slangh:144）。Remix 靠 RR 的时域累积吃平，
+        // 我们这边的玻璃像素 guide 在 pane / receiver 之间切换，时域不一定收敛。
+        // 把阈值钉死后：若玻璃面上的颗粒消失 ⇒ 根因就是选层抖动。
+        //
+        //   glass_layer_first.flag ⇒ lane 5 : threshold = 0
+        //        ⇒ 0 >= 1 - bgT 只在 bgT >= 1 时成立 ⇒ 恒选第一层（确定性）
+        //   glass_layer_last.flag  ⇒ lane 6 : threshold = 1
+        //        ⇒ 1 >= 1 - bgT 恒成立 ⇒ 恒选最后一层（确定性，另一种对照）
+        // =====================================================
+        if(cam.perfAblationStage.w == 5u)
+        {
+            alphaBlendThreshold = 0.0;
+        }
+        else if(cam.perfAblationStage.w == 6u)
+        {
+            alphaBlendThreshold = 1.0;
+        }
+
+        glassAlphaBlendSurfaceReset(
+            ivec2(gl_LaunchIDEXT.xy),
+            alphaBlendThreshold);
+    }
+#endif
+
+    // =====================================================
+    // 2026-10-26：起点可能**仍在入射玻璃体内** —— 这是"玻璃/冰不透"的第二个机制。
+    //
+    // glassSlabExitPoint() 为了防"透过玻璃穿墙"会把出射点夹回入射格
+    // （距远面只剩 0.05 格，见 glass_dielectric_common.glsl 的推导），再加 0.01
+    // 的起点偏移后，射线其实还在这一格里。于是链遇到的**第一个面是同一块玻璃的
+    // 出射面**，却被状态机当成"进入面"又乘了一次 ⇒ 单块玻璃被吸收两次
+    // （致密体档案的 profile 衰减同样乘两次）⇒ 观感明显不透。
+    //
+    // 判据：几何光程 thickness/cosT 比"入射面 → 实际起点"的距离长 ⇒ 起点在体内。
+    // 只在真的在体内时把链初始化成"已在介质中"：第一个面按出射面跳过，
+    // 之后其它玻璃体的进入面照常乘一次。
+    // =====================================================
+    {
+        const float chainSlabThickness =
+            glassSlabThicknessFromFace(glassSurfacePosition, glassNormal);
+        const float chainCosInside =
+            max(abs(dot(normalize(glassNormal), straightDirection)), 1.0e-4);
+        const float chainGeomExitDistance =
+            chainSlabThickness / chainCosInside;
+        const float chainStartDistance =
+            length(continuationOrigin - glassSurfacePosition);
+
+        if(chainGeomExitDistance > chainStartDistance + 0.02)
+        {
+            hit.glassInside = 1.0;
+            hit.glassEntryT = 0.0;
+        }
+    }
+#else
     hit.state = makeTraceState(RT_PURPOSE_PASSTHROUGH);
+#endif
 
 
 #ifdef RT_ENABLE_SER
@@ -14438,7 +16055,7 @@ vec3 tracePrimaryGenericTransparentRadiance(
             0.01,
             straightDirection,
             10000.0,
-            gl_RayFlagsNoneEXT,
+            SECONDARY_TRAVERSE_FLAGS,
             0xff,
             0u
         );
@@ -14448,7 +16065,7 @@ vec3 tracePrimaryGenericTransparentRadiance(
     {
         traceRayEXT(
             topLevelAS,
-            gl_RayFlagsNoneEXT,
+            SECONDARY_TRAVERSE_FLAGS,
             0xff,
             0,
             0,
@@ -14464,6 +16081,37 @@ vec3 tracePrimaryGenericTransparentRadiance(
 
     vec3 behindRadiance =
         vec3(0.0);
+    // 2026-10-26：链终止在天空（miss）时背景自己就是光源，
+    // 不能再做"behindRadiance / 接收面 albedo"的辐照度还原。
+    bool behindReachedSky = false;
+
+#if ORION_GLASS_SINGLE_PASS
+#ifndef ORION_GLASS_CHAIN_DEBUG
+// 1 = 链的"漏面自检"直接画品红（本该永远看不到）。
+#define ORION_GLASS_CHAIN_DEBUG 0
+#endif
+#if ORION_GLASS_CHAIN_DEBUG
+    // 链只应在"不透明面 / 天空"上结束。停在半透明体上 = any-hit 漏吃了一个面，
+    // 也就是 2026-10-25"玻璃不透"的形态。画品红比截图猜快。
+    if(hit.hitDistance >= 0.0 &&
+       glassChainIsTranslucentMaterial(getLegacyMaterialId(hit.state)))
+    {
+        return vec3(1.0, 0.0, 1.0);
+    }
+#endif
+
+    // 必须在这里取走：下面 evaluateDirectSunLighting / RIS 都会复用同一个 payload。
+    // 第一片玻璃不在这里（由 main 的 glassTransmission 负责），所以只含 2..N 片。
+    vec3 paneChainTransmittance =
+        clamp(hit.transmittanceAccum, vec3(0.0), vec3(1.0));
+    // 2026-10-26：链内各层自己的 alpha blend 贡献（见 hit_payload.glsl）。
+    // 与上面同一处取走 —— 后面任何 traceRay 都会覆盖 payload。
+    vec3 paneChainSurfaceWeight =
+        max(hit.glassSurfaceWeightAccum, vec3(0.0));
+#else
+    vec3 paneChainTransmittance = vec3(1.0);
+    vec3 paneChainSurfaceWeight = vec3(0.0);
+#endif
 
 
     if(payload.hitDistance < 0.0)
@@ -14471,6 +16119,7 @@ vec3 tracePrimaryGenericTransparentRadiance(
         // Dedicated -4 miss path returns real sky radiance.
         behindRadiance =
             payload.albedo;
+        behindReachedSky = true;
     }
     else
     {
@@ -14591,7 +16240,37 @@ vptTransparentSurfaceNormal =
 #endif
 
 
-if(hitMaterialId <= 0.5)
+// =====================================================
+// 2026-10-27（严格搬，algorithm/resolve.slangh:471-479）
+//   if (opacity >= cb.resolveOpaquenessThreshold)  // 254/255
+//   { resolveVertexFinalHit(...); return; }         // 按**不透明表面**完整着色
+// 本轮以前这里只做了"不记录、当作遮挡返回"，于是这类面落到 rgen 的
+// `hitAlbedo * ambient` 兜底 —— 那不是原文的 final hit。
+// 判据用 glassBlendAlpha（贴图 alpha x 顶点色 alpha，见
+// material_resolve_glass.glsl:1548）；**不能**用 glassAlpha：它对整个玻璃族
+// 恒为 1.0（那只表示"覆盖率"）。
+// =====================================================
+#ifndef GLASS_ALPHA_BLEND_MAX_ALPHA
+#define GLASS_ALPHA_BLEND_MAX_ALPHA 0.3
+#endif
+// 2026-10-27：判据必须用**钳制后**的 alpha，与两个 rahit 的 chainAlpha 同口径。
+//   payload.glassBlendAlpha 是贴图原始值，边框 texel 为 1.0；而侧面掠射时
+//   边框铺满整个投影 ⇒ 整个侧面都被判成"不透明表面"走完整着色 ⇒ 侧面实。
+//   钳制后（<= MAX_ALPHA < 254/255）任何玻璃面都不会再走这条分支。
+#ifndef GLASS_BEHIND_MIN_RADIANCE
+// 透过玻璃看到的背景辐射下限（见 deferred 分支 return 处的说明）。
+#define GLASS_BEHIND_MIN_RADIANCE 0.04
+#endif
+
+// 2026-10-27：玻璃族一律走玻璃路径（见文件顶部补丁说明）。
+//
+// 原判据 min(glassBlendAlpha, MAX_ALPHA) >= 254/255 依赖贴图 texel 的 alpha：
+// 玻璃贴图的边框 texel 是 1.0，紧贴墙、正面对着看时整面都落在边框上
+// ⇒ 整个面被判成"不透明表面"做完整着色 ⇒ 一片实心色。
+// 这正是"45° 看是透的、正对内部看邻面是不透的"—— 角度变了，采到的 texel 变了。
+const bool hitIsOpaqueGlass = false;
+
+if(hitMaterialId <= 0.5 || hitIsOpaqueGlass)
 {
     transmissionInfo.receiverWorldPos = hitPos;
     transmissionInfo.receiverNormal = hitNormal;
@@ -14670,7 +16349,7 @@ if(DBG_LADDER_B) { return vec3(0.0, 1.0, 1.0); }
 //
 // If the specks survive every switch above, the GI bounce owns them.
 // =====================================================
-const bool DBG_KILL_BEHIND_SUN = false;
+const bool DBG_KILL_BEHIND_SUN = false;      // 2026-10-28 临时判决
 // Build-time ablation switch (see the banner above): -DDBG_KILL_BEHIND_GI_MACRO=1
 // removes the 1-spp cosine bounce the receiver adds AFTER NRD has already
 // consumed the pixel -- the one term no denoiser can reach.
@@ -14705,6 +16384,51 @@ const bool DBG_KILL_BEHIND_GI = (DBG_KILL_BEHIND_GI_MACRO != 0);
 vptTransparentSurfaceNormal =
     vptGeometricFaceNormalFromRay(historyKeyPosition, straightDirection);
 #endif
+#ifndef ORION_GLASS_RECEIVER_ESTIMATOR_V2
+// 2026-10-25 阶段 A 第 1 条（默认 0 = 旧档；A/B 时置 1）：
+//   0 = evaluateTransparentReceiverDirectLighting（8~96 帧世界空间 VPT 历史）
+//   1 = 主不透明面用的 evaluateVPTRISDirectLighting（每帧 RIS + 动态光源）
+//
+// 为什么值得再试一次（14707-14710 那段注释说"裸 RIS 在这里是噪点"）：
+// 当时接收面既没有 depth guide、也没有 MV（RR 只能按玻璃面的历史重投影），
+// 裸 RIS 当然只能是一层颗粒。现在接收面已经有：
+//   · depthImage 覆盖（24357 起）；
+//   · albedo / normal / roughness guide（20119-20206）；
+//   · 与深度一致的 MV（-DORION_GLASS_RECEIVER_MV，2026-10-25 落地）；
+// 也就是它终于是个"正常表面"，RR 能自己时域累积 ⇒ 这一条才有资格重新 A/B。
+// 若开 1 后噪点反而变差，说明 RR 仍未把它当表面处理，回 0 即可。
+#define ORION_GLASS_RECEIVER_ESTIMATOR_V2 1
+#endif
+
+#if ORION_GLASS_RECEIVER_ESTIMATOR_V2
+#ifndef ORION_GLASS_RECEIVER_RIS_SAMPLES
+// 每帧独立样本数（rngState 链式推进 ⇒ 样本互不相关）。默认 1 = 与主不透明面一致。
+#define ORION_GLASS_RECEIVER_RIS_SAMPLES 1
+#endif
+    uint receiverRisState =
+        uint(gl_LaunchIDEXT.x) * 1973u +
+        uint(gl_LaunchIDEXT.y) * 9277u ^
+        cam.frameCount * 26699u;
+    pcg_hash(receiverRisState);
+
+    vec3 localEntityIrradiance = vec3(0.0);
+    for(int receiverSample = 0;
+        receiverSample < ORION_GLASS_RECEIVER_RIS_SAMPLES;
+        ++receiverSample)
+    {
+        // f0 = vec3(-1.0) ⇒ 移动光源退回纯 Lambert（与 3603 的 4 参重载同口径）；
+        // 方块光那条 RIS 链完全不受影响，与主不透明面调用的是同一个函数。
+        localEntityIrradiance +=
+            evaluateVPTRISDirectLighting(
+                hitPos,
+                hitNormal,
+                hitAlbedo,
+                vptGeometricFaceNormalFromRay(hitPos, straightDirection),
+                vec3(-1.0), -1.0, 1.0,
+                receiverRisState);
+    }
+    localEntityIrradiance *= 1.0 / float(ORION_GLASS_RECEIVER_RIS_SAMPLES);
+#else
 vec3 localEntityIrradiance =
     evaluateTransparentReceiverDirectLighting(
         // History key: the camera ray's raw pane intersection (no POM travel).
@@ -14717,6 +16441,7 @@ vec3 localEntityIrradiance =
         hitAlbedo,
         0u
     );
+#endif
 
 
             // ===== 判决实验 BEHIND（2026-09-22 20:50）=====
@@ -14725,7 +16450,28 @@ vec3 localEntityIrradiance =
             //   G 通道 = localEntityIrradiance    （本地光 RIS，有玻璃染色）
             //   B 通道 = ambient 底光             （纯 albedo 环境，无染色）
             vec3 ambientTerm = hitAlbedo * ambientRadiance;
-            if(DBG_KILL_BEHIND_SUN)     { directAndEmission = vec3(0.0); }
+
+            // =====================================================
+            // 2026-10-28：behind 三项的**运行时逐项杀掉**（免重编）
+            //
+            // 背景：2026-10-28 之前那次"杀 localEntityIrradiance 无变化"的判决
+            //   是在 alpha blend 死链（SURFACE_RADIANCE=0）上做的 —— 那时玻璃像素
+            //   根本没进这条分支，判决无效。链路修好后必须重做。
+            //
+            // perfAblationStage.w（标记文件 ⇒ lane）：
+            //   8  = 只杀 localEntityIrradiance（本地光 RIS + 8 帧历史，**唯一估计量**）
+            //   9  = 只杀 directAndEmission（太阳直射 + 自发光，解析、无估计量）
+            //   10 = 只杀 ambientTerm（albedo × 环境底光，查表、无估计量）
+            //   11 = 三项全杀（behindRadiance 恒 0）
+            //
+            // 判据：颗粒消失的那一档就是载体。
+            // =====================================================
+            const uint behindKillLane = cam.perfAblationStage.w;
+
+            if(DBG_KILL_BEHIND_SUN || behindKillLane == 9u || behindKillLane == 11u)
+            {
+                directAndEmission = vec3(0.0);
+            }
 #if DBG_BEHIND_SPLIT_MACRO
             {
                 // 拆到底：R=自发光 G=纯太阳直射(遮挡后) B=环境底光。
@@ -14759,8 +16505,16 @@ vec3 localEntityIrradiance =
                 );
             }
 #endif
-            if(DBG_KILL_BEHIND_AMBIENT) { ambientTerm = vec3(0.0); }
-            if(DBG_KILL_BEHIND_LOCAL)   { localEntityIrradiance = vec3(0.0); }
+            if(DBG_KILL_BEHIND_AMBIENT ||
+               behindKillLane == 10u || behindKillLane == 11u)
+            {
+                ambientTerm = vec3(0.0);
+            }
+            if(DBG_KILL_BEHIND_LOCAL ||
+               behindKillLane == 8u || behindKillLane == 11u)
+            {
+                localEntityIrradiance = vec3(0.0);
+            }
             if(DBG_KILL_BEHIND_DIRECT)  { directAndEmission = vec3(0.0); }
 
             behindRadiance =
@@ -14795,9 +16549,14 @@ vec3 localEntityIrradiance =
         }
         else if(
             hitMaterialId > 0.5 &&
-            hitMaterialId < 2.5
+            glassChainIsTranslucentMaterial(hitMaterialId)
         )
         {
+            // 2026-10-26：这里原来写 `< 2.5`，而半透明面的 id 是 3.0/4.0
+            // （见 glass_chain_common.glsl 的说明）⇒ 它们会掉进最后的
+            // `else { behindRadiance = hitAlbedo; }`，表现为"纯色实心"。
+            // 现在并入介质分支：按界面继续透射，而不是当成无光照 albedo。
+            //
             // A camera ray through glass has reached real water.  Do not
             // return water's base texture (which makes triangle-shaped
             // patches); cross this interface and continue with the water
@@ -14862,31 +16621,15 @@ vec3 localEntityIrradiance =
 
             transmissionInfo = nestedWaterInfo;
         }
-        else if(hitMaterialId >= 2.5)
+        // 2026-10-25 清理：原 "hitMaterialId >= 2.5"（第二层玻璃面）递归回退已删除。
+        // 阶段 D 起玻璃在任何命中之前就被 any-hit 消耗（逐面累乘透射率），
+        // closest hit 只可能是不透明面或水 ⇒ 该分支永远不可达。
+        else if(glassChainIsTranslucentMaterial(hitMaterialId))
         {
-            // Fallback for a second glass face.  The normal fast path skips
-            // it in any-hit, but treating it as raw albedo when that skip is
-            // unavailable makes the underside of a glass block look solid.
-            // Resume after this face through the full transparent walker;
-            // it owns water state and any later translucent interfaces.
-            WaterTransmissionInfo fallbackWaterInfo;
+            // 走到这里说明介质分支被跳过（水/玻璃但几何状态异常）：
+            // 至少不要退化成"无光照 albedo"，用环境项给一个中性结果。
             behindRadiance =
-                tracePrimaryTransparentRadiance(
-                    hitPos +
-                        straightDirection *
-                        0.001,
-                    straightDirection,
-                    false,
-                    sunDirection,
-                    false,
-                    0.0,
-                    // 同上：键是相机看到的第一层玻璃面，不是这片"第二层"面。
-                    historyKeyPosition,
-                    false,
-                    fallbackWaterInfo
-                );
-
-            transmissionInfo = fallbackWaterInfo;
+                hitAlbedo * getSurfaceAmbientRadiance();
         }
         else
         {
@@ -14894,6 +16637,9 @@ vec3 localEntityIrradiance =
                 hitAlbedo;
         }
     }
+
+    // 2026-10-27：上一版的"背景辐射下限"已撤回 —— 用户指出玻璃紧贴墙，
+    // 背景根本不是天空，behindRadiance 不为 0，该假设不成立。
 
     // =====================================================
     // 2026-10-07（用户要求）：普通玻璃「当空气」= 保留原版纹理，只去折射与反射
@@ -15069,54 +16815,15 @@ vec3 localEntityIrradiance =
         );
 
 
-    vec3 sheetReflection;
-    vec3 sheetTransmission;
-    glassThinSheetFactorsScalarF(
-        viewFresnel,
-        blockTransmission,
-        sheetReflection,
-        sheetTransmission
-    );
+    // 2026-10-25 清理：旧的经验薄片链路（glassThinSheetFactorsScalarF +
+    // pow(tint, path-1) 光程修正）已由下面的物理薄片模型取代 ——
+    // 它原先算完就被覆盖，属于纯浪费的 ALU，这里只留声明。
+    vec3 glassReflection;
+    vec3 glassTransmission;
 
-    // Orion surfaceDeltaLobes(): the reflection lobe interpolates from the
-    // bare Fresnel toward the full thin-sheet reflection by the transmission
-    // weight, while the transmission lobe is simply scaled by it.  For a
-    // nearly-opaque body the reflection collapses to plain Fresnel and the
-    // transmission vanishes, instead of both being darkened together.
-    vec3 glassReflection =
-        mix(
-            vec3(viewFresnel),
-            sheetReflection,
-            transmissionWeight
-        );
-    vec3 glassTransmission =
-        sheetTransmission *
-        transmissionWeight;
-
-    // =====================================================
-    // 2026-10-01 第二步：按**实际体内光程**做染料 Beer-Lambert
-    //
-    // 薄片系列（glassThinSheetFactorsScalarF）算的是"一片"（1 格）的染料；斜视
-    // 时体内光程 t/cos(theta_inside) 比板厚长，染料应当更强。这里只补"超出 1 格
-    // 的那部分" pow(tint, path-1)，不重复计入系列内部已经用过的那一份。
-    //
-    // 2026-10-17 三项收口（都是零新增 trace）：
-    //   ① 逐材质 IOR（冰 1.309）；
-    //   ② 真实板厚（玻璃板 0.125）→ 允许 path-1 为负，Pane 不再按一整格吸收；
-    //   ③ 入射格之后的染色玻璃格按段长累计（体素页表 DDA，无射线）。
-    //
-    // 光程/板厚都来自解析平板（见 glass_dielectric_common.glsl），**不需要额外
-    // 射线**，性能不变。A/B：-DGI_GLASS_DIELECTRIC_DYE=0
-    // =====================================================
-#ifndef GI_GLASS_DIELECTRIC_DYE
-#define GI_GLASS_DIELECTRIC_DYE 1
-#endif
-#ifndef GI_GLASS_DYE_TRUE_PATH
-// 1 = 用真实光程（玻璃板 0.125 格 ⇒ pow(tint, -0.875)，比一整格亮）；
-// 0 = 旧档 max(path-1, 0)（Pane 按一整格吸收）。
-#define GI_GLASS_DYE_TRUE_PATH 1
-#endif
-#if GI_GLASS_DIELECTRIC_DYE
+    // 2026-10-25 清理：旧的 pow(tint, path-1) 光程修正与 glassSegmentTransmittance
+    // 已由物理薄片模型（按真实厚度 / cosT 做 Beer-Lambert）取代。
+    // 这里只保留"入射格之后的其他染色格"的体素 DDA 方向（零射线）。
     const float glassDyeIor =
         glassIorForProfile(transparentProfile);
 
@@ -15127,9 +16834,7 @@ vec3 localEntityIrradiance =
     }
 
 #if GI_GLASS_WALK && GI_GLASS_DIELECTRIC
-    // v3 弯折的起飞方向**已经是体内折射方向** ⇒ 不能再折一次。旧代码在这里
-    // 调 glassSlabInsidePathLength，函数内部又 refract 一遍 ⇒ 二次折射，
-    // 斜视时染料光程偏短（60° 入射约差 12%）。
+    // v3 弯折的起飞方向已经是体内折射方向 ⇒ 不能再折一次。
     vec3 glassInsideDirection = straightDirection;
 #else
     vec3 glassInsideDirection =
@@ -15139,45 +16844,6 @@ vec3 localEntityIrradiance =
         glassInsideDirection = straightDirection;
     }
     glassInsideDirection = normalize(glassInsideDirection);
-#endif
-
-    float glassPathBlocks =
-        glassSlabThicknessFromFace(glassSurfacePosition, glassNormal) /
-        max(-dot(dyeNormal, glassInsideDirection), 1.0e-4);
-
-#if GI_GLASS_DYE_TRUE_PATH
-    float glassDyeExponent = glassPathBlocks - 1.0;
-#else
-    float glassDyeExponent = max(glassPathBlocks - 1.0, 0.0);
-#endif
-    glassTransmission *=
-        glassSegmentTransmittance(
-            blockTransmission,
-            glassDyeExponent
-        );
-
-#if GI_GLASS_RUN_DYE
-    // 入射格之后：染色玻璃格逐段累计（体素 DDA，零射线）。
-    // profile 0 = 染色玻璃；致密体的染料不在体素字里，交给未来的界面走查。
-    if(transparentProfile == 0)
-    {
-        glassTransmission *=
-            glassRunDyeAfterFirstCell(
-                glassSurfacePosition,
-                glassInsideDirection
-            );
-    }
-#endif
-#endif
-
-#if GI_GLASS_DOMINANT_GUIDE
-    // Route A: the guide block in main has to know which lobe owns this pane
-    // pixel, but these two weights are local to the trace.  Export them the
-    // same way the reflected receiver is exported -- one pane pixel, one guide
-    // record, and only the caller knows both lobe weights.
-    glassLobeReflectionWeight = glassReflection;
-    glassLobeTransmissionWeight = glassTransmission;
-    glassLobeWeightsValid = true;
 #endif
 
     // Keep a direct-sun GGX highlight for the pane, but use a fixed mirror
@@ -15209,45 +16875,272 @@ vec3 localEntityIrradiance =
             c3CloudSunTransmittance(glassSurfacePosition + N * 0.035, L);
         surfaceSpecular = sunRadiance * specularBRDF * NdotL;
     }
+#if VPT_GLASS_ALPHA_BLEND && !VPT_GLASS_ALPHA_BLEND_PANE_SPECULAR
+    // 同上：(1-a) 已是全部透射能量，再叠太阳 GGX 高光属于重复计能量，
+    // 且高光只落在直面太阳的面上 => 与 alpha blend 的逐面均匀观感冲突。
+    surfaceSpecular = vec3(0.0);
+#endif
 
 
-    // ===== 判决实验 GLASSTINT（2026-09-22 21:06）=====
-    // 直接输出摄像面玻璃的透射率 glassTransmission（= blockTransmission）。
-    // 若是纯白 ⇒ glassSurface.tint 没带上染料色 ⇒ 整条 behindRadiance 恒不染色，
-    // 天花板/payload.emission/太阳/环境全部白 —— 即用户症状。
-    // 若是有色 ⇒ tint 正常，问题在下游。
-    if(DBG_SHOW_GLASSTINT)
+    // 2026-10-25 清理：两段 DBG_SHOW_GLASSTINT 判决块删除（其中 stage 3 引用了
+    // 已删除的 sheetTransmission）。玻璃色相/浓度的读数改用 DBG_BEHIND_SPLIT_MACRO。
+
+    // =====================================================
+    // 2026-10-25 阶段 B：物理薄片滤波（Remix thin-walled 同构）
+    // 旧经验链路已在此次清理中删除，本段不再是"覆盖"，而是唯一实现。
+    //
+    // 上面的经验链路（sheetTransmission × 光程指数）仍会跑一遍，结果在此处被
+    // 覆盖。口径对齐 dxvk-remix：
+    //   transmission = atten·(1-Fo)·(1-Fi)/(1-(atten·Fi)^2)
+    //   reflection   = Fo + Fi·atten^2·(1-Fo)·(1-Fi)/(1-(atten·Fi)^2)
+    //   atten        = transmittanceColor^(thickness/cosT)
+    // 其中 thickness 由 glassSlabThicknessFromFace() 从命中面解析给出（板 0.125 /
+    // 整块 1.0），cosT 由 Snell 折射角给出 ⇒ 斜视光程自然变长，
+    // 不再需要 pow(tint, path-1) 那条手工修正。
+    // =====================================================
     {
-        return clamp(blockTransmission * 4.0, vec3(0.0), vec3(1.0));
-    }
+        const float v2Thickness =
+            glassSlabThicknessFromFace(glassSurfacePosition, glassNormal);
 
-    // ===== 判决实验 GLASSTINT（2026-09-22 21:10）=====
-    // 三级读数（改 DBG_GLASSTINT_STAGE 切换）：
-    //   1 = 原始 glassTint（= payload.albedo，玻璃方块纹理色×顶点色）
-    //   2 = blockTransmission（= clamp(glassTint)）
-    //   3 = sheetTransmission（经薄片菲涅耳）
-    // 判定：若 stage1 就是白 ⇒ 染色玻璃的染料色根本没进 payload.albedo ⇒
-    //       根因在 rchit / 顶点数据（MC 的 block tint 未传入 RT 顶点）。
-    if(DBG_SHOW_GLASSTINT)
-    {
-        // 色相归一读数：v / max(v)，不受整体亮度影响。
-        // 纯色 ⇒ 满饱和色（如纯红 1,0,0）；中性灰/白 ⇒ (1,1,1) 白。
-        // 这样即使 tint 很暗，也不会被放大倍数掩盖真实色相。
-        vec3 tintSource =
-            (DBG_GLASSTINT_STAGE == 1u) ? glassTint :
-            (DBG_GLASSTINT_STAGE == 2u) ? blockTransmission :
-                                          sheetTransmission;
-        float peak = max(tintSource.r, max(tintSource.g, tintSource.b));
-        if(peak <= 1.0e-5)
+        vec3 v2Transmission;
+        vec3 v2Reflection;
+
+        glassThinWallFactors(
+            blockTransmission,
+            v2Thickness,
+            NdotV,
+            glassIorForProfile(transparentProfile),
+            0.04,
+            v2Transmission,
+            v2Reflection);
+
+        // 与 Orion surfaceDeltaLobes() 同一分工：致密体（蜂蜜/遮光玻璃）用
+        // transmissionWeight 压低透射、把反射抬回裸 Fresnel。
+        glassTransmission = v2Transmission * transmissionWeight;
+        glassReflection = mix(vec3(viewFresnel), v2Reflection, transmissionWeight);
+
+#if VPT_GLASS_ALPHA_BLEND
+        // 2026-10-26 对齐 RTX Remix：MC 的 translucent 层是 alpha blend，
+        // 用源 alpha 而不是"薄壁染料吸收"（推导见 glass_chain_common.glsl 的共享头）。
+        // 致密体（遮光玻璃/冰/粘液/蜂蜜）的"不透明度"来自剖面表：a = 1 − transmission。
+        // Remix 侧这个值是材质里 authored 的 opacity；我们这里由 profile 表等价给出。
+        const float alphaBlendOpacity = max(
+            glassAlpha,
+            1.0 - clamp(transmissionWeight, 0.0, 1.0));
+        glassTransmission = glassAlphaBlendTransmission(glassTint, alphaBlendOpacity);
+#if VPT_GLASS_ALPHA_BLEND_PANE_SPECULAR
+        // A/B 档：保留裸 Fresnel 反射（旧行为）。
+        glassReflection = vec3(viewFresnel);
+#else
+        // 2026-10-26 修正：alpha blend 表面**没有**反射项。
+        //   Remix: AlphaBlendSurface::getAlphaBlendSurface() 只取 albedo x opacity；
+        //   合成式 out = a*C_surface + (1-a)*C_bg 里 (1-a) 已是全部透射能量。
+        // 此前保留裸 Fresnel，而 abs(N·V) 在掠射时 ->1 => 侧面被镜面反射盖成
+        // "不透明纯色"，正是"一个玻璃块只有正对的透明面透明"。
+        glassReflection = vec3(0.0);
+#endif
+#endif
+
+#if GI_GLASS_RUN_DYE && !VPT_GLASS_ALPHA_BLEND
+        // 2026-10-26：alpha blend 口径下每层已按 (1−a)+a·tint 乘过；这条多格染料
+        // 累计会把同一染料再乘一遍（旧"透过彩色玻璃发黑"的成因之一）。
+        // 入射格之后的其他染色格：体素页表 DDA（零射线），与物理模型不重叠
+        // —— 物理模型只算"当前这一片"的实际光程。
+        if(transparentProfile == 0)
         {
-            return vec3(0.0, 0.0, 0.0);
+            glassTransmission *=
+                glassRunDyeAfterFirstCell(glassSurfacePosition, glassInsideDirection);
         }
-        return clamp(tintSource / peak, vec3(0.0), vec3(1.0));
+#endif
+
+#if GI_GLASS_DOMINANT_GUIDE
+        glassLobeReflectionWeight = glassReflection;
+        glassLobeTransmissionWeight = glassTransmission;
+        glassLobeWeightsValid = true;
+#endif
     }
+
+#if VPT_GLASS_ALPHA_BLEND && VPT_GLASS_ALPHA_BLEND_SURFACE_RADIANCE
+    // 2026-10-26（第三轮，对齐 Remix 的 alpha blend 合成）：
+    //   C_out = C_bg * PI(1-a_i) + SUM_i E_bg * tint_i * a_i * PI_{j<i}(1-a_j)
+    // 第一层的 a/tint 在这里重算（与上面 glassTransmission 的口径同源），
+    // 第 2..N 层由 any-hit 累进 paneChainSurfaceWeight。
+    // 2026-10-26：a = glassAlpha（= 贴图 texel alpha x 顶点色 alpha），
+    // 与 Remix-MC 的 ATLAS_TRANSLUCENT_BLEND = textureTimesVertexColor() 同源
+    // （BlockTextureManager.java:64）。致密体用剖面表抬高不透明度。
+    // 2026-10-27：与两个 rahit 同口径的 alpha 上限（贴图边框 alpha=1 的问题，
+    // 见 rahit 里 chainAlpha 处的说明）。
+    // 宏在共享头里定义，但本行早于那个 include，所以就地给同值兜底。
+#ifndef GLASS_ALPHA_BLEND_MAX_ALPHA
+#define GLASS_ALPHA_BLEND_MAX_ALPHA 0.3
+#endif
+    // 2026-10-27：与 rahit 同口径 —— 玻璃族用固定 alpha，不再取贴图 alpha。
+    const float blendAlpha0 = clamp(
+        max(GLASS_FIXED_ALPHA,
+            1.0 - clamp(transmissionWeight, 0.0, 1.0)),
+        0.0, 1.0);
+    const vec3 blendTint0 =
+        clamp(glassTint, vec3(0.0), vec3(1.0));
+
+    // 第一层玻璃面到相机的距离（74.a）。只被屏幕空间邻居搜索的"共面/深度"
+    // 判据消费，所以它必须与相机射线同源：用 rayDirection（含磨砂抖动）而不是
+    // glassSurfacePosition 的 POM 位移量 —— 后者逐 texel 跳变，会让判据在
+    // 浮雕图案里假否定（与 historyKeyPosition 那条 2026-10-17 的结论同因）。
+    const float blendPaneHitT =
+        max(
+            dot(
+                glassSurfacePosition - cam.viewInverse[3].xyz,
+                normalize(rayDirection)),
+            1.0e-3);
+
+#if VPT_GLASS_ALPHA_BLEND_PANE_ILLUMINATION
+    // C_surface 的光照取自**玻璃表面自己的位置**（与 clearGlassAsAir 分支同源）：
+    //   太阳 NEE（1 条带遮挡的射线）+ 环境底光 + VLI 点光源（零射线，缓存）。
+    // 上一版用"背景接收面的辐照度"当代理，但背景可能是 50 格外的墙、或者是天空 ——
+    // 侧面斜视时背后正是天空 => E 远超实际受光 => 整面过曝成纯色。
+    vec3 paneIllumination =
+        evaluateDirectSunLighting(
+            glassSurfacePosition,
+            N,
+            V,
+            vec3(1.0),
+            0.06,
+            0.0,
+            1.0,
+            sunDirection) +
+        getSurfaceAmbientRadiance() +
+        evaluateVLIEmitterRadianceAtHit(
+            glassSurfacePosition, N, vec3(1.0));
+
+    vec3 blendSurfaceWeight =
+        blendTint0 * blendAlpha0 * paneChainTransmittance +
+        paneChainSurfaceWeight;
 
     vec3 transmittedRadiance =
+        behindRadiance * ((1.0 - blendAlpha0) * paneChainTransmittance) +
+        paneIllumination * blendSurfaceWeight;
+
+#ifndef DBG_GLASS_ALPHA_BLEND
+// 2026-10-26 定位用（默认 0）：把半透明的三个决定量画成 RGB。
+//   R = blendAlpha0                 第一层 alpha（贴图 texel alpha × profile 不透明度）
+//   G = 链内 2..N 层的权重和         斜视穿过更多层时变大
+//   B = luma(paneIllumination)×0.25  C_surface 的受光强度
+// 用法：-DDBG_GLASS_ALPHA_BLEND=1 重编 rt_test.rgen 的四个变体。
+// 判读：白蓝的面 R≈1 => alpha 本身是 1（texel/marker）；绿 => 层数叠加；蓝 => 受光过亮。
+#define DBG_GLASS_ALPHA_BLEND 0
+#endif
+#if DBG_GLASS_ALPHA_BLEND
+    return vec3(
+        blendAlpha0,
+        clamp(max(paneChainSurfaceWeight.r,
+                  max(paneChainSurfaceWeight.g,
+                      paneChainSurfaceWeight.b)), 0.0, 1.0),
+        clamp(dot(paneIllumination, vec3(0.2126, 0.7152, 0.0722)) * 0.25,
+              0.0, 1.0));
+#endif
+#if VPT_GLASS_ALPHA_BLEND_DEFERRED_COMPOSITE
+        // 2026-10-26（第四轮，严格搬）：相机直接命中的这个面是**第一层候选**，
+        // 与 any-hit 调同一个 update()（原文 alpha_blend_surface.slangh:128-158）。
+        // 颜色按 getAlphaBlendSurface():117-123 的解调口径（albedo / opacity）。
+        glassAlphaBlendSurfaceUpdate(
+            ivec2(gl_LaunchIDEXT.xy),
+            vec4(blendTint0 / max(blendAlpha0, 1.0e-3), blendAlpha0),
+            N,
+            blendPaneHitT,
+            0.0);
+        // radiance volume 兜底（binding 77）：
+        // Remix 用 evalVolumetricNEE(VolumeFilteredRadianceY/CoCg, ...) * surface.color
+        // （composite_alpha_blend.comp.slang:259-267）。本引擎没有 SH-froxel，
+        // 用**已有的体素面辐照度缓存**换算成同量纲的 volumeRadiance：
+        //   evaluateVPTExactFaceDirectLighting(pos, normal, albedo = 1)
+        //     = 0.92/pi * E  （VPT_EXACT_FACE_DIFFUSE_SCALE，rt_test.rgen:2060）
+        // 消费端同样乘 surface albedo，所以传 albedo = 1 即可。
+        imageStore(
+            glassAlphaBlendVolumeImage,
+            ivec2(gl_LaunchIDEXT.xy),
+            vec4(
+                evaluateVPTExactFaceDirectLighting(
+                    transmissionInfo.receiverWorldPos,
+                    transmissionInfo.receiverNormal,
+                    vec3(1.0)),
+                1.0));
+
+        // 返回**未合成**的背景辐射：合成由 compute pass 按
+        //   out = radiance * backgroundAlpha + alphaBlendOutput
+        // （composite.comp.slang:812）完成。
+        //
+        // 2026-10-27：不允许纯黑。背景为 0 时合成退化成 a*tint*E（纯玻璃色），
+        // 而侧面正对着背光/阴影面 ⇒ 玻璃在最该透明的地方反而像实心块。
+        // 这里只保证"有背景可透"，不是把阴影整体提亮。
+        return max(behindRadiance, vec3(GLASS_BEHIND_MIN_RADIANCE));
+#endif
+#else
+    // E_bg：背景接收面的**入射辐照度**（Remix 的 demodulated 直接光）。
+    // behindRadiance 的三项都乘过接收面 albedo（见 16302 的说明），逐通道除回去。
+    // 0.05 下限防除零（深色面），64 上限纯属护栏（太阳直射辐照度约 20~30）。
+    vec3 behindIrradiance;
+    if(behindReachedSky)
+    {
+        // Remix 的邻居搜索显式跳过 miss（composite_alpha_blend.comp.slang:174-187
+        // 的 `!isMiss`），找不到邻居时回落到 radiance volume
+        // （stochasticAlphaBlendUseRadianceVolume）。本引擎没有体积辐照度网格，
+        // 用同一个世界空间环境辐照度兜底。
+        // ⚠ 不能用天空自身的辐射：那会让"背后是天空"的玻璃面亮到发白，
+        //   正是"侧面看不见后面"的直接成因（2026-10-26 实测）。
+        behindIrradiance = getSurfaceAmbientRadiance();
+    }
+    else
+    {
+        // 降级（本仓库无屏幕空间邻居搜索，见下方标注）：
+        // Remix 用 PrimaryDirectDiffuseRadianceHitDistance[neighbor]（已 demodulate），
+        // 这里用“透射射线命中的接收面”的 radiance / albedo 代替。
+        behindIrradiance =
+            behindRadiance / max(transmissionInfo.receiverAlbedo, vec3(0.05));
+    }
+
+    vec3 blendSurfaceWeight =
+        blendTint0 * blendAlpha0 * paneChainTransmittance +
+        paneChainSurfaceWeight;
+
+    vec3 transmittedRadiance =
+        behindRadiance * ((1.0 - blendAlpha0) * paneChainTransmittance) +
+        behindIrradiance * blendSurfaceWeight;
+#if VPT_GLASS_ALPHA_BLEND_DEFERRED_COMPOSITE
+    // 2026-10-26（第四轮，严格搬）：默认路径（PANE_ILLUMINATION=0）下
+    // 主命中面同样是第一层候选，见上面 PANE_ILLUMINATION 分支的说明。
+    glassAlphaBlendSurfaceUpdate(
+        ivec2(gl_LaunchIDEXT.xy),
+        vec4(blendTint0 / max(blendAlpha0, 1.0e-3), blendAlpha0),
+        N,
+        blendPaneHitT,
+        0.0);
+
+    // radiance volume 兜底（binding 77），说明见上面 PANE_ILLUMINATION 分支。
+    imageStore(
+        glassAlphaBlendVolumeImage,
+        ivec2(gl_LaunchIDEXT.xy),
+        vec4(
+            evaluateVPTExactFaceDirectLighting(
+                transmissionInfo.receiverWorldPos,
+                transmissionInfo.receiverNormal,
+                vec3(1.0)),
+            1.0));
+
+    // 2026-10-27：透过玻璃看到的背景不允许纯黑。
+    // 背景为 0 时 alpha/折射合成都退化成"纯玻璃色"，
+    // 而侧面正对着背光/阴影面 ⇒ 玻璃在最该透明的地方反而像实心块。
+    // 这不是把阴影整体提亮：只在玻璃这条路径上保证有背景可透。
+    behindRadiance = max(behindRadiance, vec3(GLASS_BEHIND_MIN_RADIANCE));
+
+    return behindRadiance;
+#endif
+#endif
+#else
+    vec3 transmittedRadiance =
         behindRadiance *
-        glassTransmission;
+        glassTransmission *
+        paneChainTransmittance;
+#endif
 
     // One deterministic mirror ray returns the first opaque scene surface.
     // Its existing PBR/VLI/cached-local radiance is weighted by the
@@ -15470,7 +17363,7 @@ const float WATER_EXTINCTION_DISTANCE =
                 0.001,
                 currentDirection,
                 10000.0,
-                gl_RayFlagsNoneEXT,
+                SECONDARY_TRAVERSE_FLAGS,
                 0xff,
                 pathStep
             );
@@ -15479,7 +17372,7 @@ const float WATER_EXTINCTION_DISTANCE =
 #endif
         {
             traceRayEXT(
-                topLevelAS, gl_RayFlagsNoneEXT, 0xff, 0, 0, 0,
+                topLevelAS, SECONDARY_TRAVERSE_FLAGS, 0xff, 0, 0, 0,
                 currentOrigin, 0.001, currentDirection, 10000.0, 0
             );
         }
@@ -15678,7 +17571,7 @@ vec3 tracePrimaryWaterReceiverIndirect(
                 0.001,
                 currentDirection,
                 10000.0,
-                gl_RayFlagsNoneEXT,
+                SECONDARY_TRAVERSE_FLAGS,
                 0xff,
                 pathStep
             );
@@ -15688,7 +17581,7 @@ vec3 tracePrimaryWaterReceiverIndirect(
         {
             traceRayEXT(
                 topLevelAS,
-                gl_RayFlagsNoneEXT,
+                SECONDARY_TRAVERSE_FLAGS,
                 0xff,
                 0,
                 0,
@@ -16046,7 +17939,7 @@ const vec3 WATER_SCATTER_COLOR = waterScatterColor();
                 0.01,
                 currentDirection,
                 10000.0,
-                gl_RayFlagsNoneEXT,
+                SECONDARY_TRAVERSE_FLAGS,
                 0xff,
                 step
             );
@@ -16056,7 +17949,7 @@ const vec3 WATER_SCATTER_COLOR = waterScatterColor();
         {
             traceRayEXT(
                 topLevelAS,
-                gl_RayFlagsNoneEXT,
+                SECONDARY_TRAVERSE_FLAGS,
                 0xff,
                 0,
                 0,
@@ -16099,7 +17992,7 @@ if(payload.hitDistance < 0.0)
                 0.01,
                 waterEntryDirection,
                 10000.0,
-                gl_RayFlagsNoneEXT,
+                SECONDARY_TRAVERSE_FLAGS,
                 0xff,
                 step
             );
@@ -16109,7 +18002,7 @@ if(payload.hitDistance < 0.0)
         {
             traceRayEXT(
                 topLevelAS,
-                gl_RayFlagsNoneEXT,
+                SECONDARY_TRAVERSE_FLAGS,
                 0xff,
                 0,
                 0,
@@ -16889,7 +18782,7 @@ for(
                 0.001,
                 currentDirection,
                 10000.0,
-                gl_RayFlagsNoneEXT,
+                SECONDARY_TRAVERSE_FLAGS,
                 0xff,
                 pathStep
             );
@@ -16899,7 +18792,7 @@ for(
         {
             traceRayEXT(
                 topLevelAS,
-                gl_RayFlagsNoneEXT,
+                SECONDARY_TRAVERSE_FLAGS,
                 0xff,
                 0,
                 0,
@@ -17701,7 +19594,7 @@ float traceWaterReflectedSun(
             0.02,
             toWaterDir,
             10000.0,
-            gl_RayFlagsNoneEXT,
+            SECONDARY_TRAVERSE_FLAGS,
             0xff,
             0u
         );
@@ -17711,7 +19604,7 @@ float traceWaterReflectedSun(
     {
         traceRayEXT(
             topLevelAS,
-            gl_RayFlagsNoneEXT,
+            SECONDARY_TRAVERSE_FLAGS,
             0xff,
             0,
             0,
@@ -17849,7 +19742,7 @@ float traceWaterReflectedSun(
     float reflectedCausticGain = 1.0;
     if(cam.waterFftParams.y > 0.0 && cam.waterFftParams2.w > 0.5)
     {
-        float projScale = float(gl_LaunchSizeEXT.y) /
+        float projScale = float(rtLaunchSize().y) /
             (2.0 * max(tan(cam.cameraParams.z * 0.5), 0.05));
         float causticLod = waterCausticMapLodFromProj(
             receiverPos,
@@ -18238,6 +20131,67 @@ bool dhFarNeighborPoint(
 #define GI_HALFRES 0
 #endif
 
+// =====================================================
+// 2026-10-26 稀疏渲染活跃判定（设置项「稀疏渲染采样率%」）。
+//
+// 语义直接照 RTX Remix 的 per_pixel_rate.slangh：
+//   isActivePixelFromSamplingRate = whiteNoise(pixel, frameIdx, 0) <= rate
+// 抽签只决定 **radiance 段是否着色**；depth / motion vector / RR guides 仍然
+// 每像素每帧无条件写（与 10 月的棋盘格子半分辨率不同：那条跳过整像素，
+// 导致 guides/MV 陈旧，这正是它被证伪的原因）。
+//
+// rate 以百分数编码在 cam.sparseParams.y（0 = 关，100 = 全采样）。抽签用
+// Remix 的 uintHash 白噪声，避免棋盘/蓝噪声平铺在动态画面上形成固定纹理。
+// SHARC_UPDATE 与 GI_HALFRES 变体不门控（前者由 SHaRC 侧负责，后者的
+// 半分辨率上采样依赖自己的一套子像素调度）。
+// =====================================================
+// 噪声源与 Remix 默认一致：BlueNoise128x128x64x8。
+// 判定式照 per_pixel_rate.slangh: threshold <= samplingRate。
+// 2026-10-27：默认改读 sparse_active_mask.comp 产出的掩码（Remix 的
+// isActivePixelFromMask），保证本 pass 与下游消费者用同一份判定。
+// A/B 回退：-DSPARSE_USE_MASK=0 回到本 pass 内直算蓝噪声阈值。
+#ifndef SPARSE_USE_MASK
+#define SPARSE_USE_MASK 1
+#endif
+
+// 直算版（掩码 pass 不可用时的回退，也是 -DSPARSE_USE_MASK=0 的实现）。
+bool vptSparsePixelIsActiveDirect(uvec2 pixelCoord)
+{
+    float samplingRate = clamp(cam.sparseParams.y, 0.0, 100.0) * 0.01;
+    if(samplingRate >= 1.0 || samplingRate <= 0.0)
+    {
+        return true;
+    }
+
+#if SPARSE_RATE_NOISE_WHITE
+    return vptWhiteNoise(pixelCoord, cam.frameCount, 0u) <= samplingRate;
+#else
+    return vptSparseBlueNoiseThreshold(pixelCoord, cam.frameCount) <= samplingRate;
+#endif
+}
+
+bool vptSparsePixelIsActive(uvec2 pixelCoord)
+{
+    float samplingRate = clamp(cam.sparseParams.y, 0.0, 100.0) * 0.01;
+    if(samplingRate >= 1.0 || samplingRate <= 0.0)
+    {
+        return true;
+    }
+
+#if SPARSE_USE_MASK
+    // Remix sparse_rendering.slangh:29-37
+    const uvec2 blockCoordinate = pixelCoord / uvec2(4u, 2u);
+    const uvec2 blockLocal = pixelCoord % uvec2(4u, 2u);
+    const uint bitIndex = blockLocal.y * 4u + blockLocal.x;
+    const uint maskValue =
+        imageLoad(sparseActiveMaskImage, ivec2(blockCoordinate)).r;
+
+    return ((maskValue >> bitIndex) & 1u) != 0u;
+#else
+    return vptSparsePixelIsActiveDirect(pixelCoord);
+#endif
+}
+
 #if !GI_HALFRES
 // ============================================================================
 // 3×3 深度感知上采样（HANDOFF-2026-10-24-GI-HALFRES.md §3）
@@ -18246,7 +20200,7 @@ bool dhFarNeighborPoint(
 // ⇒ 全分辨率像素拿到的往往是**同块内相邻子像素、最多 3 帧前**的辐照度。所以：
 //   · 权重 w = 1/(1e-3 + |z0 - z1|)：深度一致才接近双线性展开，跨物体边缘退化成
 //     最近邻（HANDOFF §6.4：宁可退化也不要跨玻璃/水面边缘漏光）；
-//   · 返回的是**辐照度**，乘回本像素自己的 brdfWeight 由调用点做（解调/再调制）。
+//   · 返回的是**辐照度本身**（不解调 —— 原因见半图写入处的 2026-10-25 注释）。
 // 不做材质一致性判据：这张图只有 4 个通道，matId 无处可放；玻璃/水面与实体在
 // **深度**上就是两道不同的面，深度权重已经把它们挡住。
 // ============================================================================
@@ -18271,8 +20225,24 @@ vec3 upsampleGiHalf(ivec2 fullCoord, float centerViewDepth)
                 maxCoord);
 
             const vec4 tapGi = imageLoad(giHalfImage, tapCoord);
+
+            // 相对深度差：远端掠射面上相邻 texel 的**绝对**深度差可以有几十米，
+            // 用绝对差会让权重量纲随距离漂移，所以一律相对化。
+            const float relativeDepthDelta =
+                abs(centerViewDepth - tapGi.a) / max(centerViewDepth, 1.0);
+
+            // ⚠ 2026-10-25 实机第二轮：原来是 1/(1e-3 + 绝对差)。
+            //   "相位刚好轮到自己"的那 1/4 像素，Δz 精确为 0 ⇒ 权重 1000，而 8 个
+            //   邻居只有 0.2~5 ⇒ 求和实际上只剩那一格，9 个 tap **根本没平均**，
+            //   单个 1spp 的 GI 萤火虫原样上屏；又因为相位 4 帧一轮，同一像素在
+            //   "自己的噪点样本"与"邻居的平滑值"之间反复跳变，RR 的时间累积把这
+            //   当成真实变化 ⇒ 满屏闪烁小方点（对照实验：同位置 ORION_GI_HALF=0
+            //   时地板干净，=1 时满是小点）。
+            //   现在用相对差 + 0.05 的底：平面邻格落在 4~20，与中心格的 20 同量级
+            //   ⇒ 真正做 9 tap 平均（方差 ÷3）；跨面时相对差 ~0.5 以上，权重降到
+            //   1.8 以下，仍有 ~10:1 以上的拒绝比，漏光不会回来。
             const float weight =
-                1.0 / (1.0e-3 + abs(centerViewDepth - tapGi.a));
+                1.0 / (0.05 + relativeDepthDelta);
 
             irradianceSum += tapGi.rgb * weight;
             weightSum += weight;
@@ -18308,6 +20278,28 @@ void main() {
         return;
     }
 
+    // =====================================================
+    // 2026-10-28 **写入通路探针**（标记文件 glass_write_probe.flag ⇒ lane 7）
+    //
+    // 起因：玻璃的所有诊断档（dbg 1/9/10/11/12/13）在实机上**零效果**，
+    // 而 dbg=1 显示整屏洋红 = blend 读到的 74 号图 y 通道全 0 = 没有任何像素被写。
+    // 这一档绕开全部玻璃逻辑，无条件把 74 号图写成 (bgT=1, hitT=1)。
+    //
+    // 判读（配 ORION_GLASS_ALPHA_BLEND_DBG / glass_dbg_1.flag）：
+    //   整屏变成纯红 (1,0,0) ⇒ 写入通路正常
+    //        ⇒ 洋红的原因就是"玻璃分支一个像素都没进"，与描述符无关；
+    //   仍整屏洋红        ⇒ rgen 写的不是 blend 读的那张图（描述符/镜像问题）。
+    //
+    // 只在主变体上有效（GI_HALFRES 变体的 LaunchID 是半分辨率坐标）。
+    // =====================================================
+    if(cam.perfAblationStage.w == 7u)
+    {
+        imageStore(
+            glassAlphaBlendMetaImage,
+            ivec2(gl_LaunchIDEXT.xy),
+            vec4(1.0, 1.0, 0.0, 0.0));
+    }
+
 
 #if GI_HALFRES
     // 2026-10-24 半分辨率 GI 变体：dispatch 是 (w+1)/2 × (h+1)/2，每个 invocation
@@ -18315,35 +20307,42 @@ void main() {
     // 四帧覆盖整个 2×2。
     // ⚠ 这是本文件 pixelCoord 的**唯一来源**（HANDOFF §4 已核实全文件只有这一处派生），
     //   所以只改这里就能把整条主射线 + 材质求值搬到一个子像素上。
+    // ⚠ 2026-10-25 实机第二轮：**默认不再轮转相位**。
+    //   dispatch 覆盖全部半图 texel ⇒ 每个 texel 每帧都被写，于是"四帧轮转四个
+    //   子像素"并不成立；真实效果是每个 texel 代表的**世界位置每帧平移一个像素**，
+    //   信号在 -1/0/+1 像素之间跳，RR 把它当真实变化 ⇒ 时间累积失效 ⇒ 闪烁。
+    //   固定 (0,0) 之后 texel (i,j) 永远代表像素 (2i,2j)，半图稳定，主 pass 用
+    //   3×3 双边权重上采样（标准 half-res + bilateral upsample）。
+    //   代价：3/4 的像素自己从不贡献 GI（读到的是 2×2 块的左上邻居）= 固定 2×2 模糊。
+    //   回到轮转：ORION_GI_HALF_ROTATE=1（宿主把 giHalfParams.y 写 1）。
+    const ivec2 giHalfPhase =
+        (cam.giHalfParams.y > 0.5f)
+            ? ivec2(
+                int(cam.frameCount & 1u),
+                int((cam.frameCount >> 1u) & 1u))
+            : ivec2(0);
+
     ivec2 pixelCoord =
-        ivec2(gl_LaunchIDEXT.xy) * 2 +
-        ivec2(
-            int(cam.frameCount & 1u),
-            int((cam.frameCount >> 1u) & 1u));
+        ivec2(gl_LaunchIDEXT.xy) * 2 + giHalfPhase;
 #else
     ivec2 pixelCoord =
         ivec2(gl_LaunchIDEXT.xy);
 #endif
 
 #if SHARC_UPDATE
-    // ------------------------------------------------------------------------
-    // 2026-10-11 5b-4：update pass 的像素选法（放在一切昂贵工作与输出写入之前）。
-    //
-    // 参考用"降分辨率 dispatch"选像素（Pathtracer.cpp:872-877：width/height ÷
-    // sharcDownscaleFactor），它的 ray gen 以 DispatchRaysIndex/Dimensions 归一化，
-    // 所以 dispatch 缩到多大、采样就铺满多大。本工程 rgen 的射线取自**绑定图像**
-    // （上面 imageSize(image)）⇒ 照搬降 dispatch 只会覆盖屏幕左上角，不可行。
-    //
-    // 等价适配（密度与参考一致，机制换成 shader 内按块选择）：
-    //   · SHARC_UPDATE_BLOCK=5 ⇒ 每 5×5 块选 1 像素 = 4%（与参考的
-    //     sharcDownscaleFactor=5 完全同一密度）；
-    //   · 未选中的像素在这里直接退出：不追路径、不写任何输出图像 —— 所有输出
-    //     由渲染 pass 覆写（参考的 pass 顺序本来就是 update → render：
-    //     Pathtracer.cpp:867-877 的 Sharc Update 在主 trace 之前）。
-    // ------------------------------------------------------------------------
-    if(!sharcUpdatePixelSelected())
+    // 块级 dispatch：launchID 是**块坐标**，不是像素坐标（见 sharcUpdateBlockOffset）。
+    // 块内偏移由 (块坐标, 帧号) 哈希选出唯一像素；最后一行/列不满块时像素可能
+    // 越界，直接退出（不追路径、不写任何输出图 —— 所有输出由渲染 pass 覆写）。
     {
-        return;
+        const ivec2 sharcBlock = ivec2(gl_LaunchIDEXT.xy);
+
+        pixelCoord =
+            sharcBlock * SHARC_UPDATE_BLOCK + sharcUpdateBlockOffset(sharcBlock);
+
+        if(pixelCoord.x >= size.x || pixelCoord.y >= size.y)
+        {
+            return;
+        }
     }
 #endif
 
@@ -18410,6 +20409,12 @@ void main() {
     // 1 = 我们没命中（远场，可以让 DH 接管）。判据的完整理由见置位处。
     float dhFarFieldOurs = 0.0;
 
+    // 2026-10-27 阶段 3：稀疏判定的两个量在采样循环内（vptPixelActive / 
+    // primaryHitDistance 都是循环体局部量），而最终 imageStore 在循环外。
+    // 照上面 dhFarFieldOurs 的同一做法开槽，循环内 s==0 记录。
+    bool vptPixelActiveOutside = true;
+    bool primaryRayMissed = false;
+
     // 主射线的最终命中距离（miss 保持负数）。合成块用它区分"我们真的命中了"
     // 与"我们没命中"——补空气那条分支必须只在前者之外生效。
     // 水下视角（applyUnderwaterWaterColumn）也取这个值当水柱长度，不再另开一个。
@@ -18464,6 +20469,17 @@ bool rrTransparentReceiverIsPane =
 
 float rrDeltaCrossedFlag =
     0.0;
+
+// =====================================================
+// 2026-10-24：粒子像素标记 → RR TransparencyHint（治粒子残影）。
+// 主射线命中粒子（payload.state 的 RT_STATE_PARTICLE_BIT，material_resolve 置位）
+// 时置 1；hint 写入块把它并进 TransparencyHint ⇒ RR 对粒子像素降低历史信任。
+// 粒子会移动/生灭，其像素的历史按主表面语义积累必然拖尾 —— 官方现行方案是
+// TransparencyLayer + ColorBeforeTransparency（大工程，跟进项见交接文档），
+// 本标记是旧机制 kBufferTypeTransparencyHint 的最小接入。
+// =====================================================
+bool rrParticlePixel =
+    false;
 
 #if RR_STABLE_GLASS_RADIANCE
 // Analytic pane radiance for this pixel (mirror lobe + solar gloss), handed to
@@ -18611,6 +20627,12 @@ vec3 primaryHitWorldOffset =
         payload.prevOffsetZ
     );
 
+// 2026-10-24：主射线是否命中了粒子。必须与 hitDistance/prevOffset **同一时刻**
+// 取走 —— 之后的 reflection/AO/shadow/GI 每次 traceRay 都会重写 payload.state
+//（与上面 prevOffset 的注释同一约束）。消费者：循环外的 TransparencyHint 写入。
+rrParticlePixel =
+    (payload.state & RT_STATE_PARTICLE_BIT) != 0u;
+
 // =====================================================
 // DH 的"我们侧"判据（09-23 第三次定案）：**只有 miss 算远场**
 // =====================================================
@@ -18699,6 +20721,16 @@ bool rtLodThirtySecondSample =
     ((rtLodRandom >> 7u) & 1u) == 0u;
 
 
+// 2026-10-25 近场 GI 降速专用位（bit 0~7 已被 half/quarter/glossy/远场 1/8~1/32 占满）。
+// ⚠ 必须是**独立位**：与距离阶梯的位重叠会让"两级速率相乘、权重乘两次"变成
+//   权重过曝（光泽那边就是因此只能合成一个级别）。
+bool rtLodGiHalfSample =
+    ((rtLodRandom >> 8u) & 1u) == 0u;
+
+bool rtLodGiQuarterSample =
+    ((rtLodRandom >> 8u) & 3u) == 0u;
+
+
 // =====================================================
 // 间接光（漫反射 GI）距离梯形 —— 【唯一出口】
 //
@@ -18768,6 +20800,45 @@ if(perfL10DisableDiffuseGi())
 }
 
 
+// =====================================================
+// 2026-10-25：近场 GI 降速（sub-1spp 的 GI 部分）
+//
+// 上面那张距离阶梯只管 64 格以外；室内/近场原本一律全速，而 noGi 消融在室内
+// 是 -5.86ms（rt=18.04，光泽分级后 base 15.30），是当前最大的单项。
+//
+// 用**独立 bit 片**（rtLodGiHalfSample / rtLodGiQuarterSample，bit8/9）：
+// 与距离阶梯的 bit0~7 不重叠 ⇒ 两级速率相乘、rtLodDiffuseGiWeight 同步相乘，
+// 估计量仍无偏。跳过的是 GI **信号**而不是像素 —— 颜色/深度/MV/guide 每帧照写，
+// 所以不会像 spp=0.5 那样出现锯齿（2026-10-25 实测过：整像素棋盘会退化边缘）。
+//
+// 代价：该帧不跑 GI 的像素 indirectLight = 0，跑的那帧乘 2（或 4）。时间平均
+// 正确，但方差按倍数放大（半速约 1.4×、四分一约 2× 幅度），由 DLSS-RR 的时间
+// 累积抹平。若实测噪点不可接受，下一步才是"读自己上一帧的 GI 历史"那套。
+// 回退：宿主 ORION_GI_NEAR_RATE=0。
+// =====================================================
+if(cam.giRayParams.x > 0.5f)
+{
+    if(cam.giRayParams.x > 1.5f)
+    {
+        rtLodDiffuseGiEnabled =
+            rtLodDiffuseGiEnabled &&
+            rtLodGiQuarterSample;
+
+        rtLodDiffuseGiWeight *=
+            4.0;
+    }
+    else
+    {
+        rtLodDiffuseGiEnabled =
+            rtLodDiffuseGiEnabled &&
+            rtLodGiHalfSample;
+
+        rtLodDiffuseGiWeight *=
+            2.0;
+    }
+}
+
+
 float primaryPOMSelfShadow =
     clamp(
         payload.pomSelfShadow,
@@ -18788,6 +20859,14 @@ float primaryPOMMicroOcclusion =
 float primaryGlassAlpha =
     clamp(
         payload.glassAlpha,
+        0.0,
+        1.0
+    );
+
+// alpha blend 的源 alpha（texture x vertex），与覆盖率字段分离。
+float primaryGlassBlendAlpha =
+    clamp(
+        payload.glassBlendAlpha,
         0.0,
         1.0
     );
@@ -18842,6 +20921,55 @@ float primaryGlassSlabThickness =
 bool primaryGlassUsesDielectric =
     false;
 
+// =====================================================
+// 2026-10-28：解析出射点必须用**面法线**（轴对齐），不能用带法线贴图扰动的
+// payload.normal。
+//
+// 现象（用户）：玻璃正对面干净，与它不平行的其他面全是固定形状的块状噪点；
+//   ORION_GLASS_ALPHA_BLEND_DBG=9 旁路 alpha blend 后仍在 ⇒ 在 rgen 输出里。
+//
+// 机理：出射点 = entry + insideDirection * (thickness / cosInside)
+//   · payload.normal 已被法线贴图逐 texel 扰动（LabPBR 浮雕）；
+//   · thickness 由 glassSlabThicknessFromFace(entry, normal) 按"命中面到格心
+//     的距离"给出 —— 法线被扰动到靠近另一个主轴时，它会从 1.0（整块）跳到
+//     0.125（板）；
+//   · cosInside = -dot(refract(dir, n, 1/ior), n)，掠射时 -> 0，1/cosInside 放大。
+//   ⇒ 链起点逐 texel 乱跳 ⇒ 穿过玻璃看到的背景被切成块。
+//   正对面 |N·V|≈1，1/cosInside≈1，扰动不放大 ⇒ 干净 —— 这就是"平行才干净"。
+//
+// MC 的方块面全部轴对齐 ⇒ 把扰动法线吸附到最近主轴即可恢复连续出射点。
+// 光照仍用带法线贴图的 payload.normal（本变量只服务解析折射与厚度）。
+//
+// A/B：-DORION_GLASS_EXIT_AXIS_NORMAL=0 回到旧档（逐位）。
+// =====================================================
+#ifndef ORION_GLASS_EXIT_AXIS_NORMAL
+#define ORION_GLASS_EXIT_AXIS_NORMAL 1
+#endif
+vec3 primaryGlassExitNormal =
+    payload.normal;
+#if ORION_GLASS_EXIT_AXIS_NORMAL
+{
+    const vec3 exitAxisAbs =
+        abs(payload.normal);
+
+    if(exitAxisAbs.x > max(exitAxisAbs.y, exitAxisAbs.z))
+    {
+        primaryGlassExitNormal =
+            vec3(payload.normal.x >= 0.0 ? 1.0 : -1.0, 0.0, 0.0);
+    }
+    else if(exitAxisAbs.y > exitAxisAbs.z)
+    {
+        primaryGlassExitNormal =
+            vec3(0.0, payload.normal.y >= 0.0 ? 1.0 : -1.0, 0.0);
+    }
+    else
+    {
+        primaryGlassExitNormal =
+            vec3(0.0, 0.0, payload.normal.z >= 0.0 ? 1.0 : -1.0);
+    }
+}
+#endif
+
 #if GI_GLASS_DIELECTRIC
 primaryGlassUsesDielectric =
     getLegacyMaterialId(payload.state) >= 2.5;
@@ -18851,13 +20979,13 @@ if(primaryGlassUsesDielectric)
     primaryGlassSlabThickness =
         glassSlabThicknessFromFace(
             primaryGlassEntryPoint,
-            payload.normal
+            primaryGlassExitNormal
         );
 
     // RR 深度仍要一个沿视线的标量：给出射面的距离。
     primaryParallaxRayTravel =
         glassSlabTravelAlongView(
-            payload.normal,
+            primaryGlassExitNormal,
             worldDir.xyz,
             primaryGlassSlabThickness
         );
@@ -19124,7 +21252,7 @@ if (s == 0)
             vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
 
         const vec2 skyUv =
-            skyPixelCenter / vec2(gl_LaunchSizeEXT.xy);
+            skyPixelCenter / vec2(rtLaunchSize());
 
         vec2 skyNdc = skyUv * 2.0 - 1.0;
         skyNdc.y = -skyNdc.y;
@@ -19216,6 +21344,29 @@ if (s == 0)
 
     // 调试图用（DBG_SHOW_MV）：把写出去的那个值留到最终 imageStore 处画出来。
     rtDebugPrimaryMotion = primaryMotionPixels;
+}
+#endif
+
+// =====================================================
+// 2026-10-26 稀疏渲染抽签。
+//
+// 位置刻意放在 depth/MV 写入**之后**：非活跃像素的 depth 与 motion vector
+// 已经是本帧新鲜值，RR/DLSS 的重投影与重建不依赖本像素的 radiance。
+// 后续只把 RTAO / 太阳软影 / 本地光 / GI / glossy 的**贡献与射线**置零，
+// 不提前 return —— guides 与主命中的自发光/天空仍在下面照常写。
+// =====================================================
+bool vptPixelActive = true;
+#if !SHARC_UPDATE && !GI_HALFRES
+vptPixelActive = vptSparsePixelIsActive(uvec2(gl_LaunchIDEXT.xy));
+#endif
+
+// 2026-10-27 阶段 3：带出循环（只有做稀疏的变体需要；SHARC_UPDATE / GI_HALFRES
+// 不判稀疏，槽保持默认 true/false ⇒ 末尾全写，与它们原有的行为一致）。
+#if !SHARC_UPDATE && !GI_HALFRES
+if(s == 0)
+{
+    vptPixelActiveOutside = vptPixelActive;
+    primaryRayMissed = primaryHitDistance < 0.0;
 }
 #endif
 
@@ -19390,7 +21541,7 @@ if (matId > 0.5 && matId < 2.5) {
                             0.01,
                             rrWaterReflectionDir,
                             10000.0,
-                            gl_RayFlagsNoneEXT,
+                            SECONDARY_TRAVERSE_FLAGS,
                             0xff,
                             s
                         );
@@ -19400,7 +21551,7 @@ if (matId > 0.5 && matId < 2.5) {
                     {
                         traceRayEXT(
                             topLevelAS,
-                            gl_RayFlagsNoneEXT,
+                            SECONDARY_TRAVERSE_FLAGS,
                             0xff,
                             0,
                             0,
@@ -19665,6 +21816,8 @@ if (matId > 0.5 && matId < 2.5) {
                     // threshold result still traces blocky contours.  Kept
                     // for reference; re-enable only with a continuous depth
                     // field (e.g. several jittered receiver probes).
+                    // 2026-10-26 21:1x: 路线 B 持久泡沫图已随用户定档整条回退，
+                    // 岸线注入调用一并摘除（注入/采样函数在下方 #if 0 保留）。
 #if 0
                     sampleColor +=
                         evaluateShoreFoam(
@@ -19688,6 +21841,57 @@ if (matId > 0.5 && matId < 2.5) {
                         sunDir,
                         waterSurfaceSunTransmittance
                     );
+
+                // =====================================================
+                // 2026-10-26 Persistent foam, sampled once (Crest route B).
+                //
+                // One texture fetch + two ALU-noise octaves per water pixel; no
+                // extra BVH ray.  The map itself is advanced by water_foam.comp
+                // at 30 Hz (fade + whitecap / interaction / shoreline injection).
+                //
+                // Foam is a diffuse layer: sun visibility and cloud shadow use
+                // the same values as the water glint above, so foam in a cave
+                // or under a cloud does not glow.  The 0.45 ambient term keeps
+                // shaded foam readable instead of black.
+                //
+                // 2026-10-26 21:1x 用户不要泡沫 ⇒ 回退：整块采样/着色屏蔽保留，
+                // 水面回到"只有反射+折射+烧结"的旧观感。
+                // =====================================================
+#if 0
+                if(cam.pomParams.w > 0.0)
+                {
+                    float foamProjScale =
+                        float(rtLaunchSize().y) /
+                        (2.0 * max(tan(cam.cameraParams.z * 0.5), 0.05));
+                    float foamAlpha = waterFoamMapSample(
+                        hitPos,
+                        primaryHitDistance,
+                        foamProjScale);
+
+                    if(foamAlpha > 0.001)
+                    {
+                        float foamCloudShadow = (sunDir.y > 0.02)
+                            ? c3CloudSunTransmittance(
+                                hitPos + sunDir * 0.001,
+                                sunDir)
+                            : 0.0;
+                        const vec3 FOAM_ALBEDO = vec3(0.86, 0.90, 0.92);
+                        vec3 foamAmbient =
+                            getTimeDrivenSkyLightColor() * 0.45;
+                        vec3 foamSun =
+                            getTimeDrivenSkyLightColor() *
+                            (0.62 * max(sunDir.y, 0.0)) *
+                            waterSurfaceSunTransmittance *
+                            foamCloudShadow;
+                        vec3 foamRadiance =
+                            FOAM_ALBEDO * (foamAmbient + foamSun);
+                        sampleColor = mix(
+                            sampleColor,
+                            foamRadiance,
+                            min(foamAlpha, 0.95));
+                    }
+                }
+#endif
 
             }
             // =====================================================
@@ -19754,17 +21958,46 @@ else if(
                 // 玻璃 1.5、冰 1.309；粘液/蜂蜜参考未给 ⇒ 沿用 1.5）。
                 const float glassIor =
                     glassIorForProfile(glassPayloadProfile);
+                // =====================================================
+                // 2026-10-28：起点直接用**入射点**，撤掉解析出射点位移。
+                //
+                // 现象：出射面与入射面**平行**时干净（正对玻璃块 / 玻璃板），
+                //   不平行时（斜看玻璃块的侧面）整面固定形状块状噪点。
+                //
+                // 机理：glassSlabExitPoint 的最后一步把出射点 clamp 回入射格
+                //   （glass_dielectric_common.glsl:176-180，"修透过玻璃穿墙"）。
+                //   它假设内部光线一定走到对面；斜穿/掠射时
+                //       exitPoint = entry + T * (thickness / cosInside)
+                //   立刻冲出格子 ⇒ 被夹到格边界。而"夹/不夹"是**二值**的，
+                //   逐像素切换 ⇒ 链起点在"真实出射点"与"格边界"之间跳
+                //   ⇒ 透过玻璃看到的背景被切成块。平行进出面时横移是常数、
+                //   不会冲出格子 ⇒ 不夹 ⇒ 干净。
+                //
+                // 为什么现在不需要位移：2026-10-25 阶段 D 之后，主透射链的
+                //   any-hit 会 ignore 掉每一片玻璃面，射线本来就沿真实几何穿过
+                //   玻璃体。出射点位移属于"单射线跳过整块玻璃"的旧模型
+                //   （v2 弯折 / PASSTHROUGH），现在只会把起点推离真实光路。
+                //
+                // A/B：-DORION_GLASS_STRAIGHT_START=0 回到解析出射点位移。
+                // =====================================================
+#ifndef ORION_GLASS_STRAIGHT_START
+#define ORION_GLASS_STRAIGHT_START 1
+#endif
+#if ORION_GLASS_STRAIGHT_START
+                vec3 glassWalkExitPosition = hitPos;
+#else
                 vec3 glassWalkExitPosition = clearGlassAsAir
                     ? hitPos
                     : (primaryGlassUsesDielectric
                         ? glassSlabExitPoint(
                             primaryGlassEntryPoint,
-                            normal,
+                            primaryGlassExitNormal,
                             worldDir.xyz,
                             primaryGlassSlabThickness,
                             glassIor
                         )
                         : hitPos + worldDir.xyz * primaryParallaxRayTravel);
+#endif
                 vec3 glassWalkExitDirection = worldDir.xyz;
 // =====================================================
 // 2026-10-17：v3 弯折射线此前**没有默认值** ⇒ 从未生效
@@ -19801,7 +22034,10 @@ else if(
                 glassSurface.position = hitPos;
                 glassSurface.normal = normal;
                 glassSurface.tint = albedo;
-                glassSurface.alpha = primaryGlassAlpha;
+                // 2026-10-26：传 texture x vertex 的 alpha（Remix-MC
+                // ATLAS_TRANSLUCENT_BLEND = textureTimesVertexColor），
+                // 而不是只按顶点 materialId 判定的覆盖率字段。
+                glassSurface.alpha = primaryGlassBlendAlpha;
                 const vec3 glassF0 = vec3(0.04);
 
                 float glassNdotV =
@@ -19853,12 +22089,24 @@ else if(
                         vec3(0.0);
 
 
+#if VPT_GLASS_ALPHA_BLEND_PANE_SPECULAR
                     rrSpecularAlbedo =
                         rrEnvBRDFApprox2(
                             glassF0,
                             0.0,
                             glassNdotV
                         );
+#else
+                    // 2026-10-27：镜面反射已在渲染侧关掉（PANE_SPECULAR=0），
+                    // RR 的 specular guide 必须同样为 0。
+                    //
+                    // 症状对照：原来这一行让 rrSpecularAlbedo 随 NdotV 变化 ——
+                    //   正对面 NdotV≈1 ⇒ 0.04（几乎无镜面）⇒ 背景能透出来
+                    //   侧面   NdotV≈0 ⇒ 1.0（纯镜面）  ⇒ RR 走镜面通道 ⇒ 发实
+                    // 这正是"只有正对面透明、邻面一直不透明"的机制。
+                    rrSpecularAlbedo =
+                        vec3(0.0);
+#endif
 
 
                     rrNormalRoughness =
@@ -20018,6 +22266,7 @@ else if(
                         rrTransparentReceiverIsPane =
                             true;
 
+
 #if GI_GLASS_DOMINANT_GUIDE
                         // Route A: the merge above assumed transmission owns
                         // this pane pixel.  When the mirror lobe actually
@@ -20064,6 +22313,69 @@ else if(
                             // behind it.
                             rrTransparentReceiverGuideValid =
                                 false;
+                        }
+#endif
+#ifndef ORION_GLASS_RECEIVER_MV
+// 2026-10-25 阶段 A（修正版）：接收面运动矢量。置 0 = 沿用玻璃面的 MV（旧档）。
+#define ORION_GLASS_RECEIVER_MV 1
+#endif
+#if !GI_HALFRES && ORION_GLASS_RECEIVER_MV
+                        // =====================================================
+                        // 运动矢量必须跟随**这张像素最终的深度 guide**：
+                        //   · 透射支配的像素 => 深度在 24529 起的
+                        //     rrUseReceiverDepthGuide 里被换成接收面 ⇒ MV 也要用接收面；
+                        //   · 镜面支配的像素（上面的 dominant guide）=> valid 已被置
+                        //     false、深度保持玻璃面 ⇒ MV 必须保持玻璃面。
+                        // 之前把覆盖写在 dominant guide 之前、且不看 valid，镜面支配的
+                        // 像素就成了"玻璃面的深度 + 接收面的位移" ⇒ RR 重投影错位
+                        // ⇒ 玻璃发虚（2026-10-25 用户实测）。
+                        // 判据与宿主 24529-24538 逐字同源。
+                        // 半分辨率 GI 变体不写 G-buffer，故 !GI_HALFRES。
+                        // =====================================================
+                        bool receiverOwnsDepthGuide =
+                            rrTransparentReceiverGuideValid;
+#if GI_GLASS_PANE_DEPTH_GUIDE
+                        if(rrTransparentReceiverIsPane)
+                        {
+                            receiverOwnsDepthGuide = false;
+                        }
+#endif
+                        if(receiverOwnsDepthGuide &&
+                           cam.perfAblationStage.z != 0u &&
+                           dot(glassTransmissionInfo.receiverWorldPos,
+                               glassTransmissionInfo.receiverWorldPos) > 1.0e-8)
+                        {
+                            const mat4 receiverPrevViewProj =
+                                inverse(cam.prevViewInverse * cam.prevProjInverse);
+                            const mat4 receiverCurViewProj =
+                                inverse(cam.viewInverse * cam.projInverse);
+
+                            const vec4 receiverPrevClip =
+                                receiverPrevViewProj *
+                                vec4(glassTransmissionInfo.receiverWorldPos, 1.0);
+                            const vec4 receiverCurClip =
+                                receiverCurViewProj *
+                                vec4(glassTransmissionInfo.receiverWorldPos, 1.0);
+
+                            if(abs(receiverPrevClip.w) > 1.0e-6 &&
+                               abs(receiverCurClip.w) > 1.0e-6)
+                            {
+                                const vec2 receiverPrevNdc =
+                                    receiverPrevClip.xy / receiverPrevClip.w;
+                                const vec2 receiverCurNdc =
+                                    receiverCurClip.xy / receiverCurClip.w;
+
+                                imageStore(
+                                    dlssMotionImage,
+                                    pixelCoord,
+                                    vec4(
+                                        (receiverPrevNdc - receiverCurNdc) *
+                                            vec2(0.5, -0.5),
+                                        0.0,
+                                        1.0
+                                    )
+                                );
+                            }
                         }
 #endif
                     }
@@ -20192,13 +22504,36 @@ if(perfL10DisableRtao())
         0;
 }
 
+// 2026-10-27 用户「RTAO 近距采样」的关闭档（=5）：整条 RTAO 链关闭。
+// 0 仍是旧语义（0~16 格不发 AO 射线，32~96 格照旧 1 条）；5 覆盖所有距离段，
+// rtaoFactor 保持 1.0 中性。放在 perfL10AoSampleCap 之前，cap 不会把 0 抬回去。
+if(int(cam.perfPrimary.x) >= 5)
+{
+    aoSamples = 0;
+}
+
 // Perf-L10.1 stage 9: cap the near-field ray count so the cost of four RTAO
 // rays against two is a measurable partial delta.
 aoSamples =
     min(aoSamples, perfL10AoSampleCap());
 
-// [8] 本像素是否跑 RTAO
-if(aoSamples > 0)
+// 2026-10-26 稀疏渲染：非活跃像素不发 AO 射线（rtaoFactor 保持 1.0 的
+// "无遮蔽"中性值；该像素的 radiance 会被 RR 重建）。
+if(!vptPixelActive)
+{
+    aoSamples = 0;
+}
+
+// [8] 本像素是否会**真的发出** RTAO 射线。
+// 2026-10-28：原口径只看 aoSamples > 0，但生产档（SER 变体）把"死 AO 射线"
+// 整体跳过（perfSerAb.w 恒 1，见 VulkanCore.cpp 的 PERF_L10_ENABLE_RTAO_SKIP_AB
+// = false ⇒ 永不做 A/B）。于是日志里 aoPixPct 显示 82% 而 aoRayPerPix 恒 0，
+// 两个字段口径相反，读起来像"AO 在工作"。这里让两者同源。
+if(aoSamples > 0
+#ifdef RT_ENABLE_SER
+   && cam.perfSerAb.w == 0u
+#endif
+)
 {
     perfRayStatAdd(8u, 1u);
 }
@@ -20457,6 +22792,14 @@ if(!(NdotL > 0.0 ||
     shadowSamples = 0;
 }
 
+// 2026-10-26 稀疏渲染：非活跃像素跳过太阳软阴影射线。
+// shadowSamples = 0 时下面的归一化给出 shadowTransmittance = 0（见上方
+// 17784 的记载），即本像素的太阳直射贡献为 0 —— 与"跳过该段"同义。
+if(!vptPixelActive)
+{
+    shadowSamples = 0;
+}
+
 // =====================================================
 // 远场档标记（2026-10-01）
 //
@@ -20571,7 +22914,12 @@ for (int si = 0;
 
     hit.lastGlassFaceT = -1.0;
     hit.glassFaceBudget = 0.0;
+    hit.glassInside = 0.0;
+    hit.glassEntryT = -1.0;
     hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
+    // [13] 太阳软影射线：循环体每根计一次（SER / 非 SER 两条分支共用同一口径，
+    // 所以放在分支之前，而不是各自的 trace 调用旁）。
+    perfRayStatAdd(13u, 1u);
     // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
     // 见 HANDOFF-2026-10-21-VERTEX-32B-TERRAIN.md §8。否则累乘起点是
     // 上一条射线的残留 albedo，逐帧不同 ⇒ 静止时被 DLSS-RR 当信号累积。
@@ -20724,6 +23072,8 @@ if(
 
     hit.lastGlassFaceT = -1.0;
     hit.glassFaceBudget = 0.0;
+    hit.glassInside = 0.0;
+    hit.glassEntryT = -1.0;
     hit.state =
         makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
     // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
@@ -20835,6 +23185,8 @@ if(
 
             hit.lastGlassFaceT = -1.0;
             hit.glassFaceBudget = 0.0;
+            hit.glassInside = 0.0;
+            hit.glassEntryT = -1.0;
             hit.state =
                 makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
             // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
@@ -21530,7 +23882,7 @@ if(matId > 0.2 && matId < 0.45)
 // 左半屏 = false。必须在两个本地光项之前声明（GLSL 单遍编译）。
 bool splitHalfRight =
     DBG_SPLIT_ABLATION &&
-    (float(gl_LaunchIDEXT.x) >= 0.5 * float(gl_LaunchSizeEXT.x));
+    (float(gl_LaunchIDEXT.x) >= 0.5 * float(rtLaunchSize().x));
 
 // 2026-09-30 收口：本地光只剩经典 0.31 RIS 一种方案（ReSTIR DI 链已整链删除），
 // 发射体邻接自发光（命中面**背后**体素的 emission，hitPos - normal*0.02）
@@ -21603,7 +23955,22 @@ vec3 localExactFaceDirect = VPT_LOCAL_EXACT_DIRECT_ON_PRIMARY
 #ifndef LOCAL_RIS_PRIMARY_TEMPORAL
 #define LOCAL_RIS_PRIMARY_TEMPORAL 0
 #endif
-vec3 localDirectLight;
+// 2026-10-26：直接光模式（cam.sparseParams.x）运行时二选一 ——
+//   0 = 传统 RIS（下面 #else 的原路径，逐位不变）
+//   1 = RTXDI 式时域 reservoir（WRS，见 evaluateVPTDirectLightReservoirTail）
+// LOCAL_RIS_PRIMARY_TEMPORAL 仍是编译期 A/B 旧 EMA 路径，默认 0。
+bool runPrimaryDirectLight = vptPixelActive;
+#if !LOCAL_RIS_PRIMARY_TEMPORAL
+// 稀疏渲染 × RTXDI：非活跃像素仍做 reservoir 验证/老化（对应官方
+// enableRtxdiReuseForInactivePixels=true），tail 内不发着色射线。
+if(!vptPixelActive && cam.sparseParams.x >= 0.5 && cam.sparseParams.z > 0.5)
+{
+    runPrimaryDirectLight = true;
+}
+#endif
+vec3 localDirectLight = vec3(0.0);
+if(runPrimaryDirectLight)
+{
 #if LOCAL_RIS_PRIMARY_TEMPORAL
 localDirectLight = evaluateVPTCandidateDirectTemporal(
 #if VPT_TRANSPARENT_HISTORY_KEY
@@ -21615,7 +23982,7 @@ localDirectLight = evaluateVPTCandidateDirectTemporal(
     albedo,
     vptGeometricFaceNormalFromRay(hitPos, worldDir.xyz),
     ivec2(gl_LaunchIDEXT.xy),
-    ivec2(gl_LaunchSizeEXT.xy)
+    ivec2(rtLaunchSize())
 );
 #else
 // 本地直射余弦的几何面上界必须用**射线入面**恢复的面法线：payload.normal
@@ -21624,7 +23991,7 @@ localDirectLight = evaluateVPTCandidateDirectTemporal(
 // 2026-10-07：带上主命中的 LabPBR 材质 —— materialF0 / metallic / roughness 都是本
 // 作用域里**已经解码好**的那一份（见 18122 附近的 F0/Metal 解码块），不必重算，也不能
 // 用太阳那段的 directF0（它在内层大括号里，这里看不到）。
-localDirectLight = evaluateVPTRISDirectLighting(
+localDirectLight = evaluateVPTRISDirectLightingPrimary(
     hitPos,
     normal,
     albedo,
@@ -21632,9 +23999,12 @@ localDirectLight = evaluateVPTRISDirectLighting(
     materialF0,
     metallic,
     roughness,
+    cam.sparseParams.x >= 0.5,
+    vptPixelActive,
     vptRisSeed
 );
 #endif
+}
 uint vptBounceSeed = uint(gl_LaunchIDEXT.x) * 31847u ^
     uint(gl_LaunchIDEXT.y) * 11213u ^ cam.frameCount * 6971u;
 pcg_hash(vptBounceSeed);
@@ -21653,6 +24023,12 @@ else if(rtLodDistance >= 128.0 * perfL10TierScale() && rtLodDistance < 160.0 * p
 {
     runLocalSecondary = rtLodQuarterSample;
     localSecondaryLodWeight = 4.0;
+}
+
+// 2026-10-26 稀疏渲染：非活跃像素跳过本地光二级弹射（DDA）。
+if(!vptPixelActive)
+{
+    runLocalSecondary = false;
 }
 
 vec3 localSecondaryLight = runLocalSecondary
@@ -21747,10 +24123,56 @@ float glossyLodWeight =
 // (perfSecondary.w, 16/32/64/96 blocks).
 float glossyFullResDistance =
     float(clamp(cam.perfSecondary.w, 16u, 96u));
+
+// =====================================================
+// 2026-10-25：光泽反射降速级（0 = 全速 / 1 = 半速 / 2 = 四分之一 / 3 = 关）
+//
+// 距离级与**粗糙度**级合成一个整数再统一施加。为什么要合成而不是各写一个 if：
+// rtLodGlossyHalfSample 与 rtLodGlossyQuarterSample 共用 rtLodRandom 的同一批
+// bit，两个门先后 AND 时"命中率"不会变成 1/4 的两倍小，但 glossyLodWeight 会被
+// 乘两次 ⇒ 过曝。一个级别对应一个权重，才是无偏的时间估计量。
+//
+// 粗糙度门槛的依据：noGlossy 消融在室内是 -4.27ms（rt=18.0），而室内距离全都
+// < 16 格 ⇒ 距离级一格都没触发，全屏都在跑全速光追。宽波瓣（roughness >= 0.30）
+// 的单样本 GGX 反射本来就由 RR 的时间累积重建，降到 1/2~1/4 速率几乎不可区分；
+// 光滑面（绿玻璃板、镜面）保持全速，锐利反射不受影响。
+// =====================================================
+int glossySampleLevel =
+    0;
+
 if(
     rtLodDistance >= glossyFullResDistance &&
     rtLodDistance < 128.0 * perfL10TierScale()
 )
+{
+    glossySampleLevel = 1;
+}
+else if(
+    rtLodDistance >= 128.0 * perfL10TierScale() &&
+    rtLodDistance < 160.0 * perfL10TierScale()
+)
+{
+    glossySampleLevel = 2;
+}
+else if(rtLodDistance >= 160.0 * perfL10TierScale())
+{
+    glossySampleLevel = 3;
+}
+
+// 粗糙度级（ORION_GLOSSY_ROUGH_LOD）：只往上抬，不往回降。
+if(cam.giHalfParams.w > 0.5f)
+{
+    if(roughness >= 0.65)
+    {
+        glossySampleLevel = max(glossySampleLevel, 2);
+    }
+    else if(roughness >= 0.30)
+    {
+        glossySampleLevel = max(glossySampleLevel, 1);
+    }
+}
+
+if(glossySampleLevel == 1)
 {
     runGlossyRT =
         runGlossyRT &&
@@ -21759,10 +24181,7 @@ if(
     glossyLodWeight =
         2.0;
 }
-else if(
-    rtLodDistance >= 128.0 * perfL10TierScale() &&
-    rtLodDistance < 160.0 * perfL10TierScale()
-)
+else if(glossySampleLevel == 2)
 {
     runGlossyRT =
         runGlossyRT &&
@@ -21771,7 +24190,7 @@ else if(
     glossyLodWeight =
         4.0;
 }
-else if(rtLodDistance >= 160.0 * perfL10TierScale())
+else if(glossySampleLevel >= 3)
 {
     runGlossyRT = false;
 }
@@ -21781,6 +24200,12 @@ if(perfL10DisableGlossy())
 {
     runGlossyRT =
         false;
+}
+
+// 2026-10-26 稀疏渲染：非活跃像素跳过 GGX 光泽反射段。
+if(!vptPixelActive)
+{
+    runGlossyRT = false;
 }
 
 vec3 glossyRayNormal =
@@ -21816,6 +24241,9 @@ float glossyVdotH =
 // math cost before the runGlossyRT guard below, even when no ray was traced.
 if(runGlossyRT)
 {
+    // [14] 光泽反射求值（每像素最多一次；真正的那根光线在本块之后才发）。
+    perfRayStatAdd(14u, 1u);
+
     glossyH =
         normalize(
             sampleGGX(
@@ -22142,6 +24570,47 @@ int giBounceLimit =
         ? min(MAX_DIFFUSE_BOUNCES, 1)
         : MAX_DIFFUSE_BOUNCES;
 
+#if SHARC_UPDATE
+    // 2026-10-25：update 路径只需写满 SHARC_PROPAGATION_DEPTH 个顶点
+    // （cacheIndices 数组深度就是它），更深的弹射写进去也永远不会被 query 命中。
+    // 之前 update 与主渲染共用 4 跳 ⇒ 一半以上的 update 成本是白付的。
+    //
+    // 2026-10-28 修正：原来是 `min(giBounceLimit, SHARC_PROPAGATION_DEPTH)`，
+    // 于是用户把「GI 跳数」设成 1 时 update 也只跑 1 跳。而渲染侧从本日起把第二跳
+    // 交给缓存（见下面 !SHARC_UPDATE 分支），缓存里"顶点 1 的入射辐射"只有在
+    // update 追到顶点 2 时才包含第二跳的反弹 ⇒ 改成固定 SHARC_PROPAGATION_DEPTH：
+    // 不受用户跳数影响，也不受上面那条"远场只跑 1 跳"的 LOD 折扣影响（远场缓存
+    // 同样需要第二跳，否则远场接管后整片偏暗）。
+    giBounceLimit = SHARC_PROPAGATION_DEPTH;
+#else
+    // ========================================================================
+    // 2026-10-28：SHaRC 接管第二跳。
+    //
+    // 参考实现（本地 _ref/dxvk-remix）的做法：
+    //   · rtx/pass/sharc/sharc_integrator_utilities.slangh:126-199
+    //     onHitBeforeDirectLighting() —— 查询挂在**每个 secondary hit** 上、位于
+    //     直接光之前；命中即 `return false` 终止路径（:191）。
+    //   · :167-175 光锥判据用 pathState.segmentHitDistance 与
+    //     prevPerceptualRoughness；后者由 :1326 的
+    //     onBounceEnd(firstHitPerceptualRoughness) 在**主命中顶点**播种。
+    //   · Remix 不额外钳 bounce 数（High 预设 pathMaxBounces=2、Ultra=4，
+    //     rtx_options.cpp:539/561）。"第二跳不被追"是**命中缓存后终止**的自然结果，
+    //     不是单独一条钳制。
+    //
+    // 本文件的挂点与判据本来就与上面一致（见下面 "5b-3：SHaRC 查询" 段）。这里补的
+    // 是 Remix 没有、本工程需要的一步：命中率覆盖不满全屏时，第二跳仍会被实追
+    // （实测第二跳 11.2ms，VulkanCore.cpp:9312）。所以 query 活跃时把回路截到 1 跳
+    // —— 第二跳起全部由缓存给。与 Remix 在**命中时**逐像素等价（Remix 在 bounce 1
+    // 命中后同样不再发第二跳），未命中时是纯损失：那一份能量缺失，靠 update 把缓存
+    // 热起来补回。⚠ 这是自造口径、不在参考实现里；A/B 与回退都用 ORION_SHARC=0。
+    // ========================================================================
+    if(sharcQueryActive())
+    {
+        giBounceLimit = min(giBounceLimit, 1);
+    }
+#endif
+
+
 // [10]/[11] 远场像素分布（GI 在 384 格外被压到 1/32，见 23347 行注释）
 if(rtLodDistance >= 384.0)
 {
@@ -22162,6 +24631,12 @@ else if(rtLodDistance >= 160.0)
 
 bool runDiffuseGI =
     rtLodDiffuseGiEnabled;
+
+// 2026-10-26 稀疏渲染：非活跃像素跳过整条 diffuse GI 回路（含 SHaRC 查询）。
+if(!vptPixelActive)
+{
+    runDiffuseGI = false;
+}
 
 
 float diffuseGILodWeight =
@@ -22227,7 +24702,7 @@ while(
         }
     }
 
-                    if(perfL10EnableGiRoulette())
+                    if(giRouletteEnabledForVariant())
                     {
                         // Perf-L10.1 stage 11: Russian-roulette survival with energy
                         // compensation, mirroring the reference renderer's policy.
@@ -22318,6 +24793,13 @@ while(
                     hit.state = makeTraceState(
                         currentInsideWater ? RT_PURPOSE_WATER_MEDIUM : RT_PURPOSE_FULL
                     );
+
+                    // 2026-10-25 A/B：GI 射线跳过 POM（含 POM 自阴影）。
+                    // 命中侧只需让 getPOMDepthScale() 返回 0 即可走既有早退分支。
+                    if(cam.giHalfParams.z > 0.5f)
+                    {
+                        hit.state |= RT_STATE_GI_NO_POM_BIT;
+                    }
 #if GI_SKIP_SUN_DISK
                     // MIS-A（见 RT_STATE_NO_SUN_DISK_BIT）：GI 回路发出的射线命中
                     // 天空时不要回传日盘 —— 太阳直射由 NEE 承担，两份并存在期望上
@@ -22341,10 +24823,10 @@ while(
                     }
                     else
                     {
-                        traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, 0xff, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
+                        traceRayEXT(topLevelAS, SECONDARY_TRAVERSE_FLAGS, 0xff, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
                     }
 #else
-                    traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, 0xff, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
+                    traceRayEXT(topLevelAS, SECONDARY_TRAVERSE_FLAGS, 0xff, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
 #endif
 
 if (payload.hitDistance < 0.0) {
@@ -22355,7 +24837,15 @@ if (payload.hitDistance < 0.0) {
     // 由它按每个**已记录顶点**的 sampleWeights 回填（这就是"到该顶点的入射辐射度"
     // 的来源）。天空值用本工程 miss 支自己那一份（payload.albedo * 0.6），
     // 与紧接着的累加完全同一个量。
-    SharcUpdateMiss(sharcParameters, sharcState, payload.albedo * 0.6);
+    vec3 sharcMissRadiance = payload.albedo * 0.6;
+    if(sharcState.pathLength > 0)
+    {
+        sharcMissRadiance = sharcClampUpdateRadiance(
+            sharcParameters, sharcState.cacheIndices[0],
+            sharcMissRadiance, vec3(sharcState.sampleWeights[0]),
+            SHARC_FIREFLY_CLAMP_MULTIPLIER);
+    }
+    SharcUpdateMiss(sharcParameters, sharcState, sharcMissRadiance);
 #endif
     indirectLight +=
         currentThroughput *
@@ -23337,15 +25827,22 @@ indirectLight +=
         float(pcg_hash(sharcUpdateRngState) & 0x00ffffffu) /
         float(0x01000000u);
 
+    const vec3 sharcUpdateRadiance =
+        nextUnifiedEmission +
+        bounceDirect +
+        bounceWaterReflectedSun +
+        bounceLocalDiffuse;
+    const vec3 sharcUpdateClampedRadiance = sharcClampUpdateRadiance(
+        sharcParameters, sharcState.cacheIndices[0],
+        sharcUpdateRadiance, vec3(sharcState.sampleWeights[0]),
+        SHARC_FIREFLY_CLAMP_MULTIPLIER);
+
     const bool sharcUpdateCommitted =
         SharcUpdateHit(
             sharcParameters,
             sharcState,
             sharcUpdateHitData,
-            nextUnifiedEmission +
-                bounceDirect +
-                bounceWaterReflectedSun +
-                bounceLocalDiffuse,
+        sharcUpdateClampedRadiance,
             sharcUpdateRandom);
 
     // 仪器（参考没有）：lock[8] = 该顶点成功写入缓存；lock[10] = 返回 false。
@@ -23751,27 +26248,32 @@ currentDir =
         giHalfImage,
         ivec2(gl_LaunchIDEXT.xy),
         vec4(
-            // min() 只为防 16F 溢出成 Inf：brdfWeight 下限 1e-3 ⇒ 最多放大 1000 倍，
-            // 而 1spp 的 GI 本来就会出现尖峰。Inf 一旦落进半图，3×3 会把一个像素的
-            // 萤火虫扩散成一小片；夹到 60000 之后至少仍是有限值（RR 能按亮斑夹掉）。
-            min(
-                indirectLight / max(brdfWeight, vec3(1.0e-3)),
-                vec3(60000.0)),
+            // ⚠ 2026-10-25 实机首跑（满屏萤火虫）后**取消解调**：这里原来是
+            //   indirectLight / max(brdfWeight, 1e-3)，主变体再乘回自己的 brdfWeight。
+            // 机理：brdfWeight = (1-F)(1-metallic)·albedo·g2bPrimaryMixtureWeight，
+            // 同一个 2×2 块内 4 个像素共享几乎同一份入射辐亮度，但 albedo 与 RIS 混合
+            // 权重逐像素独立随机 ⇒ brdfWeight_p / brdfWeight_i 在同一平面上就能到
+            // 1e3~1e4，且相位轮转让每个像素每帧读到不同邻居 ⇒ 逐像素随机放大 ⇒
+            // 满屏萤火虫（RR 的 anti-firefly 只夹孤立亮点，夹不掉这个）。
+            // 现在直接存 L：2×2 块内平均入射辐亮度正是本方案的原意，代价只有反照率
+            // 边界轻微串色（有界 ~10 倍，不是指数）。
+            // min() 仍保留，纯粹防 16F 溢出成 Inf。
+            min(indirectLight, vec3(60000.0)),
             giHalfViewDepth
         )
     );
 }
 return;
 #else
-// giHalfParams.x != 0：间接光来自半分辨率 GI 图，乘回本像素的 brdfWeight。
+// giHalfParams.x != 0：间接光直接取半分辨率 GI 图的 3×3 深度感知平均。
 // 远场尾部（下面的 diffuseGILodWeight / farSlopeOcclusion / 环境底）照旧乘在它上面。
+// ⚠ 2026-10-25：这里**不再**乘回 brdfWeight（与半图侧的取消解调配对）。
 if (cam.giHalfParams.x != 0.0f)
 {
     indirectLight =
         upsampleGiHalf(
             pixelCoord,
-            -(viewMatrix * vec4(hitPos, 1.0)).z) *
-        max(brdfWeight, vec3(1.0e-3));
+            -(viewMatrix * vec4(hitPos, 1.0)).z);
 }
 #endif
 
@@ -23860,21 +26362,42 @@ if(farSlopeOcclusionActive)
 }
 
 
+// 2026-10-27 稀疏渲染的无偏缩放（Remix 的 1/rate，逐行照搬）。
+// 施加范围 = 由稀疏射线产生的项：
+//   太阳直射 / 本地光 RIS / 二级 DDA / glossy / GI。
+// 不施加：
+//   localExactFaceDirect（编译期恒 false 的面缓存直读）、
+//   waterReflectedSunLight（按帧间隔采样，不受 vptPixelActive 门控）、
+//   以及 litColor 之外的 emission / localEmitterEmission / ambientLight。
+// Remix 的挂点是 demodulate 的 per-lobe radiance（demodulate.comp.slang:649-659 /
+// 773-781），语义相同：只缩放被稀疏化的辐射度。
+// scale == 1（稀疏关）时多乘一个 1.0，结果逐位不变。
+// ⚠ 必须与 vptPixelActive 的变体门控一致（rt_test.rgen:21024 的
+// `#if !SHARC_UPDATE && !GI_HALFRES`）：这两个变体**不做稀疏**，每像素全采样，
+// 乘 1/rate 会让他们过亮 1/rate 倍 —— SHARC_UPDATE 会把过亮值写进 world-space
+// 缓存，GI_HALFRES 会把过亮的 giHalfImage 上采样进主 pass。
+#if !SHARC_UPDATE && !GI_HALFRES
+const float sparseRadianceScale = vptSparseRadianceScale();
+#else
+const float sparseRadianceScale = 1.0;
+#endif
+
 vec3 litColor =
-    directLight +
-    localDirectLight +
+    directLight * sparseRadianceScale +
+    localDirectLight * sparseRadianceScale +
     localExactFaceDirect +
-    localSecondaryLight +
+    localSecondaryLight * sparseRadianceScale +
     waterReflectedSunLight +
     // 2026-10-05 微结构反射遮蔽（#44）：凹槽 texel 的间接反射被凸起遮挡，
     // 按静态深度遮蔽折减（#12 的 GI 扣减同源）。
-    glossyReflectionLight * primaryPOMMicroOcclusion +
+    glossyReflectionLight * primaryPOMMicroOcclusion * sparseRadianceScale +
     indirectLight *
     1.8 *
     rtaoFactor *
     farSlopeOcclusion *
     farAmbientSunTerm *
-    primaryPOMMicroOcclusion;
+    primaryPOMMicroOcclusion *
+    sparseRadianceScale;
 
 // 2026-10-14 **临时诊断**（标记文件 surface_terms.flag ⇒ 车道 perfAblationStage.w = 1；
 // 把三类表面光照分别编码成 RGB，用来**一次运行**定位"洞里被日落色照亮"来自哪一类：
@@ -24260,14 +26783,19 @@ imageStore(
 //   rrTransparentReceiverGuideValid 透明接收面接管了正面 guide 记录
 // 任一为真 ⇒ 该像素的可见颜色不是主表面自身的颜色 ⇒ RR 不该按主表面历史平均。
 // 不新增状态、不改变任何现有 guide 的语义。
+// =====================================================
+// 2026-10-25 **回退（用户实测否决）**：玻璃/透射像素退出 hint。
+// 实测：hint=1 + 运动封顶（VPT_TRANSPARENT_MOTION_CAP）在**快速转视角**时
+// 两级时域同时失效 —— rgen 侧滑移大 ⇒ 历史封顶≈1；RR 侧 hint ⇒ 不信任历史
+// ⇒ 透过玻璃的内容直接变成原始 1spp，"非常大的噪点"（用户原话）。
+// hint 改为**只标记粒子**：玻璃恢复完全按主表面历史平均（10-23 之前的处理）；
+// 粒子是屏幕上的少数像素，且生灭语义本来就需要降信任。宿主开关保持默认开。
+// =====================================================
 imageStore(
     rrTransparencyHintImage,
     pixelCoord,
     vec4(
-        max(
-            rrDeltaCrossedFlag,
-            rrTransparentReceiverGuideValid ? 1.0 : 0.0
-        ),
+        rrParticlePixel ? 1.0 : 0.0,
         0.0,
         0.0,
         0.0
@@ -24751,7 +27279,7 @@ if (cam.dhFarFieldParams.x > 0.5
 
                     traceRayEXT(
                         topLevelAS,
-                        gl_RayFlagsNoneEXT,
+                        SECONDARY_TRAVERSE_FLAGS,
                         0xff,
                         0,
                         0,
@@ -25135,15 +27663,38 @@ currentColor = vec3(
 }
 #endif
 
-imageStore(
-    image,
-    pixelCoord,
-    vec4(
-        max(
-            currentColor,
-            vec3(0.0)
-        ),
-        1.0
-    )
-);
+// =====================================================
+// 2026-10-27 稀疏渲染：非活跃像素不覆盖本帧辐射。
+// Remix 的等价行为：integrate 按 compacted 列表启动 ⇒ 非活跃像素的 radiance
+// buffer 没有任何线程写；demodulate 的非活跃线程直接 return
+// （demodulate.comp.slang:862-874）。RR 因此读到的是"上一次写出"的值，
+// 而不是以前那版写进去的 ambient + emissive（有偏的假观测）。
+//
+// 三个例外（全部来自 Remix）：
+//   · cam.sparseParams.y <= 0：稀疏关闭 ⇒ 全写；
+//   · cam.sparseParams.w <= 0.5：稀疏历史尚未有效（首帧 / 切档第一帧）⇒ 全写，
+//     否则读到的是未初始化内容（g_rtOutputImage 每帧不清零）；
+//   · primaryHitDistance < 0：主射线 miss（天空）不稀疏 —— Remix
+//     enableSparsePrimaryRayMissComposition 默认 false。
+// =====================================================
+const bool sparseWriteImage =
+    vptPixelActiveOutside ||
+    cam.sparseParams.y <= 0.0 ||
+    cam.sparseParams.w <= 0.5 ||
+    primaryRayMissed;
+
+if(sparseWriteImage)
+{
+    imageStore(
+        image,
+        pixelCoord,
+        vec4(
+            max(
+                currentColor,
+                vec3(0.0)
+            ),
+            1.0
+        )
+    );
+}
 }

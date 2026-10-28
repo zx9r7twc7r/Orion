@@ -22,6 +22,7 @@ import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.client.renderer.texture.OverlayTexture;
 import com.mojang.math.Axis;
 import net.minecraft.core.Direction;
+import net.minecraft.core.SectionPos;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Pose;
 import org.joml.Matrix4f;
@@ -202,6 +203,61 @@ public class LevelRendererMixin {
         }
     }
 
+    // =====================================================
+    // 2026-10-24 项 1：原版可见性图 -> native（TLAS 主射线掩码剔除）
+    //
+    // 数据源是 LevelRenderer.visibleSections()（26.3 源码 :1289），由
+    // LevelExtractor.applyFrustum（:472）经
+    // SectionOcclusionGraph.addSectionsInFrustum 的 Octree 遍历填充 ——
+    // 只包含"从相机出发可达"的 Section。native 侧拿它去清 TLAS 实例 mask 的
+    // bit0（主射线位），实例本身保留 ⇒ 反射 / GI / 阴影 / 体积光 / 雨探针的
+    // 行为逐位不变。
+    //
+    // 两个必须照抄原版的边界条件：
+    //   · 相机处于 frustum 捕获状态（第三人称冻结 / 调试相机）时，
+    //     LevelExtractor:140 的 `getCapturedFrustum() == null` 分支不成立
+    //     ⇒ visibleSections 不刷新、可能陈旧 ⇒ 本帧上报 0，让 native 退回
+    //     改动前的行为；
+    //   · 列表为空同样上报 0（刚进世界时的空窗口不能变成"全剔"）。
+    // =====================================================
+    private static int[] rtx$visibleSectionScratch = new int[0];
+
+    private static void rtx$uploadVisibleSections(CameraRenderState cameraState) {
+        if (cameraState != null && cameraState.isFrustumCaptured) {
+            NativeVulkan.setVisibleSections(null, 0);
+            return;
+        }
+
+        final LevelRenderer renderer = Minecraft.getInstance().levelRenderer;
+        if (renderer == null) {
+            NativeVulkan.setVisibleSections(null, 0);
+            return;
+        }
+
+        final var sections = renderer.visibleSections();
+        final int count = sections == null ? 0 : sections.size();
+        if (count <= 0) {
+            NativeVulkan.setVisibleSections(null, 0);
+            return;
+        }
+
+        final int needed = count * 3;
+        if (rtx$visibleSectionScratch.length < needed) {
+            rtx$visibleSectionScratch = new int[Math.max(needed, 3 * 2048)];
+        }
+
+        final int[] out = rtx$visibleSectionScratch;
+        int write = 0;
+        for (int i = 0; i < count; i++) {
+            final long node = sections.get(i).getSectionNode();
+            out[write++] = SectionPos.x(node);
+            out[write++] = SectionPos.y(node);
+            out[write++] = SectionPos.z(node);
+        }
+
+        NativeVulkan.setVisibleSections(out, count);
+    }
+
     @Inject(method = "render", at = @At("HEAD"))
     private void rtx$beginEntityRtFrame(
             com.mojang.blaze3d.resource.GraphicsResourceAllocator resourceAllocator,
@@ -228,11 +284,15 @@ public class LevelRendererMixin {
         FarFieldGate.updateNearby(cameraState, viewArea);
         long rtx$t2 = System.nanoTime();
         VoxyLodManager.perfAdd(VoxyLodManager.PERF_FFG, rtx$t2 - rtx$t1);
-        // 2026-10-06：帧窗口可能已经由手部（FirstPersonHandsAndItemsRendererMixin）
-        // 提前打开 —— 手部在 GameRenderer 里**先于**世界渲染提交并立刻落地。这里改为
-        // 幂等开窗，两条路径都安全；原生的 beginEntityFrame()（清空顶点数组）保证每帧
-        // 恰好一次，由 beginEarlyFrame() 内部的标记把关。
-        // 世界渲染开始 ⇒ 手部阶段结束（手在世界之前提交，见手部那个 mixin）。
+        // 2026-10-25：实体帧窗口在这里打开（世界实体）。
+        // ⚠ 修正旧注释：26.3 的实际顺序是
+        //   LevelRenderer.render（世界） → GameRenderer.render3dHud → renderItemInHand（手）
+        // 即手**晚于**世界，而不是旧注释写的"手在世界之前"。
+        // 因此窗口在这里只开、不收：必须一直开到手的 feature 批次提交完
+        // （见 EntityRtCapture.finishEntityFrame 与 GameRendererMixin 的 prepareFrame
+        // 注入点），否则手会撞上原生门禁 if(!g_entityFrameOpen) 被静默丢弃。
+        // 幂等：无手帧同样由这里开；原生 beginEntityFrame()（清空顶点数组）由
+        // beginEarlyFrame 内部的标记保证每帧恰好一次。
         EntityRtCapture.endHandPhase();
         EntityRtCapture.beginEarlyFrame();
         ParticleRtCapture.beginFrame();
@@ -240,6 +300,10 @@ public class LevelRendererMixin {
         // 站着不动举火把时 native 侧整段跳过上传；没有移动光源时零开销。
         // 应急总闸：-Dorion.dynamicLights=0。
         DynamicLightCapture.submitFrame();
+        // 2026-10-24 项 1：可见性图上报。必须在 RT 提交之前 —— native 的
+        // rebuildWorldGeometry 读的是"最近一次上报的集合"，同帧次序无所谓，
+        // 但放在这里能与实体/粒子采集共用同一个帧窗口。
+        rtx$uploadVisibleSections(cameraState);
         VoxyLodManager.perfAdd(VoxyLodManager.PERF_CAPTURE, System.nanoTime() - rtx$t2);
     }
 
@@ -313,9 +377,13 @@ public class LevelRendererMixin {
         // Submit every frame after vanilla has prepared the current animated
         // entity models; device setup is a one-time concern only.
         ParticleRtCapture.endFrame();
-        // Flushes the sign/name-tag text run before the native side consumes
-        // the entity batches.
-        EntityRtCapture.endFrame();
-        NativeVulkan.endEntityFrame();
+        // 2026-10-25：实体帧**不在这里收**。
+        // 手/手持物的 feature 批次要到 GameRenderer.render3dHud → renderItemInHand
+        // 里才 prepareGroup（26.3 顺序：世界 → 手）。在这里调 endEntityFrame 会让手的
+        // 上传撞上原生门禁被丢弃 —— 那就是"手完全不参与光追"的直接原因。
+        // 实体帧的收口在 GameRendererMixin：
+        //   · 手 prepareFrame 之后（同帧、早于 RT 注入的 createRenderPass）；
+        //   · renderLevel RETURN 兜底（第三人称 / 隐藏 HUD / 无手帧）。
+        // 粒子层与实体层是两个独立窗口，粒子的 endFrame 留在这里不变。
     }
 }

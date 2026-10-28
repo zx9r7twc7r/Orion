@@ -1,0 +1,245 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// ============================================================================
+// vol_diag.comp —— 体积 ReSTIR / SH 辐照度缓存的**诊断视图**
+//
+// 目的：回答"体积 ReSTIR 到底有没有生效、SH 缓存里到底有没有数据"。
+// 之前只能靠看画面猜（玻璃背后亮不亮），而 SH 全黑与"没灯"无法区分。
+//
+// 由 ORION_VOL_DIAG=1..4 打开（push.dbgMode = 1 + mode），在 finish 之后
+// 覆盖 rtOutput —— 整屏显示诊断量；关掉时本 pass 不 dispatch。
+//
+//   mode 1：SH 球谐辐照度（shLoadFiltered3D → hanning(0.7) → getIrradiance）
+//           全黑 ⇒ SH 缓存没数据（vol_restir 没跑 / 没注入）
+//   mode 2：体积 radiance（vol_restir_integrate 写的入散射辐亮度）
+//           全黑 ⇒ ReSTIR 没选到灯（灯表空 / reservoir 空）
+//   mode 3：SH 累积 age（越亮 = 历史越稳定；黑 = 每帧重置）
+//   mode 4：reservoir 有效性（绿 = lightIndex 非 0 且 sampleCount 非 0，红 = 空）
+//
+// 复用 glass_alpha_blend 的 descriptor set 与 push constant（同一 layout），
+// 所以 binding 编号与那边一致，多出的 13/14/15 是本 pass 专用。
+// ============================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D sceneColor;
+layout(r32f,    set = 0, binding = 5) uniform image2D sceneDepth;
+
+layout(set = 0, binding = 8) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+// 与 glass_alpha_blend.comp 同编号（同一 set layout）。
+layout(rgba16f, set = 0, binding = 11) uniform readonly image3D volumeShY;
+layout(rgba16f, set = 0, binding = 12) uniform readonly image3D volumeShCoCg;
+
+// 本 pass 专用（blend/finish 不声明它们，布局是超集所以合法）。
+layout(rgba16f, set = 0, binding = 13) uniform readonly image3D volRadianceDebug;
+layout(r8,      set = 0, binding = 14) uniform readonly image3D volAgeDebug;
+layout(rgba32ui, set = 0, binding = 15) uniform readonly uimage3D volReservoirDebug;
+
+layout(push_constant) uniform GlassAlphaBlendPush
+{
+    uint  extentX;
+    uint  extentY;
+    uint  searchIterations;
+    uint  frameIndex;
+    float initialSearchRadius;
+    float radiusExpand;
+    float normalSimilarity;
+    float depthDifference;
+    float planarDifference;
+    float shMaxDistance;
+    float shDepthExponent;
+    float shValid;
+    uint  useNeighborSearch;
+    uint  useRadianceVolume;
+    uint  searchTheSameObject;
+    uint  shareNeighbors;
+    uint  shFroxelW;
+    uint  shFroxelH;
+    uint  shFroxelDepth;
+    uint  dbgMode;                // 1 = blend 诊断；2..5 = 本 pass 的 mode 1..4
+} pc;
+
+#include "spherical_harmonics.glsl"
+
+// reverse-Z 深度 → 相机到该像素几何的距离（与 glass_alpha_blend.comp 同款）。
+float volDiagSceneDistance(vec2 ndc, float depthValue)
+{
+    if(depthValue <= 1.0e-5)
+    {
+        return 0.0;
+    }
+
+    vec4 viewPosition = cam.projInverse * vec4(ndc, depthValue, 1.0);
+
+    if(abs(viewPosition.w) <= 1.0e-6)
+    {
+        return 0.0;
+    }
+
+    return length(viewPosition.xyz / viewPosition.w);
+}
+
+vec3 volDiagPixelWorldDirection(vec2 ndc)
+{
+    vec4 viewPosition = cam.projInverse * vec4(ndc, 1.0, 1.0);
+    vec3 viewDirection = normalize(viewPosition.xyz / max(abs(viewPosition.w), 1.0e-6));
+    return normalize((cam.viewInverse * vec4(viewDirection, 0.0)).xyz);
+}
+
+vec3 volDiagSampleWorldPosition(ivec2 pixel, ivec2 extent)
+{
+    const vec2 uv = (vec2(pixel) + 0.5) / vec2(extent);
+    const vec2 ndc = uv * 2.0 - 1.0;
+    const vec3 worldDirection = volDiagPixelWorldDirection(ndc);
+    const float distance =
+        volDiagSceneDistance(ndc, imageLoad(sceneDepth, pixel).r);
+
+    // 天空/无几何：用最远一层，避免整屏黑掉分不清"没数据"与"没几何"。
+    const float usableDistance =
+        distance > 0.0 ? distance : (pc.shMaxDistance * 0.95);
+
+    return cam.viewInverse[3].xyz + worldDirection * usableDistance;
+}
+
+// 世界 → froxel 坐标（vol_restir_common.glsl 的 volRestirFroxelCenter 的逆）。
+bool volDiagWorldToFroxel(vec3 worldPosition, out vec3 coordinate)
+{
+    coordinate = vec3(0.0);
+
+    if(pc.shFroxelW == 0u || pc.shFroxelH == 0u || pc.shFroxelDepth == 0u)
+    {
+        return false;
+    }
+
+    const mat4 viewMatrix = inverse(cam.viewInverse);
+    const mat4 projMatrix = inverse(cam.projInverse);
+    const vec4 viewPosition = viewMatrix * vec4(worldPosition, 1.0);
+    const vec4 clipPosition = projMatrix * viewPosition;
+
+    if(abs(clipPosition.w) < 1.0e-6)
+    {
+        return false;
+    }
+
+    const vec2 ndc = clipPosition.xy / clipPosition.w;
+    const vec2 uv = ndc * vec2(0.5, -0.5) + 0.5;
+
+    if(any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))))
+    {
+        return false;
+    }
+
+    const float viewZ = -viewPosition.z;
+    const float nearPlane = max(cam.cameraParams.x, 1.0e-3);
+    const float t = clamp((viewZ - nearPlane) / max(pc.shMaxDistance, 1.0), 0.0, 1.0);
+    const float sliceT = pow(t, 1.0 / max(pc.shDepthExponent, 1.0));
+
+    coordinate = vec3(
+        uv * vec2(float(pc.shFroxelW), float(pc.shFroxelH)),
+        sliceT * float(pc.shFroxelDepth));
+
+    return true;
+}
+
+void main()
+{
+    const ivec2 extent = ivec2(int(pc.extentX), int(pc.extentY));
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+
+    if(pixel.x < 0 || pixel.y < 0 || pixel.x >= extent.x || pixel.y >= extent.y)
+    {
+        return;
+    }
+
+    // 色盲友好：黑底 + 先给一个明确的"不可用"红，避免和"数据为 0"混淆。
+    vec3 debugColor = vec3(0.15, 0.0, 0.0);
+
+    const ivec3 froxelSize =
+        ivec3(int(pc.shFroxelW), int(pc.shFroxelH), int(pc.shFroxelDepth));
+    const bool volumeConfigured = all(greaterThan(froxelSize, ivec3(0)));
+
+    if(volumeConfigured)
+    {
+        const vec3 worldPosition = volDiagSampleWorldPosition(pixel, extent);
+        vec3 coordinate;
+
+        if(volDiagWorldToFroxel(worldPosition, coordinate))
+        {
+            const ivec3 clamped = clamp(
+                ivec3(coordinate), ivec3(0), froxelSize - ivec3(1));
+
+            const uint mode = pc.dbgMode >= 2u ? pc.dbgMode - 1u : 1u;
+
+            if(mode == 1u)
+            {
+                // SH 球谐辐照度（消费端的**同一条**路径）。
+                //
+                // ⚠ 这里必须手写三线性：binding 11/12 是 storage image（没有 sampler），
+                //   spherical_harmonics.glsl 的 shLoadFiltered3D 收的是 sampler3D。
+                const vec3 normalized = clamp(
+                    coordinate / vec3(froxelSize), vec3(0.0), vec3(1.0));
+                const vec3 texelPosition =
+                    normalized * (vec3(froxelSize) - vec3(1.0));
+                const ivec3 base = ivec3(floor(texelPosition));
+                const ivec3 upper = min(base + ivec3(1), froxelSize - ivec3(1));
+                const vec3 fraction = texelPosition - vec3(base);
+
+                SphericalHarmonic sh = shCreate();
+
+                for(int dz = 0; dz < 2; ++dz)
+                {
+                    for(int dy = 0; dy < 2; ++dy)
+                    {
+                        for(int dx = 0; dx < 2; ++dx)
+                        {
+                            const ivec3 p = ivec3(
+                                dx == 0 ? base.x : upper.x,
+                                dy == 0 ? base.y : upper.y,
+                                dz == 0 ? base.z : upper.z);
+
+                            const float w =
+                                (dx == 0 ? 1.0 - fraction.x : fraction.x) *
+                                (dy == 0 ? 1.0 - fraction.y : fraction.y) *
+                                (dz == 0 ? 1.0 - fraction.z : fraction.z);
+
+                            sh.shY += imageLoad(volumeShY, p) * w;
+                            sh.cocg += imageLoad(volumeShCoCg, p).xy * w;
+                        }
+                    }
+                }
+
+                shHanningFilter(sh, 0.7);
+                // ×4 只是让低动态范围可见；数值本身没有做任何修改。
+                debugColor = shGetIrradiance(sh) * 4.0;
+            }
+            else if(mode == 2u)
+            {
+                debugColor = imageLoad(volRadianceDebug, clamped).rgb;
+            }
+            else if(mode == 3u)
+            {
+                const float age = imageLoad(volAgeDebug, clamped).r;
+                debugColor = vec3(age);
+            }
+            else
+            {
+                const uvec4 raw = imageLoad(volReservoirDebug, clamped);
+                // 与 vol_restir_common.glsl:66-78 的 packing 对齐：
+                //   x = lightIndex(16b) | flags(2b)<<16 | age(8b)<<18
+                //   w = M（样本数）
+                const uint lightIndex = raw.x & 0xFFFFu;
+                const uint sampleCount = raw.w;
+                debugColor = (lightIndex != 0u && sampleCount != 0u)
+                    ? vec3(0.0, 1.0, 0.0)
+                    : vec3(1.0, 0.0, 0.0);
+            }
+        }
+    }
+
+    imageStore(sceneColor, pixel, vec4(max(debugColor, vec3(0.0)), 1.0));
+}

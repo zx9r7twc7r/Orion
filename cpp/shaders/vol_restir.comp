@@ -1,0 +1,194 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// ===========================================================================
+// vol_restir.comp —— 体积光 froxel + ReSTIR（S2：INITIAL 阶段）
+//
+// 5 个 dispatch 的第 1 个：
+//
+//   initial(RIS) → temporal → spatial → integrate
+//   ^^^^^^^^^^^^^ 本文件      （S3）    （S3）   （S4，未写）
+//
+// 职责：对**每个 restir froxel**（froxel÷4 的粗网格）从本地光网格里抽 32 个
+// 候选、按 权重 = 发光等级 × 距离衰减 × 范围淡出 做加权蓄水池抽样（WRS），
+// 把选中的灯写进 reservoir，供 temporal / spatial 复用。
+//
+// 为什么粗网格：froxel 是 8×8 下采样的屏幕网格 × 64 层，restir 再÷4 ⇒ 22×12×64
+// = 17k 个 reservoir（707×376 时），每帧 32 次抽样 ≈ 0.5M 样本，比沿视线每步
+// NEE 便宜两个量级。integrate 阶段才回到全分辨率 froxel 并沿视线积分。
+//
+// 绑定（set 0）———————————————————————————————————————————————
+//   0  CameraProperties   （camera_ubo.glsl，唯一真源）
+//   12 本地光表           （local_light_grid_common.glsl 声明）
+//   13 空间网格           （同上；与体积云 pass 是同一份 buffer）
+//   14 reservoir 输出     rgba32ui uimage3D，尺寸 = restir 网格 × 64
+//   15 辐亮度输出         rgba16f  image3D，尺寸 = froxel 网格 × 64
+//
+// 12/13 由 local_light_grid_common.glsl 声明为 set 0 —— 那个文件是体积云 pass
+// 的头，binding 号写死在里面。本 pass 沿用同一组编号，宿主在**自己**的描述符
+// 集里把同样的两个 buffer 绑到 12/13，于是"雾里亮的那个火把"与"rgen 里给表面
+// 打光的那个火把"结构上仍是同一盏灯（见该文件头注释的"唯一真源"约定）。
+//
+// 辐亮度输出口径：选中灯的发光色 × 发光等级 × 衰减 × energyScale，
+// **不含相位**（相位依赖视线方向，属于 integrate 阶段）。
+// ===========================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+// binding 12 = 本地光表、binding 13 = 空间网格。
+// 该头同时提供 fogGatherLocalLights() / vptLocalLight*() / decodeLocalLightColor()
+// —— 全部逐行照抄 rt_test.rgen，勿在此处另立一套口径。
+#include "local_light_grid_common.glsl"
+
+#include "vol_restir_common.glsl"
+
+layout(rgba32ui, set = 0, binding = 14) uniform writeonly uimage3D volReservoirOut;
+layout(rgba16f, set = 0, binding = 15) uniform writeonly image3D volRadianceOut;
+
+layout(push_constant) uniform VolRestirPush
+{
+    // x = froxel 宽, y = froxel 高, z = 层数(64), w = restir 下采样比(4)
+    ivec4 froxelSize;
+    // x = 最远距离(格), y = 深度指数, z = 保留（近平面读 cam.cameraParams.x）,
+    // w = 帧种子
+    vec4 volumeParams;
+} pc;
+
+// 单盏灯对某个 froxel 的权重。逐项照抄 local_light_grid_common.glsl 的 VPT 口径
+// （vptLocalLightRangeFade / vptLocalLightDistanceAttenuation /
+// LOCAL_LIGHT_ENERGY_SCALE），不在此另立标定。
+// 放在本文件而非 vol_restir_common.glsl：它依赖只有本 pass 才绑定的灯表头。
+float volRestirLightWeight(
+    vec3 lightPos,
+    float emissionLevel,
+    vec3 froxelCenter,
+    float energyScale)
+{
+    float distanceToLight = length(lightPos - froxelCenter);
+    float rangeFade = vptLocalLightRangeFade(distanceToLight, emissionLevel);
+    float attenuation = vptLocalLightDistanceAttenuation(distanceToLight);
+
+    return max(emissionLevel * rangeFade * attenuation * energyScale, 0.0);
+}
+
+void main()
+{
+    ivec3 restirCoord = ivec3(gl_GlobalInvocationID);
+    ivec3 restirSize = ivec3(imageSize(volReservoirOut));
+
+    if(any(greaterThanEqual(restirCoord, restirSize)))
+    {
+        return;
+    }
+
+    vec2 froxelExtent = vec2(pc.froxelSize.xy);
+    int restirDownscale = max(pc.froxelSize.w, 1);
+
+    vec3 froxelCenter = volRestirFroxelCenter(
+        restirCoord, restirSize, froxelExtent, restirDownscale,
+        pc.volumeParams.x, pc.volumeParams.y);
+
+    // ---- 候选收集（网格邻域，最多 FOG_LIGHT_MAX 盏）----
+    // 用索引版：reservoir 里要存灯的**全局表下标**，候选数组下标只对本 froxel 有效
+    // （见 local_light_grid_common.glsl 里 fogGatherLocalLightsIndexed 的注释）。
+    vec4 candidatePosEmission[FOG_LIGHT_MAX];
+    uint candidateType[FOG_LIGHT_MAX];
+    uint candidateGlobalIndex[FOG_LIGHT_MAX];
+    int candidateCount = fogGatherLocalLightsIndexed(froxelCenter,
+        candidatePosEmission, candidateType, candidateGlobalIndex);
+
+    if(candidateCount == 0)
+    {
+        // 无灯：写空 reservoir（M = 0）。temporal 据此判定"无历史可合并"，
+        // 而不是把上一条管线的残留值当成有效样本。
+        imageStore(volReservoirOut, restirCoord, uvec4(0u, 0u, 0u, 0u));
+        imageStore(volRadianceOut, restirCoord, vec4(0.0));
+        return;
+    }
+
+    float energyScale = LOCAL_LIGHT_ENERGY_SCALE * localLightIntensity();
+
+    float candidateWeight[FOG_LIGHT_MAX];
+    float weightTotal = 0.0;
+
+    for(int i = 0; i < candidateCount; ++i)
+    {
+        candidateWeight[i] = volRestirLightWeight(
+            candidatePosEmission[i].xyz,
+            candidatePosEmission[i].w,
+            froxelCenter,
+            energyScale);
+        weightTotal += candidateWeight[i];
+    }
+
+    if(weightTotal <= 1.0e-6)
+    {
+        imageStore(volReservoirOut, restirCoord, uvec4(0u, 0u, 0u, 0u));
+        imageStore(volRadianceOut, restirCoord, vec4(0.0));
+        return;
+    }
+
+    // ---- 加权蓄水池抽样（RIS）----
+    uint randomState = volRestirSeed(restirCoord,
+        cam.frameCount + uint(pc.volumeParams.w));
+
+    int selectedIndex = 0;
+    float sampleWeightSum = 0.0;
+
+    for(int sampleIndex = 0; sampleIndex < VOL_RESTIR_SAMPLE_COUNT; ++sampleIndex)
+    {
+        float pick = volRestirRand(randomState) * weightTotal;
+        int pickedIndex = candidateCount - 1;
+        float runningSum = 0.0;
+
+        for(int i = 0; i < candidateCount; ++i)
+        {
+            runningSum += candidateWeight[i];
+            if(pick <= runningSum)
+            {
+                pickedIndex = i;
+                break;
+            }
+        }
+
+        // 单样本估计量 f(y)/p̂(选它)。此处 p̂ 即候选权重归一化后的分布，
+        // 因此累加"被抽中者自身的权重"就是标准 RIS 的 M 平均口径。
+        sampleWeightSum += candidateWeight[pickedIndex];
+
+        if(volRestirRand(randomState) * sampleWeightSum <=
+            candidateWeight[pickedIndex])
+        {
+            selectedIndex = pickedIndex;
+        }
+    }
+
+    VolReservoir reservoir;
+    // 存全局灯表下标（+1，0 留给太阳），不是候选序号。
+    reservoir.lightIndex =
+        candidateGlobalIndex[selectedIndex] + VOL_RESTIR_LIGHT_INDEX_BIAS;
+    reservoir.flags = 0u;
+    reservoir.age = 0u;
+    reservoir.weightSum = sampleWeightSum;
+    reservoir.weight = sampleWeightSum / float(VOL_RESTIR_SAMPLE_COUNT);
+    reservoir.sampleCount = uint(VOL_RESTIR_SAMPLE_COUNT);
+
+    imageStore(volReservoirOut, restirCoord, volRestirPack(reservoir));
+
+    // ---- 辐亮度（供 integrate 直接乘）----
+    vec4 selectedPosEmission = candidatePosEmission[selectedIndex];
+    uint selectedType = candidateType[selectedIndex];
+    float selectedAttenuation =
+        vptLocalLightDistanceAttenuation(length(selectedPosEmission.xyz - froxelCenter)) *
+        vptLocalLightRangeFade(length(selectedPosEmission.xyz - froxelCenter),
+            selectedPosEmission.w);
+
+    vec3 radiance = decodeLocalLightColor(selectedType) *
+        selectedPosEmission.w * selectedAttenuation * energyScale;
+
+    imageStore(volRadianceOut, restirCoord, vec4(radiance, 1.0));
+}

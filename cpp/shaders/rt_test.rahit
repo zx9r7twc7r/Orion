@@ -11,12 +11,32 @@
 // the raygen-family shaders.
 #extension GL_GOOGLE_include_directive : require
 #define GLASS_TINT_NO_DDA 1
+
+// =====================================================
+// 2026-10-26（第四轮，严格搬 RTX Remix）
+// AlphaBlendSurface 的每像素状态由**命中着色器**读写（原文在
+// geometry_resolver.slangh:2196-2199 做 load -> update -> store），
+// 三张图的通道分配见 glass_chain_common.glsl 顶部。
+// =====================================================
+layout(binding = 73, set = 0, rgba16f)
+uniform image2D glassAlphaBlendGbufferImage;
+
+layout(binding = 74, set = 0, rgba16f)
+uniform image2D glassAlphaBlendMetaImage;
+
+layout(binding = 75, set = 0, rgba16f)
+uniform image2D glassAlphaBlendLightImage;
+
 #include "glass_tint_common.glsl"
 // LOD / 远场几何的角色表与每柱覆盖位图（binding 19/20）。
 #include "lod_coverage.glsl"
 
 // 2026-10-20: 结构体单源化，见 hit_payload.glsl（六个 shader 共用同一份布局）。
 #include "hit_payload.glsl"
+// 2026-10-25：透射事件与 main 共用同一套物理薄片数学 + 同一套链契约。
+#include "glass_dielectric_common.glsl"
+#include "glass_thinwall_common.glsl"
+#include "glass_chain_common.glsl"
 
 layout(location = 0) rayPayloadInEXT HitPayload payload;
 
@@ -25,10 +45,43 @@ const uint RT_PURPOSE_CLASSIFY          = 1u;
 const uint RT_PURPOSE_PASSTHROUGH      = 4u;
 const uint RT_PURPOSE_GLASS_VISIBILITY = 5u;
 const uint RT_PURPOSE_PRIMARY_SKY       = 7u;
+// 2026-10-25 阶段 D：主射线透射段（单条射线 + any-hit 逐面累乘）。
+const uint RT_PURPOSE_PRIMARY_TRANSMISSION = 8u;
 
 uint getRayPurpose(uint state)
 {
     return state & RT_STATE_PURPOSE_MASK;
+}
+
+// 2026-10-28：主透射链身份位（bit 18）。
+// 病灶：RT_PURPOSE_PRIMARY_TRANSMISSION = 8 超出 3 位 purpose 掩码
+// （RT_STATE_PURPOSE_MASK = 0x7u）⇒ makeTraceState 后被掩成 RT_PURPOSE_FULL，
+// 本文件里所有 `== RT_PURPOSE_PRIMARY_TRANSMISSION` 恒假（2026-10-25 起的死代码）。
+// 回退：-DORION_GLASS_CHAIN_BIT=0。
+#ifndef ORION_GLASS_CHAIN_BIT
+#define ORION_GLASS_CHAIN_BIT 1
+#endif
+const uint RT_STATE_PRIMARY_TRANSMISSION_BIT = 1u << 18u;
+
+bool isPrimaryTransmissionRay(uint state)
+{
+#if ORION_GLASS_CHAIN_BIT
+    return (state & RT_STATE_PRIMARY_TRANSMISSION_BIT) != 0u;
+#else
+    return getRayPurpose(state) == RT_PURPOSE_PRIMARY_TRANSMISSION;
+#endif
+}
+
+// 2026-10-28：主透射链只吞**真正的玻璃面**（顶点材质 2.0..2.5）。
+//
+// 不能复用 glassChainIsTranslucentMaterial()：那个函数是给 rgen 的
+// getLegacyMaterialId()（3.0/4.0 = RT_HIT_TRANSLUCENT）写的，范围 2.0..4.5；
+// 而两个 any-hit 读的是**顶点材质号**，同一范围会把 LOD 水（2.5..3.5）和
+// LOD 树叶（3.5..4.5）也当成玻璃层忽略掉 ⇒ 隔着玻璃看远处水面/树冠会直接
+// 穿到后面的东西。这段此前是死代码（purpose 溢出），修好 bit 后才生效。
+bool isGlassPaneVertexMaterial(float materialId)
+{
+    return materialId >= 2.0 && materialId < 2.5;
 }
 
 hitAttributeEXT vec2 attribs;
@@ -713,8 +766,7 @@ void main() {
     }
     if(
     transparentPassthrough &&
-    materialId >= 2.0 &&
-    materialId < 2.5
+    glassChainIsTranslucentMaterial(materialId)
 )
 {
     ignoreIntersectionEXT;
@@ -731,6 +783,226 @@ void main() {
     // We accumulate RGB transmittance in payload.albedo.
     // Opaque geometry is still accepted and terminates normally.
     // =====================================================
+
+    // =====================================================
+    // 2026-10-25 阶段 D：主射线透射的"单条射线 + 逐面累乘"
+    //
+    // 参考 dxvk-remix geometry_resolver.slangh:3169-3213 —— 玻璃在遍历里被消耗，
+    // 第一个不透明面才是接收面。这样穿几层玻璃，下游都只有**一个**接收面、
+    // 一套 guide/历史，递归路径里"第二/三层共用第一层历史键"造成的固定形状噪点
+    // 就不存在了。
+    //
+    // 相机打到的**第一片**不在这里乘（由 main 的 glassTransmission 负责）。
+    // 开关：-DORION_GLASS_SINGLE_PASS=0 ⇒ 本分支不参与编译（回递归旧档）。
+    // =====================================================
+#ifndef ORION_GLASS_SINGLE_PASS
+#define ORION_GLASS_SINGLE_PASS 1
+#endif
+#if ORION_GLASS_SINGLE_PASS
+    if(isPrimaryTransmissionRay(payload.state) &&
+       isGlassPaneVertexMaterial(materialId))
+    {
+        vec3 pos0 = vec3(v0.x, v0.y, v0.z);
+        vec3 pos1 = vec3(v1.x, v1.y, v1.z);
+        vec3 pos2 = vec3(v2.x, v2.y, v2.z);
+        vec3 geometricNormal = normalize(cross(pos1 - pos0, pos2 - pos0));
+
+        vec3 paneTint = vptSaturateGlassTransmission(
+            clamp(glassPaneTransmissionColor(atlasSample.rgb, vertexColor.rgb),
+                  vec3(0.0), vec3(1.0)));
+
+        float paneCos = clamp(abs(dot(geometricNormal, gl_WorldRayDirectionEXT)), 0.0, 1.0);
+
+        // 与 main 侧同一分工：glassSheetTransmissionScalarF 给能量（含薄片菲涅耳
+        // 与染料浓度），色相由 paneTint 归一化承担 ⇒ 灰玻璃退化为纯标量、彩玻保留颜色。
+        // 与 main 侧**同一个**函数：真实板厚 + Snell 折射角 + 薄片几何级数。
+        // 之前这里用的是 glassSheetTransmissionScalarF（固定 1 格厚），与 main 的
+        // 物理模型口径不一致 —— 现在两边共用 glassChainEventThroughput()。
+        const vec3 chainHitPos =
+            gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
+
+        const uint chainProfileRaw =
+            getTransparentProfileFromRawMaterialId(materialId);
+
+        vec3 paneTransmission = glassChainEventThroughput(
+            paneTint,
+            glassSlabThicknessFromFace(chainHitPos, geometricNormal),
+            geometricNormal,
+            gl_WorldRayDirectionEXT,
+            glassIorForProfile(int(chainProfileRaw)));
+
+#if VPT_GLASS_ALPHA_BLEND
+        // 2026-10-26 对齐 RTX Remix：alpha blend 口径，与 main 侧同一公式。
+        // 注意不用 vptSaturateGlassTransmission 的 ×3 饱和增强 —— 那是给"薄壁染料
+        // 当滤光片"用的，alpha blend 要的是原色。
+        // 与 main 侧同源：texture x vertex 的 alpha（Remix-MC BlockTextureManager.java:64）。
+        // 2026-10-27：玻璃族的源 alpha 上限。
+        // 贴图边框 texel 的 alpha = 1.0，掠射时边框铺满整个面 ⇒ 侧面"实心"。
+        // 主体（alpha 0.4）不受影响，只有接近不透明的 texel 被压下来。
+#ifndef GLASS_ALPHA_BLEND_MAX_ALPHA
+#define GLASS_ALPHA_BLEND_MAX_ALPHA 0.3
+#endif
+        // 2026-10-27：玻璃族用固定 alpha（贴图 alpha 只作颜色）。
+        // 不再取 atlasSample.a —— 边框 texel 是 1.0，侧面整块落在边框上 ⇒ 实心。
+        // 致密体（遮光玻璃等）仍按 profile 抬高不透明度。
+        const float chainAlpha = max(
+            GLASS_FIXED_ALPHA,
+            1.0 - clamp(getTransparentProfileTransmissionAnyHit(chainProfileRaw),
+                        0.0, 1.0));
+#if VPT_GLASS_ALPHA_BLEND_DEFERRED_COMPOSITE
+        // =====================================================
+        // 2026-10-28：**清玻璃必须当空气跳过**。
+        //
+        // 主命中侧的清玻璃走 rgen 的 clearGlassAsAir 分支 —— 那里用
+        // mix(背景, 贴图×光, 贴图 alpha) 就地合成，**不写** 73/74 图。
+        // 但同一块玻璃的出射面会走到这里：一旦被记成一层，宿主清过的
+        // 74.y 就变成 hitT > 0，glass_alpha_finish 会把已经 mix 过的
+        // rtOutput 再合成一次（rtOutput*bgT + 表面项）⇒ 同一块玻璃一半
+        // 像素透、一半像素发实（差在"这条视线的链里有没有第二片清玻璃面"）。
+        //
+        // 判据与 rchit 的 RT_STATE_CLEAR_GLASS_BIT 同源
+        // （materialId < 2.05 && 顶点色是原版灰面明暗 ⇒ 没注入染料）。
+        // 回退：-DORION_GLASS_CLEAR_PANE_SKIP=0。
+        // =====================================================
+#ifndef ORION_GLASS_CLEAR_PANE_SKIP
+#define ORION_GLASS_CLEAR_PANE_SKIP 1
+#endif
+#if ORION_GLASS_CLEAR_PANE_SKIP
+        if(materialId < 2.05 &&
+           glassVertexFactorIsFaceShade(vertexColor.rgb))
+        {
+            // 仍然消耗一格预算：清玻璃当空气，但不能让一条射线在
+            // "玻璃墙"里无限穿下去（性能与栈深）。
+            payload.glassFaceBudget = payload.glassFaceBudget + 1.0;
+            if(payload.glassFaceBudget >= float(ORION_GLASS_CHAIN_MAX_FACES))
+            {
+                return;
+            }
+            ignoreIntersectionEXT;
+            return;
+        }
+#endif
+
+        // =====================================================
+        // 2026-10-26（第四轮，严格搬 RTX Remix）
+        //
+        // ① 两档 opacity 早退（algorithm/resolve.slangh:471-524）
+        //    opacity >= resolveOpaquenessThreshold  ⇒ 当不透明，不记录；
+        //    opacity <= resolveTransparencyThreshold ⇒ 当全透，不记录、直接穿。
+        // ② 中间档：每个相遇面都是**一层候选**，走同一个 update()。
+        //    原文没有"一个体只算一次"的概念 —— 那是本引擎旧口径
+        //    （glassChainAcceptEntry），已在这里停用。
+        // ③ bgT < 1/255 ⇒ 不再继续穿透（geometry_resolver.slangh:2201-2204）。
+        // =====================================================
+        if(chainAlpha <= GLASS_ALPHA_BLEND_TRANSPARENCY_THRESHOLD)
+        {
+            ignoreIntersectionEXT;
+            return;
+        }
+
+        if(chainAlpha >= GLASS_ALPHA_BLEND_OPAQUENESS_THRESHOLD)
+        {
+            // 不记录、不 ignore ⇒ 作为遮挡终止（原文 resolveVertexFinalHit）。
+            return;
+        }
+
+        const vec3 chainPaneAlbedo =
+            glassPaneTransmissionColor(atlasSample.rgb, vertexColor.rgb);
+
+        // 面预算照旧推进：这套口径下 transmittanceAccum 不再变化，
+        // 终止只能靠 bgT 与预算两条，所以预算必须每层加一（防无限穿透）。
+#if VPT_GLASS_ALPHA_BLEND_SINGLE_LAYER
+        // 2026-10-27：整条链只记录**最近的一层**。
+        // 背景透射率保持 1-a（而非 Π(1-a)），异色玻璃也不会混成第三种颜色。
+        // 用户实测："不同颜色的彩色玻璃是实的，只有同色才透" —— 那句现象就是
+        // Π(1-a) + 随机选层在异色下的必然结果。
+        // 2026-10-28 修：唯一槽位必须留给**最近**的那一层 = 相机主命中面
+        // （rgen 在 trace 返回之后写入）。any-hit 命中的永远是"第二近"的面，
+        // 让它先占槽位等于把最近层挤掉，最近层只能靠随后那次 update 的抽签
+        // （p = a ≈ 0.3）抢回来 ⇒ 逐像素在"近面/远面"之间随机，表现为同一块
+        // 玻璃有的地方透、有的地方实，且逐帧闪。
+        const bool acceptLayer = false;
+#else
+        const bool acceptLayer = true;
+#endif
+
+        payload.glassFaceBudget = payload.glassFaceBudget + 1.0;
+
+        if(!acceptLayer)
+        {
+            // 后续玻璃仍然穿透（不记录、不累乘 bgT）。
+            ignoreIntersectionEXT;
+            return;
+        }
+
+        const float chainBackgroundTransparency =
+            glassAlphaBlendSurfaceUpdate(
+                ivec2(gl_LaunchIDEXT.xy),
+                vec4(chainPaneAlbedo / max(chainAlpha, 1.0e-3), chainAlpha),
+                geometricNormal,
+                gl_HitTEXT,
+                float(gl_InstanceCustomIndexEXT & 0x7fffu));
+
+        if(chainBackgroundTransparency <
+           GLASS_ALPHA_BLEND_MIN_BACKGROUND_TRANSPARENCY)
+        {
+            return;
+        }
+#elif VPT_GLASS_ALPHA_BLEND_SURFACE_RADIANCE
+        // 加性口径（旧档，A/B 保留）
+        bool chainAcceptLayer;
+#if VPT_GLASS_ALPHA_BLEND_PAIR_FACES
+        chainAcceptLayer = true;
+        payload.glassFaceBudget = payload.glassFaceBudget + 1.0;
+#else
+        chainAcceptLayer = glassChainAcceptEntry(payload, gl_HitTEXT);
+#endif
+        if(chainAcceptLayer)
+        {
+            vec3 chainTransmission;
+            vec3 chainSurfaceWeight;
+            glassAlphaBlendLayerTerms(
+                glassPaneTransmissionColor(atlasSample.rgb, vertexColor.rgb),
+                chainAlpha,
+                chainTransmission,
+                chainSurfaceWeight);
+            payload.glassSurfaceWeightAccum +=
+                payload.transmittanceAccum * chainSurfaceWeight;
+            payload.transmittanceAccum *= chainTransmission;
+        }
+#else
+        paneTransmission = glassAlphaBlendTransmission(
+            glassPaneTransmissionColor(atlasSample.rgb, vertexColor.rgb),
+            chainAlpha);
+
+        // 一个半透明体只乘一次（进入面）。介质状态推进也在契约里。
+        if(glassChainAcceptEntry(payload, gl_HitTEXT))
+        {
+            payload.transmittanceAccum *= paneTransmission;
+        }
+#endif
+#else
+        // 一个半透明体只乘一次（进入面）。介质状态推进也在契约里。
+        if(glassChainAcceptEntry(payload, gl_HitTEXT))
+        {
+            payload.transmittanceAccum *=
+                paneTransmission *
+                getTransparentProfileTransmissionAnyHit(chainProfileRaw);
+        }
+#endif
+
+        // 终止判据唯一一处（累积透射 / 面预算）。
+        if(glassChainShouldAbort(
+               payload.transmittanceAccum,
+               payload.glassFaceBudget))
+        {
+            return;
+        }
+
+        ignoreIntersectionEXT;
+        return;
+    }
+#endif
 
     bool glassVisibilityOnly =
         getRayPurpose(payload.state) == RT_PURPOSE_GLASS_VISIBILITY;
@@ -783,6 +1055,46 @@ if(
         // glass block its first accepted face is the real light-exit face;
         // only that face receives the Orion boundary sheet, so one
         // block contributes exactly one filter.
+        #ifndef ORION_GLASS_MEDIUM_STATE
+        // 2026-10-25 阶段 C 总闸（默认 1）。置 0 = 逐位回到面序奇偶旧档。
+        #define ORION_GLASS_MEDIUM_STATE 1
+        #endif
+        #if ORION_GLASS_MEDIUM_STATE
+        // =====================================================
+        // 介质状态机（替换面序奇偶）
+        //
+        // 参考 dxvk-remix：concept/surface_material/translucent_surface_material_
+        // interaction.slangh:542 的 inout bool insideMedium —— 进入界面时乘一次整片
+        // 薄片滤波并置位，出射界面不再乘。
+        //
+        // 与旧奇偶的差别（这是接缝亮线的根）：
+        //   奇偶模型里 Minecraft 裁掉半透明体贴不透明方块的那一面 => 该体只贡献 1 个
+        //   面 => 从这点起整条射线下游全部翻转 => 下游丢一次 filter => 亮线。
+        //   状态机里同一件事只会让状态多留一格：下一个被接受面若距进入面 > 1.5 格，
+        //   判为「上一块的出射面被裁」，按新进入处理并重新乘一次 filter，下游不再受影响。
+        //
+        // 预算是面数口径：每进入一次记 2 面（进+出），与旧档
+        // GI_GLASS_VISIBILITY_MAX_FACES = 16 面 = 8 层逐值同义。
+        // =====================================================
+        const bool glassWasInside = payload.glassInside > 0.5;
+        const bool glassRegionBreak =
+            payload.glassEntryT >= 0.0 &&
+            gl_HitTEXT - payload.glassEntryT > 1.5;
+        const bool isLightExitFace = !glassWasInside || glassRegionBreak;
+
+        if(isLightExitFace)
+        {
+            payload.glassInside = 1.0;
+            payload.glassEntryT = gl_HitTEXT;
+            payload.glassFaceBudget = payload.glassFaceBudget + 2.0;
+        }
+        else
+        {
+            payload.glassInside = 0.0;
+        }
+
+        payload.lastGlassFaceT = gl_HitTEXT;
+        #else
         uint glassFaceOrdinal =
             uint(
                 max(
@@ -830,6 +1142,7 @@ if(
             float(glassFaceOrdinal + 1u);
         payload.glassFaceBudget =
             payload.glassFaceBudget + 1.0;
+        #endif
 
 
         if(isLightExitFace)

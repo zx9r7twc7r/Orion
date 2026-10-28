@@ -280,6 +280,8 @@ bool isVoxyEmissive = !isDhLod && voxyLodMarker < -1.5;
         payload.normal = normalize(fixedNormal);
         payload.albedo = voxyAlbedo;
         payload.glassAlpha = isVoxyGlass ? clamp(interpColor.a, 0.06, 0.72) : 1.0;
+        // 同步 alpha blend 源 alpha（voxy 玻璃也会进玻璃透射分支）。
+        payload.glassBlendAlpha = payload.glassAlpha;
         // LOD 水是**稀疏代理边界**，不拥有闭合介质 —— 用水的界面着色
         // （低粗糙度 + 介质 IOR），但**不声明介质进出**（RT_WATER_NONE 而非
         // AIR_TO_WATER / WATER_TO_AIR）。参考注释原文："把细交接环当体积会让它
@@ -468,6 +470,8 @@ bool isVoxyEmissive = !isDhLod && voxyLodMarker < -1.5;
         payload.normal = normalize(fixedNormal);
         payload.albedo = voxyAlbedo;
         payload.glassAlpha = isVoxyGlass ? clamp(interpColor.a, 0.06, 0.72) : 1.0;
+        // 同步 alpha blend 源 alpha（voxy 玻璃也会进玻璃透射分支）。
+        payload.glassBlendAlpha = payload.glassAlpha;
         // LOD 水是**稀疏代理边界**，不拥有闭合介质 —— 用水的界面着色
         // （低粗糙度 + 介质 IOR），但**不声明介质进出**（RT_WATER_NONE 而非
         // AIR_TO_WATER / WATER_TO_AIR）。参考注释原文："把细交接环当体积会让它
@@ -861,7 +865,34 @@ const bool isFlatGlassWindow =
     isGlassSurface &&
     (glassVertexFlags & 16) != 0;
 
+// =====================================================
+// 2026-10-28：玻璃**默认不做 POM 位移**
+//
+// 现象：除正对面外的所有玻璃面都有"固定形状的块状噪点"，正对面干净。
+//
+// 机理（逐条可查）：
+//   · traceParallax 的 UV 偏移
+//       (viewDirTS.xy / stableViewZ) * spriteSpan * pomDepthScale * grazingFade
+//     只在 viewZ < 0.10 时才衰减（POM_GRAZING_MIN_Z 0.04 / FULL_Z 0.10）。
+//     玻璃的邻面 viewZ 在 0.1~0.5 ⇒ 仍是**全强度**：viewZ=0.2 时
+//     |xy/viewZ| ≈ 4.9，乘 spriteSpan 与 pomDepthScale 就是半个 sprite 宽。
+//   · 高度场是 texelFetch 的**单纹素**（sampleLabPBRDepthInSprite），
+//     越界立刻 break、保留"最后一个有效 texel"（isPOMSpriteUVInBounds）。
+//     ⇒ 相邻像素停在不同 texel 上，块大小 = 一个 texel 的屏幕投影，
+//        而且完全确定性 ⇒ 逐帧不闪的固定图案。
+//   · 正对面 viewDirTS.xy ≈ 0 ⇒ 偏移 ≈ 0 ⇒ 不 march ⇒ 干净。
+//
+// 所以这不是"噪声"，是 POM 在玻璃上的越界切块。
+// 玻璃表面的浮雕信息由法线贴图继续提供（正常采样，不受本开关影响）。
+//
+// ORION_GLASS_POM=1 恢复浮雕（此时走下面的掠射角衰减缓解越界）。
+// =====================================================
+#ifndef ORION_GLASS_POM
+#define ORION_GLASS_POM 0
+#endif
+
 bool isPOMEligibleMaterial =
+    ORION_GLASS_POM != 0 &&
     isGlassSurface &&
     !isFlatGlassWindow;
 
@@ -887,6 +918,47 @@ if(
 
     texCoord =
         parallaxHit.uv;
+
+    // =====================================================
+    // 2026-10-28：POM 掠射角衰减（只在 ORION_GLASS_POM=1 时生效）
+    //
+    // 越界块的根因是偏移量随 1/viewZ 爆炸。这里按 |N·V| 把 UV 与三个深度量
+    // 连续插值回"平贴图"，让掠射面不再有硬 break。正视区（> 0.55）恒 1
+    // ⇒ 浮雕保留原样。
+    //
+    // ⚠ 不动共享的 traceParallax：它同时服务不透明体（石头/木头浮雕），
+    //   那里掠射强视差是对的，全局削平是错的。
+    // =====================================================
+#ifndef ORION_GLASS_POM_GRAZING_FADE
+#define ORION_GLASS_POM_GRAZING_FADE 1
+#endif
+#ifndef ORION_GLASS_POM_GRAZING_FADE_LO
+#define ORION_GLASS_POM_GRAZING_FADE_LO 0.15
+#endif
+#ifndef ORION_GLASS_POM_GRAZING_FADE_HI
+#define ORION_GLASS_POM_GRAZING_FADE_HI 0.55
+#endif
+
+#if ORION_GLASS_POM_GRAZING_FADE
+    {
+        const float glassPomFacing =
+            clamp(abs(dot(normalize(geoNormal), normalize(rayDirection))), 0.0, 1.0);
+        const float glassPomStrength =
+            smoothstep(
+                ORION_GLASS_POM_GRAZING_FADE_LO,
+                ORION_GLASS_POM_GRAZING_FADE_HI,
+                glassPomFacing);
+
+        if(glassPomStrength < 1.0)
+        {
+            texCoord =
+                mix(basePbrTexCoord, parallaxHit.uv, glassPomStrength);
+            parallaxHit.depth01 *= glassPomStrength;
+            parallaxHit.depthWorld *= glassPomStrength;
+            parallaxHit.rayTravelWorld *= glassPomStrength;
+        }
+    }
+#endif
 }
 
 
@@ -1523,17 +1595,26 @@ payload.pomMicroOcclusion =
 // 这里先只取精灵 alpha 做对照：
 //   · 玻璃立刻清晰、连接纹理回来 ⇒ 断点确认是"乘了顶点色 alpha"，再按语义定最终口径；
 //   · 没有变化 ⇒ 断点在 POM/UV 那一侧，本行改回 albedoColor.a 即可（逐位回到原状）。
+// 2026-10-26：a 的权威来源是 albedoColor.a = 贴图 texel alpha x 顶点色 alpha，
+// 与 Remix-MC 的 ATLAS_TRANSLUCENT_BLEND = textureTimesVertexColor() 逐字一致
+// （_ref/rtx-remix-minecraft/.../texture/BlockTextureManager.java:64）。
+// 旧写法只取 atlasSpriteSample.a，漏了顶点色 alpha。
 payload.glassAlpha =
     (
         materialId > 1.5 &&
         materialId < 2.5
     )
         ? clamp(
-            atlasSpriteSample.a,
+            albedoColor.a,
             0.0,
             1.0
         )
         : 1.0;
+
+// alpha blend 的源 alpha：无条件 texture x vertex（见 hit_payload.glsl 的说明）。
+// 实测染色玻璃贴图 alpha = 102/255 = 0.400；这里不再受顶点 materialId 判定影响。
+payload.glassBlendAlpha =
+    clamp(albedoColor.a, 0.0, 1.0);
 
 payload.normal =
     normalize(fixedNormal);

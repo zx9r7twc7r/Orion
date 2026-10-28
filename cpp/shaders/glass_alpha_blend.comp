@@ -1,0 +1,619 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// ============================================================================
+// glass_alpha_blend.comp —— 半透明 alpha blend 的屏幕空间取光 pass
+//
+// 2026-10-26 第四轮：**严格照搬** dxvk-remix
+//   _ref/dxvk-remix/src/dxvk/shaders/rtx/pass/composite/composite_alpha_blend.comp.slang
+// 不再有自创的取光模型：本文件的结构、判据、权重、输出都与原文一一对应，
+// 差别只在"原文有而我们没有的输入"上，逐项标注在下面。
+//
+// ---------------------------------------------------------------------------
+// 原文流程（行号均为 composite_alpha_blend.comp.slang）
+//   :106  surface = AlphaBlendSurface.createFromPacked(AlphaBlendGBuffer[pixel])
+//   :110  if (surface.isValid())                     // hitT > 0
+//   :118  radius = cb.stochasticAlphaBlendInitialSearchRadius
+//   :146  for (i < cb.stochasticAlphaBlendSearchIteration)
+//   :187    if (!isMiss && (isCoplanar || isDepthSimilar) && isNormalSimilar && isSameGeometry)
+//   :160/:204  未命中/不相似 ⇒ radius *= cb.stochasticAlphaBlendRadiusExpandFactor
+//   :213/:238  未找到时用蓝噪声在 radius 内重新定位邻居
+//   :230  stochasticAlphaBlendShareNeighbors ⇒ 组内共享已找到的邻居
+//   :253  found ⇒ surfaceLight = calculateNeighborLight(...)
+//   :259  !found && UseRadianceVolume ⇒ 体积辐照度兜底
+//   :273  AlphaBlendRadiance = surfaceLight * surface.color.a
+// 合成式在 composite.comp.slang:812（由 glass_alpha_finish.comp 执行）
+//   out = radianceOutput * backgroundAlpha + alphaBlendOutput
+//
+// ---------------------------------------------------------------------------
+// 我们从 raygen/any-hit 拿到的 AlphaBlendSurface（见 glass_chain_common.glsl）：
+//   binding 1 : color.rgba  = (albedo/opacity, opacity)   ← 原文 surface.color
+//   binding 2 : (bgT, hitT, normalOct.x, normalOct.y)     ← backgroundTransparency/hitT/normal
+//   binding 3 : (randomThreshold, geometryHash, emissive) ← randomThreshold/geometryHash/hasEmissive
+//
+// 原文输入 → 本引擎等价物（**这是唯一允许的偏差**，逐条注明理由）：
+//   PrimaryLinearViewZ
+//       → binding 5 sceneDepth（reverse-Z）+ 相机 projInverse 反算长度。
+//         与 god_ray_composite.comp 的 sceneDistanceForDepth 同一手法。
+//   PrimaryVirtualWorldNormalPerceptualRoughness
+//       → binding 6 sceneNormalRoughness（RR guide，虚拟世界法线 + 粗糙度）。
+//   PrimaryDirectDiffuseRadianceHitDistance[neighbor]（已解调）
+//       → binding 0 sceneColor[neighbor] / max(binding 7 albedo[neighbor], 0.05)。
+//         本引擎没有分离的 direct-diffuse 缓冲，用"辐射 / 漫反射 albedo"现解调。
+//   PrimaryDirectSpecularRadianceHitDistance（原文 :67-73 的高光项）
+//       → **缺失**：本引擎没有分离的高光辐射缓冲，该项暂不计入（标注，非自创）。
+//   CompactedPixelIndices / TileActiveCounts（sparse rendering）
+//       → 本引擎不跑 sparse ⇒ 恒活跃、坐标即像素（原文关闭 sparse 时同样如此）。
+//   getNextSampleBlueNoise
+//       → 整数哈希等价物（标注）。
+// ============================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D sceneColor;
+layout(rgba16f, set = 0, binding = 1) uniform image2D alphaBlendGbuffer;
+layout(rgba16f, set = 0, binding = 2) uniform image2D alphaBlendMeta;
+layout(rgba16f, set = 0, binding = 3) uniform image2D alphaBlendAux;
+layout(rgba16f, set = 0, binding = 4) uniform image2D alphaBlendRadiance;
+layout(r32f,    set = 0, binding = 5) uniform image2D sceneDepth;
+layout(rgba16f, set = 0, binding = 6) uniform image2D sceneNormalRoughness;
+layout(rgba16f, set = 0, binding = 7) uniform image2D sceneDiffuseAlbedo;
+
+
+// =====================================================
+// 2026-10-27：Remix 的**时空蓝噪声**（严格搬）
+//
+// 原文 utility/noise.slangh:161-249
+//   #define RNG_SEED_FRAME_RANGE 64
+//   struct RNG { uvec2 pixelIdx; uint seed; uint temporalIdx; };
+//   float getNextSampleBlueNoise(inout RNG rng)
+//   { const uint oldSeed = rng.seed++;
+//     uvec2 seedOffset = uvec2(R2(oldSeed) * uvec2(128, 128));
+//     float value = texelFetch(BlueNoise, ivec3((rng.pixelIdx.x + seedOffset.x) & 127,
+//                                               (rng.pixelIdx.y + seedOffset.y) & 127,
+//                                               (rng.temporalIdx) & (RNG_SEED_FRAME_RANGE - 1)), 0).r;
+//     return min(value, 1.0f - 1.0f / 255.0f); }
+//   vec2 R2(uint index) { const float g = 1.32471795724474602596f;      // :149-157
+//                         return fract(vec2(float(index) / g, float(index) / (g * g))); }
+//
+// 数据：_ref/dxvk-remix/src/util/util_blueNoise_128x128x64.h（MIT），
+// 已原样导出为 shaders/blue_noise_128x128x64.r8 并由宿主上传为 storage buffer。
+// texelFetch 本就是 NEAREST 取单个 texel ⇒ 这里按字节索引与它逐位等价。
+// =====================================================
+layout(binding = 9, set = 0, std430) readonly buffer GlassBlueNoiseBuffer
+{
+    uint words[64u * 128u * 128u / 4u];
+} glassBlueNoise;
+
+vec2 glassBlueNoiseR2(uint index)
+{
+    const float g = 1.32471795724474602596;
+    return fract(vec2(float(index) / g, float(index) / (g * g)));
+}
+
+float glassBlueNoiseSample(uvec2 pixelIdx, uint temporalIdx, uint seedIndex)
+{
+    const uvec2 seedOffset = uvec2(glassBlueNoiseR2(seedIndex) * vec2(128.0));
+    const uint x = (pixelIdx.x + seedOffset.x) & 127u;
+    const uint y = (pixelIdx.y + seedOffset.y) & 127u;
+    const uint layer = temporalIdx & 63u;
+    const uint byteIndex = 16384u * layer + 128u * y + x;
+    const uint word = glassBlueNoise.words[byteIndex >> 2u];
+    const uint raw = (word >> ((byteIndex & 3u) * 8u)) & 0xFFu;
+    return min(float(raw) * (1.0 / 255.0), 1.0 - 1.0 / 255.0);
+}
+
+layout(rgba16f, set = 0, binding = 10) uniform image2D alphaBlendVolume;
+
+// 2026-10-27：SH 辐照度缓存（Remix AccumulatedRadianceY / CoCg，froxel 网格）。
+layout(rgba16f, set = 0, binding = 11) uniform readonly image3D volumeShY;
+layout(rgba16f, set = 0, binding = 12) uniform readonly image3D volumeShCoCg;
+
+layout(set = 0, binding = 8) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+// 必须与 VulkanCore.cpp 的 GlassAlphaBlendPush 逐字节一致（64 B）。
+// 语义按原文 composite_args.h:88-100 命名。
+layout(push_constant) uniform GlassAlphaBlendPush
+{
+    uint  extentX;
+    uint  extentY;
+    uint  searchIterations;       // cb.stochasticAlphaBlendSearchIteration        (6)
+    uint  frameIndex;
+    float initialSearchRadius;    // cb.stochasticAlphaBlendInitialSearchRadius    (10.0)
+    float radiusExpand;           // cb.stochasticAlphaBlendRadiusExpandFactor     (1.6)
+    float normalSimilarity;       // cb.stochasticAlphaBlendNormalSimilarity       (0.9)
+    float depthDifference;        // cb.stochasticAlphaBlendDepthDifference        (0.1)
+    float planarDifference;       // cb.stochasticAlphaBlendPlanarDifference       (0.2)
+    // 2026-10-27：原 unused0/1/2 三个 lane 改作 SH 辐照度缓存参数
+    // （原文的 FilteredRadiance 就是 AccumulatedRadiance，没有独立的 5x5 滤波）。
+    float shMaxDistance;          // VOL_RESTIR_MAX_DISTANCE
+    float shDepthExponent;        // VOL_RESTIR_DEPTH_EXPONENT
+    float shValid;                // 1 = SH 缓存可用
+    uint  useNeighborSearch;      // cb.stochasticAlphaBlendUseNeighborSearch      (true)
+    uint  useRadianceVolume;      // cb.stochasticAlphaBlendUseRadianceVolume      (true)
+    uint  searchTheSameObject;    // cb.stochasticAlphaBlendSearchTheSameObject    (true)
+    uint  shareNeighbors;         // cb.stochasticAlphaBlendShareNeighbors         (true)
+    uint  shFroxelW;
+    uint  shFroxelH;
+    uint  shFroxelDepth;
+    uint  dbgMode;                // 1 = 输出诊断色（R=bgT G=alpha B=层数/8）
+} pc;
+
+const float GLASS_ALPHA_BLEND_TAU = 6.28318530718;
+const float GLASS_ALPHA_BLEND_NO_GEOMETRY_DISTANCE = 1.0e30;
+const float GLASS_ALPHA_BLEND_ALBEDO_FLOOR = 0.05;
+const vec3  GLASS_ALPHA_BLEND_LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+// 与共享头同一份 octahedral 解码（原文 sphereDirectionToSnorm2x16 的逆）。
+vec3 glassAlphaBlendDecodeNormal(vec2 encoded)
+{
+    vec3 v = vec3(encoded.x, encoded.y, 1.0 - abs(encoded.x) - abs(encoded.y));
+    const float t = clamp(-v.z, 0.0, 1.0);
+    v.xy += vec2(v.x >= 0.0 ? -t : t, v.y >= 0.0 ? -t : t);
+    return normalize(v);
+}
+
+uint glassAlphaBlendHash(uint state)
+{
+    state ^= state >> 16u;
+    state *= 0x7FEB352Du;
+    state ^= state >> 15u;
+    state *= 0x846CA68Bu;
+    state ^= state >> 16u;
+    return state;
+}
+
+float glassAlphaBlendRandom(inout uint state)
+{
+    state = glassAlphaBlendHash(state + 0x9E3779B9u);
+    return float(state & 0x00FFFFFFu) * (1.0 / 16777216.0);
+}
+
+bool glassAlphaBlendInside(ivec2 pixel, ivec2 extent)
+{
+    return pixel.x >= 0 && pixel.y >= 0 &&
+           pixel.x < extent.x && pixel.y < extent.y;
+}
+
+// 对应原文 cameraReconstructViewPosition + cameraPixelCoordinateToDirection：
+// 由 reverse-Z 深度还原"相机到该像素几何的距离"。
+float glassAlphaBlendSceneDistance(vec2 ndc, float depthValue)
+{
+    if(depthValue <= 1.0e-5)
+    {
+        return GLASS_ALPHA_BLEND_NO_GEOMETRY_DISTANCE;
+    }
+
+    vec4 sceneViewPosition = cam.projInverse * vec4(ndc, depthValue, 1.0);
+    if(abs(sceneViewPosition.w) <= 1.0e-6)
+    {
+        return GLASS_ALPHA_BLEND_NO_GEOMETRY_DISTANCE;
+    }
+
+    return length(sceneViewPosition.xyz / sceneViewPosition.w);
+}
+
+vec3 glassAlphaBlendPixelWorldDirection(vec2 ndc)
+{
+    vec4 viewPosition = cam.projInverse * vec4(ndc, 1.0, 1.0);
+    vec3 viewDirection = normalize(viewPosition.xyz / max(abs(viewPosition.w), 1.0e-6));
+    return normalize((cam.viewInverse * vec4(viewDirection, 0.0)).xyz);
+}
+
+// 原文 calculateNeighborLight():50-84。
+//   diffuseLight = PrimaryDirectDiffuseRadianceHitDistance[neighbor] * surface.color
+//   specularLight 见原文 :67-73（本引擎缺该缓冲，未计入）
+// 我们返回的是「邻像素的解调光照」，由调用方再乘 surface.color（与原文等价，
+// 因为本引擎的解调分母就是邻像素的 diffuse albedo）。
+vec3 glassAlphaBlendNeighborLight(ivec2 neighbor)
+{
+    vec3 radiance = max(imageLoad(sceneColor, neighbor).rgb, vec3(0.0));
+    vec3 albedo = clamp(imageLoad(sceneDiffuseAlbedo, neighbor).rgb, vec3(0.0), vec3(1.0));
+
+    // albedo 不可信（天空 / guide 未写）：邻居本身就是光源，直出辐射。
+    // 原文此时邻居是 miss，会被 !isMiss 拒掉，轮不到这里 —— 属于兜底。
+    if(dot(albedo, GLASS_ALPHA_BLEND_LUMA) < GLASS_ALPHA_BLEND_ALBEDO_FLOOR)
+    {
+        return radiance;
+    }
+    return radiance / max(albedo, vec3(GLASS_ALPHA_BLEND_ALBEDO_FLOOR));
+}
+
+#include "spherical_harmonics.glsl"
+
+// ============================================================================
+// 2026-10-27：radiance volume 的 SH 球谐查询（**照抄** Remix 消费端）
+//
+// 原文 volume_lighting.slangh:357-366
+//   SphericalHarmonic sh = loadFiltered3D(volumeFilteredRadianceY, ...CoCg, uvw);
+//   sh.hanningFilter(0.7f);
+//   return sh.getIrradiance();
+// SH 数学全部来自 spherical_harmonics.glsl（该文件已单测）。
+// 三线性在这里手写 8 tap：SH 图是 storage image，没有 sampler。
+// ============================================================================
+vec3 glassAlphaBlendSampleVolumeSh(vec3 worldPosition)
+{
+    if(pc.shValid < 0.5 || pc.shFroxelW == 0u || pc.shFroxelH == 0u || pc.shFroxelDepth == 0u)
+    {
+        return vec3(0.0);
+    }
+
+    // 世界 -> froxel：vol_restir_common.glsl 的 volRestirFroxelCenter 的逆。
+    const mat4 viewMatrix = inverse(cam.viewInverse);
+    const mat4 projMatrix = inverse(cam.projInverse);
+    const vec4 viewPosition = viewMatrix * vec4(worldPosition, 1.0);
+    const vec4 clipPosition = projMatrix * viewPosition;
+
+    if(abs(clipPosition.w) < 1.0e-6)
+    {
+        return vec3(0.0);
+    }
+
+    const vec2 ndc = clipPosition.xy / clipPosition.w;
+    // 与 volRestirWorldDirection 的 `ndc.y = -ndc.y` 同口径。
+    const vec2 uv = ndc * vec2(0.5, -0.5) + 0.5;
+
+    if(any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))))
+    {
+        return vec3(0.0);
+    }
+
+    const float viewZ = -viewPosition.z;
+    const float nearPlane = max(cam.cameraParams.x, 1.0e-3);
+    const float t = clamp((viewZ - nearPlane) / max(pc.shMaxDistance, 1.0), 0.0, 1.0);
+    // volRestirSliceViewZ() = near + pow(sliceT, exponent) * maxDistance 的逆。
+    const float sliceT = pow(t, 1.0 / max(pc.shDepthExponent, 1.0));
+
+    const ivec3 size = ivec3(int(pc.shFroxelW), int(pc.shFroxelH), int(pc.shFroxelDepth));
+    const vec3 coordinate = vec3(uv * vec2(size.xy), sliceT * float(size.z));
+
+    const vec3 clamped = clamp(coordinate, vec3(0.0), vec3(size - ivec3(1)));
+    const ivec3 base = ivec3(floor(clamped));
+    const ivec3 upper = min(base + ivec3(1), size - ivec3(1));
+    const vec3 fraction = clamped - vec3(base);
+
+    SphericalHarmonic sh = shCreate();
+
+    for(int dz = 0; dz < 2; ++dz)
+    {
+        for(int dy = 0; dy < 2; ++dy)
+        {
+            for(int dx = 0; dx < 2; ++dx)
+            {
+                const ivec3 p = ivec3(
+                    dx == 0 ? base.x : upper.x,
+                    dy == 0 ? base.y : upper.y,
+                    dz == 0 ? base.z : upper.z);
+
+                const float w =
+                    (dx == 0 ? 1.0 - fraction.x : fraction.x) *
+                    (dy == 0 ? 1.0 - fraction.y : fraction.y) *
+                    (dz == 0 ? 1.0 - fraction.z : fraction.z);
+
+                sh.shY += imageLoad(volumeShY, p) * w;
+                sh.cocg += imageLoad(volumeShCoCg, p).xy * w;
+            }
+        }
+    }
+
+    // 原文 :358
+    shHanningFilter(sh, 0.7);
+
+    return shGetIrradiance(sh);
+}
+
+void main()
+{
+    const ivec2 extent = ivec2(int(pc.extentX), int(pc.extentY));
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if(!glassAlphaBlendInside(pixel, extent))
+    {
+        return;
+    }
+
+    const vec4 surface = imageLoad(alphaBlendGbuffer, pixel);
+    const vec4 meta = imageLoad(alphaBlendMeta, pixel);
+
+    // 原文 :110  if (surface.isValid())   —— isValid() == hitT > 0（:95-98）
+    if(meta.y <= 0.0)
+    {
+        // 诊断：这些像素**根本没有 alpha blend 数据** —— 说明该玻璃面没有走
+        // 这条链（多半是 rgen 的 hitIsOpaqueGlass 把它当成了不透明表面做完整
+        // 着色，或者它压根不是玻璃）。涂洋红，与"混合了但过亮"直接区分开。
+        if(pc.dbgMode == 1u)
+        {
+            imageStore(alphaBlendRadiance, pixel, vec4(1.0, 0.0, 1.0, 1.0));
+        }
+        return;
+    }
+
+    // 诊断：把三个决定性量直接写成颜色，由 finish 原样输出。
+    //   R = backgroundTransparency（背景还剩多少）
+    //   G = 选中层的 alpha（1.0 = 被 setOpaque 锁定过）
+    //   B = 候选层数 / 8
+    // 模式 6：只输出透射背景（surface 项归零）。用来区分"层数吃光 bgT"
+    // 与"surface 项过亮"这两条完全不同的原因。
+    // 模式 9：完全旁路 alpha blend —— surface 项归零，bgT 由 finish 当作 1。
+    // 玻璃若因此变透，说明它确实走本 pass；若仍实心，说明它不是本 pass 画的。
+    if(pc.dbgMode == 9u)
+    {
+        imageStore(alphaBlendRadiance, pixel, vec4(0.0));
+        return;
+    }
+
+    // 模式 6：把 backgroundTransparency 直接显示成灰度。
+    //   1 层(a=0.4) => 0.60 中灰   2 层 => 0.36 深灰   3 层 => 0.216 更暗
+    // 一眼看出每个面的层数，且完全不受取光影响。
+    if(pc.dbgMode == 6u)
+    {
+        imageStore(
+            alphaBlendRadiance,
+            pixel,
+            vec4(vec3(clamp(meta.x, 0.0, 1.0)), 1.0));
+        return;
+    }
+
+    if(pc.dbgMode == 1u)
+    {
+        const float layerCount = imageLoad(alphaBlendAux, pixel).w;
+        imageStore(
+            alphaBlendRadiance,
+            pixel,
+            vec4(clamp(meta.x, 0.0, 1.0),
+                 clamp(surface.a, 0.0, 1.0),
+                 clamp(layerCount / 8.0, 0.0, 1.0),
+                 1.0));
+        return;
+    }
+
+    const vec3 paneNormal = glassAlphaBlendDecodeNormal(meta.zw);
+    const vec3 cameraPosition = cam.viewInverse[3].xyz;
+
+    const vec2 uv = (vec2(pixel) + 0.5) / vec2(extent);
+    const vec2 ndc = uv * 2.0 - 1.0;
+    const vec3 worldDirection = glassAlphaBlendPixelWorldDirection(ndc);
+    const vec3 surfacePosition = cameraPosition + worldDirection * meta.y;
+
+    vec3 surfaceLight = vec3(0.0);
+
+#ifndef VPT_GLASS_ALPHA_BLEND_DIRECT_SURFACE_LIGHT
+// 2026-10-28：表面项是否只用接收面的**确定性直接光照**（见下方长注释）。
+// 置 0 = 逐位回到"本像素辐射 / 接收面 albedo"（会出现 POM 形状的颗粒）。
+#define VPT_GLASS_ALPHA_BLEND_DIRECT_SURFACE_LIGHT 1
+#endif
+
+#if VPT_GLASS_ALPHA_BLEND_DIRECT_SURFACE_LIGHT
+    // =====================================================
+    // 表面项 = 玻璃后面那个接收面的**解析直接光照**
+    //
+    // 数据源：binding 10（alphaBlendVolume）。rgen 在每个玻璃像素上写
+    //   evaluateVPTExactFaceDirectLighting(receiverWorldPos, receiverNormal, 1)
+    // —— 体素面缓存的直接光照，**不含任何 1spp 采样** ⇒ 零方差。
+    //
+    // 为什么不能用"本像素辐射 / 接收面 albedo"（旧路径）：
+    //   邻居搜索的 iteration 0 命中的邻居就是像素自己，于是
+    //       surfaceLight = sceneColor / max(sceneDiffuseAlbedo, 0.05)
+    //   sceneColor 是接收面的**全辐射**（直接 + GI + VLI，单样本），
+    //   sceneDiffuseAlbedo 是同一接收面的 albedo。多层玻璃后面基本都在阴影里，
+    //   深色接收面把这份方差放大到 1/0.05 = 20 倍，再乘玻璃自己的 albedo/alpha
+    //   叠回表面 ⇒ 颗粒的分布被玻璃贴图的浮雕图案调制，呈"POM 形状"。
+    //   层数越多、接收面越暗，放大越狠 —— 这就是"第三层才开始有颗粒"。
+    //
+    // 量纲：E / π 就是朗伯面的出射辐亮度，与 Remix 的
+    //   PrimaryDirectDiffuseRadianceHitDistance（已解调的直射光）同量纲，
+    //   见 composite_alpha_blend.comp.slang:50-84。
+    //
+    // 亮度：沿用下面 SH 分支的等比缩放，表面项恒 ≤ 背景，背景永远占主导。
+    // =====================================================
+    {
+        const vec4 directVolume = imageLoad(alphaBlendVolume, pixel);
+
+        if(directVolume.a > 0.0)
+        {
+            const vec3 directLight =
+                max(directVolume.rgb, vec3(0.0)) * (1.0 / 3.14159265359);
+            const vec3 backgroundRadiance =
+                max(imageLoad(sceneColor, pixel).rgb, vec3(0.0));
+            const float backgroundLuma =
+                dot(backgroundRadiance, GLASS_ALPHA_BLEND_LUMA);
+            const float directLuma =
+                dot(directLight, GLASS_ALPHA_BLEND_LUMA);
+
+            // prob 11：跳过"按背景亮度等比缩放"这一步。
+            // 那次缩放乘的是**本像素 1spp 背景辐射的 luma**，本身带方差；
+            // 若噪点因此消失，说明根因是这一步而不是体素面缓存。
+            surfaceLight = (pc.dbgMode == 11u ||
+                            !(directLuma > backgroundLuma && directLuma > 0.0))
+                ? directLight
+                : directLight * (backgroundLuma / directLuma);
+        }
+    }
+#else
+    if(pc.useNeighborSearch != 0u)
+    {
+        // 原文 :213 / :238 用的是 getNextSampleBlueNoise(randomState)，
+        // randomState = createRNG(pixel, frameIdx, 4)（:114），seed 初值
+        // = frameIdx / 64 + 4（noise.slangh:177）。每次取样自增 1。
+        uint blueNoiseSampleIndex = pc.frameIndex / 64u + 4u;
+
+        ivec2 neighborPixel = pixel;
+        float radius = pc.initialSearchRadius;
+        bool found = false;
+
+        // 原文 :130-140 的 sparse 感知搜索预算：本引擎不跑 sparse ⇒ 直接用原值。
+        for(uint iteration = 0u; iteration < pc.searchIterations; ++iteration)
+        {
+            if(!found)
+            {
+                const float neighborDepth = imageLoad(sceneDepth, neighborPixel).r;
+                const vec2 neighborUv = (vec2(neighborPixel) + 0.5) / vec2(extent);
+                const vec2 neighborNdc = neighborUv * 2.0 - 1.0;
+
+                // 原文 :165-170
+                const float neighborDistance =
+                    glassAlphaBlendSceneDistance(neighborNdc, neighborDepth);
+                const vec3 neighborNormal = glassAlphaBlendDecodeNormal(
+                    imageLoad(alphaBlendMeta, neighborPixel).zw);
+                const vec3 neighborWorldDirection =
+                    glassAlphaBlendPixelWorldDirection(neighborNdc);
+                const vec3 neighborPosition =
+                    cameraPosition + neighborWorldDirection * neighborDistance;
+
+                // 原文 :171-177
+                const float depthDiff = abs(neighborDistance - meta.y);
+                const vec3 positionDiff = neighborPosition - surfacePosition;
+                const bool isMiss = neighborDepth <= 1.0e-5;
+
+                const bool isCoplanar =
+                    abs(dot(normalize(positionDiff), paneNormal)) < pc.planarDifference &&
+                    depthDiff < meta.y * 0.2;
+                const bool isDepthSimilar =
+                    length(positionDiff) < pc.depthDifference;
+                const bool isNormalSimilar =
+                    dot(neighborNormal, paneNormal) > pc.normalSimilarity;
+
+                bool isSameGeometry = true;
+                if(pc.searchTheSameObject != 0u && iteration != 0u)
+                {
+                    // 原文 :181-185：只在 i != 0 时比较对象哈希。
+                    // 任一方的哈希未知（0 = raygen 第一层尚未携带对象哈希，
+                    // 与原文"i == 0 不判"同构）时放行，否则按哈希是否相等判。
+                    const float centerHash = imageLoad(alphaBlendAux, pixel).y;
+                    const float neighborHash = imageLoad(alphaBlendAux, neighborPixel).y;
+                    isSameGeometry =
+                        (centerHash < 0.5 || neighborHash < 0.5) ||
+                        (abs(centerHash - neighborHash) < 0.5);
+                }
+
+                // 原文 :187
+                if(!isMiss && (isCoplanar || isDepthSimilar) &&
+                   isNormalSimilar && isSameGeometry)
+                {
+                    found = true;
+                }
+                else
+                {
+                    // 原文 :160 / :204：**失败时**才放大半径。
+                    radius *= pc.radiusExpand;
+                }
+            }
+
+            if(!found)
+            {
+                // 原文 :213 / :238：蓝噪声偏移在 radius 内重新定位邻居。
+                const vec2 offset = vec2(
+                    glassBlueNoiseSample(uvec2(pixel), pc.frameIndex, blueNoiseSampleIndex++),
+                    glassBlueNoiseSample(uvec2(pixel), pc.frameIndex, blueNoiseSampleIndex++)) * 2.0 - 1.0;
+                neighborPixel = ivec2(
+                    clamp(vec2(pixel) + offset * radius,
+                          vec2(0.0), vec2(extent - 1)));
+                radius = clamp(radius, 2.0, 200.0);
+            }
+        }
+
+        if(found)
+        {
+            // 原文 :253-255
+            surfaceLight = glassAlphaBlendNeighborLight(neighborPixel);
+        }
+    }
+
+    if(dot(surfaceLight, surfaceLight) <= 0.0 && pc.useRadianceVolume != 0u)
+    {
+        // 原文 :259-267：stochasticAlphaBlendUseRadianceVolume 分支
+        //   surfaceLight = evalVolumetricNEE(...) * surface.color * multiplier
+        // 数据源：binding 10 = 体素面辐照度缓存换算出的 volumeRadiance
+        // （rt_vpt_irradiance.comp 的 16^3 x 6 block-face direct irradiance，
+        //  由 rgen 在玻璃像素上写入；量纲与 Remix 的 volumeRadiance 同义）。
+        // ① 原文路径：SH 辐照度缓存（Remix 的 radiance volume）。
+        const vec3 shLight = glassAlphaBlendSampleVolumeSh(surfacePosition);
+        const vec3 backgroundRadiance = max(imageLoad(sceneColor, pixel).rgb, vec3(0.0));
+        const vec3 backgroundAlbedo = clamp(
+            imageLoad(sceneDiffuseAlbedo, pixel).rgb, vec3(0.0), vec3(1.0));
+        const bool backgroundUsable =
+            dot(backgroundAlbedo, GLASS_ALPHA_BLEND_LUMA) >= GLASS_ALPHA_BLEND_ALBEDO_FLOOR;
+
+        if(dot(shLight, shLight) > 0.0)
+        {
+            // ② **radiance volume（SH 辐照度缓存）—— Remix 的原文兜底**。
+            //
+            // 原文 composite_alpha_blend.comp.slang:259-267：
+            //   surfaceLight = evalVolumetricNEE(VolumeFilteredRadianceY,
+            //                                    VolumeFilteredRadianceCoCg, ...);
+            // 内部 loadFiltered3D → hanningFilter(0.7) → getIrradiance()，
+            // 已在 glassAlphaBlendSampleVolumeSh 里逐行照搬。
+            //
+            // ⚠ 唯一的量级偏差（必须知道）：原文的 volume radiance 来自 evalNEE，
+            //   无雾场景里接近 0，所以表面项几乎为 0、玻璃自然透。我们的
+            //   vol_restir_integrate 给的是"灯附近的散射辐亮度"
+            //   （color × emission × attenuation × rangeFade × energyScale × phase），
+            //   可达背景亮度的 5~20 倍；shGetIrradiance() 又是 0.282 × 累积辐射。
+            //   直接使用会把 0.4 × albedo × (20×背景) 叠在 0.6 × 背景 上 ⇒ 实心。
+            //
+            //   这里保留 SH 的**色度与方向**（等比缩放），只把亮度压到背景以内：
+            //   表面项恒 ≤ 0.4 × 背景，背景永远占主导。
+            const float backgroundLuma = dot(backgroundRadiance, GLASS_ALPHA_BLEND_LUMA);
+            const float volumeLuma = dot(shLight, GLASS_ALPHA_BLEND_LUMA);
+
+            surfaceLight = (volumeLuma > backgroundLuma && volumeLuma > 0.0)
+                ? shLight * (backgroundLuma / volumeLuma)
+                : shLight;
+        }
+        else if(backgroundUsable)
+        {
+            // ③ SH 无数据时（体积 ReSTIR 被显式关掉）退到本像素背景辐射量。
+            surfaceLight = backgroundRadiance;
+        }
+        else
+        {
+            // ④ 最后一级：体素面辐照度，乘 1/π 归到辐射量纲。
+            const vec4 volume = imageLoad(alphaBlendVolume, pixel);
+            surfaceLight = volume.a > 0.0
+                ? max(volume.rgb, vec3(0.0)) * (1.0 / 3.14159265359)
+                : backgroundRadiance;
+        }
+    }
+#endif // VPT_GLASS_ALPHA_BLEND_DIRECT_SURFACE_LIGHT
+
+    // =====================================================
+    // 2026-10-28：半透明噪点的**逐项排查档**（ORION_GLASS_ALPHA_BLEND_DBG）
+    //
+    // 每一档只换**一个**输入源，用来把"玻璃面上的颗粒"归到具体一项上。
+    // dbgMode = 0（默认）时下面的分支全部不进，行为与改动前逐位相同。
+    //
+    //   10 = 表面项归零，正常合成（out = 背景 × bgT）
+    //        → 噪点仍在 ⇒ 不在表面项，而在透射背景项 / bgT 本身
+    //        → 噪点消失 ⇒ 就在表面项（继续试 11/12）
+    //   11 = 表面项 = 原始体素面直射光（不按背景亮度重标定）
+    //   12 = 表面项 = 常量 1（画面只剩 背景×bgT + albedo×a，
+    //        不含任何光照方差 ⇒ 剩下的颗粒只可能来自 bgT/albedo 的逐帧抖动）
+    //   13 = 表面项 = 本像素背景辐射（旧路径，1spp，对照用）
+    //
+    // 判读要配 finish：finish 对 dbgMode 1..6 走诊断色分支，10..13 不匹配
+    // ⇒ 仍走正常合成式，画面不会被诊断色替换。
+    // =====================================================
+    if(pc.dbgMode == 10u)
+    {
+        imageStore(alphaBlendRadiance, pixel, vec4(0.0));
+        return;
+    }
+    if(pc.dbgMode == 12u)
+    {
+        surfaceLight = vec3(1.0);
+    }
+    else if(pc.dbgMode == 13u)
+    {
+        surfaceLight = max(imageLoad(sceneColor, pixel).rgb, vec3(0.0));
+    }
+
+    // 原文 :273  AlphaBlendRadiance = surfaceLight * surface.color.a
+    // 原文 surface.color 已是解调 albedo（getAlphaBlendSurface():117-123），
+    // 所以这里再乘 surface.a 才等于 albedo × opacity。
+    const vec3 alphaBlendColor =
+        max(surface.rgb, vec3(0.0)) * surface.a * surfaceLight;
+
+    imageStore(alphaBlendRadiance, pixel, vec4(max(alphaBlendColor, vec3(0.0)), 1.0));
+}

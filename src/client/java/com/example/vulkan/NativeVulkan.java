@@ -193,6 +193,29 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
     public static native boolean getPOMSharp();
 
     /**
+     * 2026-10-25 近场 GI 采样率：0 = 全速 / 1 = 半速 / 2 = 四分之一。
+     *
+     * <p>跳过的是 GI **信号**（独立随机位 + 权重补偿的无偏时间估计量），像素仍然
+     * 每帧全写 ⇒ 不引入几何锯齿。代价是 GI 方差随档位放大（半速约 1.4×、
+     * 四分之一约 2× 幅度），由 DLSS-RR 的时间累积抹平。会话内生效，不写配置。
+     */
+    public static native boolean setGiNearRate(
+            int level
+    );
+
+    public static native int getGiNearRate();
+
+    /**
+     * 2026-10-25 光泽反射按粗糙度降速：roughness ≥ 0.30 半速、≥ 0.65 四分之一，
+     * 光滑面保持全速。与距离级合成同一个级别，权重只乘一次。
+     */
+    public static native boolean setGlossyRoughLod(
+            boolean enabled
+    );
+
+    public static native boolean getGlossyRoughLod();
+
+    /**
      * 2026-10-22 UE 风格体积云的八项参数（设置界面滑条）。
      *
      * <p>索引与 CameraUBO 的 {@code ueCloudA}（偏移 1536）/ {@code ueCloudB}
@@ -354,6 +377,42 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
 
     public static native int getGiRoulette();
 
+    // =====================================================
+    // 2026-10-26 直接光模式 + 稀疏渲染（CameraUBO.sparseParams 尾追加 lane）。
+    // 两者都是运行时原子量 ⇒ 设置界面 Apply 下一帧生效，无新 spv 变体。
+    // =====================================================
+
+    /** 直接光模式：0 = 传统 RIS（出厂）/ 1 = RTXDI 式时域 reservoir。 */
+    public static native boolean setDirectLightMode(
+            int mode
+    );
+
+    public static native int getDirectLightMode();
+
+    /**
+     * 2026-10-28 间接光模式：0 = GI（出厂）/ 1 = SHaRC。
+     * ⚠ SHaRC 的缓冲与 RT 管线在 initDeviceHandlesNative() 里创建，
+     * 所以本调用必须发生在它**之前**（见 initDeviceHandles 的 SER/AE 那一批），
+     * 运行期改值只会写原子量，需重启客户端才真正生效。
+     */
+    public static native boolean setIndirectMode(
+            int mode
+    );
+
+    public static native int getIndirectMode();
+
+    /** 稀疏渲染采样率 %：0 = 关（出厂）/ 100 = 全采样（白噪声逐像素抽签）。 */
+    public static native boolean setSparseRatePercent(
+            int percent
+    );
+
+    public static native int getSparseRatePercent();
+
+    /** 非活跃像素仍更新直接光 reservoir（官方 enableRtxdiReuseForInactivePixels）。 */
+    public static native boolean setRtdiReuseInactive(
+            int enabled
+    );
+
     /**
      * 2026-10-09 运动矢量（DLSS-RR）**调试视图**：0 = 关（出厂）/ 1 = 幅值热图 /
      * 2 = 有向色。
@@ -460,6 +519,15 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
     // phi_fwd 多重散射漫射场 + MS 残量尾巴（2026-10-02）：4 个 lane 一次下发，
     // 见 RTXSettingsConfig.CloudMsSettings.toParamArray() 与
     // CameraUBO.cloudMsParams。
+    /**
+     * 2026-10-25 v5（HPVolumeCloud 移植）的 28 项全参数，一次下发。
+     * 顺序必须与 RTXSettingsConfig.CLOUD_HP_LABELS / CameraUBO.hpShapeA..hpMiscA 一致。
+     */
+    public static native boolean setCloudHpParams(float[] params);
+
+    /** 读回原生侧当前生效的 28 项（调试 / UI 同步用），长度不足 28 返回 false。 */
+    public static native boolean getCloudHpParams(float[] out);
+
     public static native boolean setCloudMsParams(float[] params);
 
     /**
@@ -627,6 +695,24 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
      * 长度不足的旧数组按"该 lane 保持默认"处理，两侧可以各自独立部署。
      */
     public static native boolean setPostProcessingParams(float[] params);
+
+    /**
+     * 2026-10-26 **色彩分级**（设置页「色彩映射与调色」）24 个 lane，顺序与
+     * {@link com.example.client.config.RTXSettingsConfig#COLOR_GRADE_LABELS} 一致：
+     * 手动曝光 / 黑点 / 白点 / 显示对比 / 对比支点 / Lift RGB / Gamma RGB /
+     * Gain RGB / 阴影色相+强度 / 高光色相+强度 / 自然饱和度 / 褪色 /
+     * 暗角强度+半径 / 色相旋转 / 绿品红。
+     *
+     * <p>作用点是 rr_sdr_post.comp 里 tonemap + gamma + 饱和度**之后**的显示域；
+     * 全部中性值时着色器整块跳过 ⇒ 没调过的人画面逐位不变。</p>
+     *
+     * <p>走独立入口而不是塞进 {@code setPostProcessingParams}：那个数组已经到
+     * 12 个 lane，再加 24 个会让"改一个旋钮要同时改 C++ / Java / JNI 签名"。</p>
+     *
+     * @return 长度不是 24、或含非有限值时为 false（native 侧逐项钳制到
+     *         RTXSettingsConfig.COLOR_GRADE_RANGES 的同一区间）。
+     */
+    public static native boolean setColorGradeParams(float[] params);
 
     /**
      * 2026-10-03 RR guide 设置（rr_guide_relax.comp 的两个职责）。
@@ -1195,6 +1281,16 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
 // type: 0 = Albedo (基础色), 1 = Normal (法线), 2 = Specular (高光/粗糙度)
     public static native void setInWorld(boolean inWorld);
 
+    // =====================================================
+    // 2026-10-24 项 1：把原版可见性图的 Section 集合推给 native，
+    // 用于 TLAS 主射线掩码剔除（只清 mask 的 bit0，实例保留给次级射线）。
+    //
+    // coords = [x0,y0,z0, x1,y1,z1, ...]，Section 坐标（不是方块坐标）。
+    // count <= 0 表示本帧没有可见性数据，native 侧会自动关闭剔除。
+    // 调用点见 LevelRendererMixin.rtx$uploadVisibleSections。
+    // =====================================================
+    public static native void setVisibleSections(int[] coords, int count);
+
     static {
         try {
             final Path gameDir =
@@ -1311,7 +1407,8 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
                 settings.waterReflectionInterval(),
                 settings.glossyFullDistance(),
                 settings.dynamicRtasInterval(),
-                settings.rtSpp()
+                settings.rtSpp(),
+                settings.volumetricRestir()
         );
     }
 
@@ -1325,7 +1422,8 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
             int waterReflectionInterval,
             int glossyFullDistance,
             int dynamicRtasInterval,
-            float rtSpp
+            float rtSpp,
+            int volumetricRestir
     );
 
     private NativeVulkan() {}
@@ -1555,6 +1653,18 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
         setAutoExposureCompensationNative(
                 RTXSettingsConfig.getAutoExposureCompensation()
         );
+
+        // 2026-10-28 间接光模式：**必须**在 initDeviceHandlesNative() 之前下发 ——
+        // SHaRC 的四块缓冲（176MB）与第二条 RT 管线是在 native init 里按它创建的。
+        // 若挪到 directLightMode 那一批（init 之后）就会永远读不到 1，模式永不生效。
+        final String indirectModeEnv =
+                System.getenv("ORION_INDIRECT_MODE");
+        if((indirectModeEnv == null || indirectModeEnv.isEmpty())
+                && !setIndirectMode(
+                        RTXSettingsConfig.getIndirectMode()
+                )) {
+            System.err.println("[RTX CONFIG] Failed to restore indirect mode");
+        }
 
 
         initDeviceHandlesNative(
@@ -1907,6 +2017,26 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
         )) {
             System.err.println("[RTX CONFIG] Failed to restore sun march far distance");
         }
+        // 2026-10-26 直接光模式 / 稀疏渲染（CameraUBO.sparseParams 尾块）。
+        // env 非空时**不下发**配置值：native 的三级解析是「UI 覆盖 → env → 出厂」，
+        // 这里若无条件下发，启动恢复会永远压住 ORION_* 实验入口（IDE 运行配置里
+        // 设了也白设）。在界面上点应用才算一次显式覆盖。
+        final String directLightModeEnv =
+                System.getenv("ORION_DIRECT_LIGHT_MODE");
+        if((directLightModeEnv == null || directLightModeEnv.isEmpty())
+                && !setDirectLightMode(
+                        RTXSettingsConfig.getDirectLightMode()
+                )) {
+            System.err.println("[RTX CONFIG] Failed to restore direct light mode");
+        }
+        final String sparseRateEnv =
+                System.getenv("ORION_SPARSE_RATE");
+        if((sparseRateEnv == null || sparseRateEnv.isEmpty())
+                && !setSparseRatePercent(
+                        RTXSettingsConfig.getSparseRatePercent()
+                )) {
+            System.err.println("[RTX CONFIG] Failed to restore sparse rate percent");
+        }
         // 2026-10-09 运动矢量调试视图 / 总开关（写 perfAblationStage 的 .y/.z；
         // 这两格当时是保留 lane，现在已有读者 —— 见 camera_ubo.glsl 声明注释）。
         if(!setMotionDebugView(
@@ -1991,6 +2121,12 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
                 RTXSettingsConfig.getPostGainB() })) {
             System.err.println("[RTX CONFIG] Failed to restore post processing params");
         }
+        // 2026-10-26 色彩分级 24 项（「色彩映射与调色」页）。与后处理参数分开下发，
+        // 因为它走的是独立的 push lane（PostProcessingPush 的 lane 8..31）。
+        if(!setColorGradeParams(
+                RTXSettingsConfig.getColorGradeSettings().toParamArray())) {
+            System.err.println("[RTX CONFIG] Failed to restore color grade params");
+        }
         // 2026-10-03 远云 guide 补写：0 = 关闭（回到"远处云也走 RR 的错误 guide"）。
         if(!setRrGuideSettings(
                 true,
@@ -2008,6 +2144,9 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
         RTXSettingsConfig.CloudMsSettings cloudMs = RTXSettingsConfig.getCloudMsSettings();
         if(!setCloudMsParams(cloudMs.toParamArray()))
             System.err.println("[RTX CONFIG] Failed to restore cloud ms settings");
+        RTXSettingsConfig.CloudHpSettings cloudHp = RTXSettingsConfig.getCloudHpSettings();
+        if(!setCloudHpParams(cloudHp.toParamArray()))
+            System.err.println("[RTX CONFIG] Failed to restore cloud hp settings");
         RTXSettingsConfig.PlaneCloudSettings planeCloud =
                 RTXSettingsConfig.getPlaneCloudSettings();
         if(!setPlaneCloudParams(planeCloud.toParamArray()))

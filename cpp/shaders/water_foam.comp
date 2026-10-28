@@ -1,0 +1,191 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// ===========================================================================
+// 2026-10-26 持久泡沫图（路线 B，Crest Ocean 移植）
+//
+// 一张 512² 俯视泡沫图跟着玩家滚动，30 Hz tick：读上一 tick 的层 → 平移重映射
+// → 乘耗散 → 叠加三类注入 → 写另一层。水面（rt_test.rgen）只做**一次**采样，
+// 不新增任何 BVH 射线。
+//
+// 注入项与 Crest 的对应关系（MIT，.tmp/ghfoam/crest/UpdateFoam.compute）：
+//   · 白浪：Crest 用水平位移的雅可比行列式 det 判波峰压缩。我们的 FFT finalize
+//     只输出**斜率**（.rg 基础层 / .ba 细节层，见 water_fft.comp），没有水平位移
+//     ⇒ 用斜率的一阶导数（= 高度的二阶导）拼出同一个行列式形状：
+//         J = (1+g·∂sx/∂x)(1+g·∂sz/∂z) − g²·∂sx/∂z·∂sz/∂x
+//     g = jacobianGain 把"高度梯度"标定到 Crest 的"位移梯度"量级。
+//     注入式逐字照搬：foam += 5·dt·strength·saturate(coverage − J + base·0.7)。
+//   · 交互波：Crest 没有对应项（它没有玩家水体）。这里用水模拟高度的拉普拉斯
+//     作为"波峰/船首波"代理；只在模拟盒内、盒边 8% 羽化。
+//   · 岸线：Crest 用连续海底深度；我们只有 rgen 折射接收面的 1 m 体素阶梯深度
+//     ⇒ rgen 把覆盖率写进 binding 4（r32ui 原子取最大），本 pass 每 tick 取走并
+//     清零，注入式同 Crest：foam += strength·dt·coverage。
+//
+// 场通道 RGBA16F：.r = 泡沫量 [0,1]，.gba 保留写 0（选 RGBA16F 而不是 R16F：
+// RGBA16F 的 storage + 线性过滤是核心保证，R16F 的 storage 需要扩展特性）。
+// mip 链由宿主在 dispatch 之后逐级 blit（同焦散图的既有做法），水面按足迹选级。
+// ===========================================================================
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2DArray foamStateInput;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2DArray foamStateOutput;
+// 水模拟状态：RGBA16F (h, u.x, u.y, 0)，512² / 48 格，宿主每 tick 翻转层。
+layout(set = 0, binding = 2) uniform sampler2DArray waterSimulationState;
+// FFT 斜率图：RGBA16F .rg 基础层(128 格域) / .ba 细节层(32 格域)。
+layout(set = 0, binding = 3) uniform sampler2D waterFftSlope;
+// 岸线覆盖率注入：rgen 主光线原子写 floatBitsToUint(coverage)（正浮点位序单调），
+// 本 pass 读后清零。r32ui 才能用 imageAtomicMax。
+layout(set = 0, binding = 4, r32ui) uniform uimage2D shoreInjection;
+
+layout(push_constant) uniform WaterFoamPush
+{
+    ivec4 layersAndScroll; // x 源层 / y 目标层 / z,w 源纹素滚动量
+    vec4 timing;           // x dt / y 水模拟可用 / z FFT 可用 / w 重置（丢弃历史）
+    vec4 simState;         // x,y 模拟原点 / z 模拟纹素世界尺寸 / w 模拟读层
+    vec4 foamFrame;        // x,y 泡沫图原点 / z 泡沫纹素世界尺寸 / w 泡沫上限
+    vec4 knobs;            // x 耗散率 / y 白浪强度 / z 白浪覆盖阈值 / w 交互强度
+    vec4 knobs2;           // x 岸线强度 / y FFT 基础周期 / z FFT 细节周期 / w 雅可比增益
+} pushData;
+
+const int FOAM_RESOLUTION = 512;
+// Crest 的 _FoamBase 量级：给"已经很陡但还没压缩"的波峰留一条细线。
+const float FOAM_BASE = 0.04;
+// 与宿主 WATER_SIM_RESOLUTION 一致（只用来把 uv 换算成纹素步长）。
+const float SIM_RESOLUTION = 512.0;
+
+vec2 fftSlope(vec2 worldXZ)
+{
+    vec2 baseSlope = textureLod(
+        waterFftSlope,
+        fract(worldXZ / max(pushData.knobs2.y, 1.0e-3)),
+        0.0
+    ).rg;
+    vec2 detailSlope = textureLod(
+        waterFftSlope,
+        fract(worldXZ / max(pushData.knobs2.z, 1.0e-3)),
+        0.0
+    ).ba;
+    return baseSlope + detailSlope;
+}
+
+void main()
+{
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(texel, ivec2(FOAM_RESOLUTION))))
+    {
+        return;
+    }
+
+    const bool reset = pushData.timing.w > 0.5;
+    const float deltaSeconds = max(pushData.timing.x, 0.0);
+    const float foamTexel = max(pushData.foamFrame.z, 1.0e-4);
+
+    // ---- 1) 历史：按整数纹素滚动重映射 ----
+    // 宿主把原点吸附到纹素网格，滚动量恒为整数 ⇒ 线性采样落在纹素中心，不糊。
+    vec2 uv = (vec2(texel) + 0.5) / float(FOAM_RESOLUTION);
+    vec2 scroll = vec2(pushData.layersAndScroll.zw) / float(FOAM_RESOLUTION);
+    float foam = 0.0;
+    if(!reset)
+    {
+        foam = textureLod(
+            foamStateInput,
+            vec3(uv + scroll, float(pushData.layersAndScroll.x)),
+            0.0
+        ).r;
+    }
+
+    // 图边缘 3.5%（≈7 格）淡出：滚动时 clamp 采样会把边缘纹素拉成条带。
+    vec2 edgeDistance = min(uv, vec2(1.0) - uv);
+    foam *= smoothstep(
+        0.0,
+        0.035,
+        min(edgeDistance.x, edgeDistance.y)
+    );
+
+    // ---- 2) 耗散：Crest 的 _FoamFadeRate = 0.8 /s ----
+    foam *= max(0.0, 1.0 - pushData.knobs.x * deltaSeconds);
+
+    vec2 worldXZ =
+        pushData.foamFrame.xy + (vec2(texel) + 0.5) * foamTexel;
+
+    // ---- 3) 白浪注入（波峰压缩）----
+    if(pushData.timing.z > 0.5)
+    {
+        float e = foamTexel;
+        float inv2e = 0.5 / e;
+        vec2 slopeL = fftSlope(worldXZ - vec2(e, 0.0));
+        vec2 slopeR = fftSlope(worldXZ + vec2(e, 0.0));
+        vec2 slopeD = fftSlope(worldXZ - vec2(0.0, e));
+        vec2 slopeU = fftSlope(worldXZ + vec2(0.0, e));
+
+        float dSxdx = (slopeR.x - slopeL.x) * inv2e;
+        float dSzdz = (slopeU.y - slopeD.y) * inv2e;
+        float dSxdz = (slopeU.x - slopeD.x) * inv2e;
+        float dSzdx = (slopeR.y - slopeL.y) * inv2e;
+
+        float gain = pushData.knobs2.w;
+        float jacobian =
+            (1.0 + gain * dSxdx) * (1.0 + gain * dSzdz) -
+            (gain * dSxdz) * (gain * dSzdx);
+
+        foam +=
+            5.0 * deltaSeconds * pushData.knobs.y *
+            clamp(pushData.knobs.z - jacobian + FOAM_BASE * 0.7, 0.0, 1.0);
+    }
+
+    // ---- 4) 交互波注入（水模拟高度的拉普拉斯）----
+    if(pushData.timing.y > 0.5)
+    {
+        float simTexel = max(pushData.simState.z, 1.0e-5);
+        float simWorld = simTexel * SIM_RESOLUTION;
+        vec2 simUv = (worldXZ - pushData.simState.xy) / simWorld;
+        vec2 simEdge = min(simUv, vec2(1.0) - simUv);
+        if(all(greaterThan(simEdge, vec2(0.0))))
+        {
+            int simLayer = int(pushData.simState.w + 0.5);
+            float texelStep = simTexel / simWorld;
+            vec2 stepX = vec2(texelStep, 0.0);
+            vec2 stepZ = vec2(0.0, texelStep);
+
+            float center = textureLod(
+                waterSimulationState, vec3(simUv, simLayer), 0.0).r;
+            float left = textureLod(
+                waterSimulationState, vec3(simUv - stepX, simLayer), 0.0).r;
+            float right = textureLod(
+                waterSimulationState, vec3(simUv + stepX, simLayer), 0.0).r;
+            float down = textureLod(
+                waterSimulationState, vec3(simUv - stepZ, simLayer), 0.0).r;
+            float up = textureLod(
+                waterSimulationState, vec3(simUv + stepZ, simLayer), 0.0).r;
+
+            float laplacian =
+                (left + right + down + up - 4.0 * center) / (simTexel * simTexel);
+
+            // 0.12 / 0.10：风生波（高度 ~0.1 格）几乎不注入，脉冲/船首波
+            // （高度 ~0.4+ 格、波长 ~1 格）才越过门槛。
+            float interaction =
+                clamp(abs(laplacian) * 0.12 - 0.10, 0.0, 1.0) *
+                smoothstep(0.0, 0.08, min(simEdge.x, simEdge.y));
+            foam += deltaSeconds * pushData.knobs.w * interaction;
+        }
+    }
+
+    // ---- 5) 岸线注入：读走上一段 RT 写的覆盖率并清零 ----
+    // 重置时也执行清零，避免旧位置残留的覆盖率被带进新图。
+    if(!reset)
+    {
+        float shoreCoverage = uintBitsToFloat(imageLoad(shoreInjection, texel).r);
+        shoreCoverage = (shoreCoverage > 0.0) ? min(shoreCoverage, 1.0) : 0.0;
+        foam += deltaSeconds * pushData.knobs2.x * shoreCoverage;
+    }
+    imageStore(shoreInjection, texel, uvec4(0u));
+
+    // ---- 6) 写目标层 ----
+    foam = clamp(foam, 0.0, pushData.foamFrame.w);
+    imageStore(
+        foamStateOutput,
+        ivec3(texel, pushData.layersAndScroll.y),
+        vec4(foam, 0.0, 0.0, 1.0)
+    );
+}

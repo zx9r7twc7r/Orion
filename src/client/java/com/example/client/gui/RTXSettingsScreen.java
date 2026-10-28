@@ -28,6 +28,7 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
     private int pendingGiBounces;
     private int pendingAoNearSamples;
+    private int pendingVolumetricRestir;
     private int pendingAoMidSamples;
     private int pendingSunShadowSamples;
     private int pendingLocalLightRisCandidates;
@@ -44,6 +45,12 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     private float pendingPOMDepth;
     // 2026-10-18 视差高度场采样：false = 平滑；true = 锐利。
     private boolean pendingPOMSharp;
+
+    // 2026-10-25 两个性能档（会话内生效）：
+    //   pendingGiNearRate      0 全速 / 1 半速 / 2 四分一
+    //   pendingGlossyRoughLod  true = 光泽按粗糙度降速
+    private int pendingGiNearRate;
+    private boolean pendingGlossyRoughLod;
 
     // 2026-10-22 UE 风格体积云八项（索引与 NativeVulkan.setUeCloudParam 一致）
     private final float[] pendingUeCloud =
@@ -435,6 +442,17 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     // 切换下一帧生效），所以放在性能页同一排，不单独开一个页面。
     private int pendingMotionDebugView;
 
+    // 2026-10-26 两项新增（写法与上面同：写 CameraUBO.sparseParams 保留 lane，
+    // 下一帧生效，不重建任何资源）：
+    //   · 直接光采样：0 = 传统 RIS（每像素 16 提案 + 单根可见性），1 = RTXDI 式
+    //     时域重用（历史 reservoir 合并 + 复用上帧选中的光源），省 RIS 提案的
+    //     求值与阴影步，代价是移动光源/接收面下多一帧滞后。
+    //   · 稀疏渲染采样率%：0 = 关（全像素都算 RT）；N = 每帧按白噪声只让约 N%
+    //     的像素跑光追，其余像素复用历史/降噪。深度、MV、引导图始终密写。
+    private int pendingDirectLightMode;
+    private int pendingIndirectMode;
+    private int pendingSparseRatePercent;
+
     // 2026-10-22：运动矢量总开关已从界面移除 —— 引擎内部固定为
     // "只给 ENTITY 层发位移段 + 像素→UV 换算"（见 native 的 mvLayerMask）。
     // 保留原字段会被误以为还能控制，所以整块删掉。
@@ -473,6 +491,9 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     private static final int PAGE_WATER = 6;
     private static final int PAGE_MATERIAL = 7;
     private static final int PAGE_POST = 8;
+    // 2026-10-26 **色彩分级**子页（用户要求：色彩映射仍留在后处理页可切换，
+    // 另给一个入口点进去，用详细参数逐色调地调）。入口在 PAGE_POST 末尾。
+    private static final int PAGE_COLORGRADE = 9;
 
     private int page = PAGE_HUB;
 
@@ -503,6 +524,7 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         RTXSettingsConfig.PerformanceSettings performance =
                 RTXSettingsConfig.getPerformanceSettings();
         this.pendingAoNearSamples = performance.aoNearSamples();
+        this.pendingVolumetricRestir = performance.volumetricRestir();
         this.pendingAoMidSamples = performance.aoMidSamples();
         this.pendingSunShadowSamples = performance.sunShadowSamples();
         this.pendingLocalLightRisCandidates = performance.localLightRisCandidates();
@@ -521,6 +543,13 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
         this.pendingPOMSharp =
                 RTXSettingsConfig.isPOMSharp();
+
+        // 2026-10-25 两个性能档：初值从原生读回（原生侧已有默认值 2 / true）。
+        this.pendingGiNearRate =
+                NativeVulkan.getGiNearRate();
+
+        this.pendingGlossyRoughLod =
+                NativeVulkan.getGlossyRoughLod();
 
         this.pendingTrueSubsurfaceScattering =
                 RTXSettingsConfig.isTrueSubsurfaceScattering();
@@ -731,6 +760,12 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                 RTXSettingsConfig.getSunMarchFarDistance();
         this.pendingMotionDebugView =
                 RTXSettingsConfig.getMotionDebugView();
+        this.pendingDirectLightMode =
+                RTXSettingsConfig.getDirectLightMode();
+        this.pendingIndirectMode =
+                RTXSettingsConfig.getIndirectMode();
+        this.pendingSparseRatePercent =
+                RTXSettingsConfig.getSparseRatePercent();
     }
 
 
@@ -1100,8 +1135,13 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
         this.addOptionRow(giBouncesButton);
 
+        this.addOptionRow(performanceButton("体积光 ReSTIR", pendingVolumetricRestir,
+                List.of(0, 1), value -> pendingVolumetricRestir = value));
+        // 2026-10-27：加一个真正的「关闭」档（值 5）。旧 0 只是 0~16 格不发
+        // AO 射线（32~96 格仍硬编码 1 条），5 才让整条 RTAO 链停掉，
+        // 见 rt_test.rgen 里 perfPrimary.x >= 5 的判据。
         this.addOptionRow(performanceButton("RTAO 近距采样", pendingAoNearSamples,
-                List.of(0, 1, 2, 3, 4), value -> pendingAoNearSamples = value));
+                List.of(5, 0, 1, 2, 3, 4), value -> pendingAoNearSamples = value));
         this.addOptionRow(performanceButton("RTAO 中距采样", pendingAoMidSamples,
                 List.of(0, 1, 2), value -> pendingAoMidSamples = value));
         this.addOptionRow(performanceButton("太阳阴影采样", pendingSunShadowSamples,
@@ -1150,6 +1190,28 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                 List.of(0, 1), value -> pendingGiRoulette = value));
         this.addOptionRow(performanceButton("太阳透射距离(0=关)", pendingSunMarchFarDistance,
                 List.of(0, 8, 16, 32, 64, 128, 256), value -> pendingSunMarchFarDistance = value));
+        // 2026-10-26 直接光采样模式（0 = 传统 RIS = 旧档，1 = RTXDI 式时域重用）。
+        // 1 档复用上一帧选中的光源、只在合并后打**一根**可见性射线（Remix 的
+        // RTXDI_UpdateSelectedReservoirVisibility 语义），省掉每像素 16 提案的
+        // 阴影步。代价：光源/接收面快速运动时多一帧滞后。1 档需要 reservoir
+        // 历史，切回 0 时旧历史会被标签判据拒绝，不会串味。
+        this.addOptionRow(performanceButton("直接光采样(1=RTXDI复用)", pendingDirectLightMode,
+                List.of(0, 1), value -> pendingDirectLightMode = value));
+        // 2026-10-28 间接光模式（对齐 Remix 的 IntegrateIndirectMode）。
+        //   0 = GI：现有 4 跳路径 + 俄罗斯轮盘，逐位等于改动前。
+        //   1 = SHaRC：空间哈希辐射缓存，命中即截断该像素剩余的 GI 路径
+        //       （rgen:25493 的 break）。代价是 update pass 每帧额外成本，
+        //       实测本机 0.8~2.5ms（取决于场景与覆盖率）。
+        // ⚠ 切到 1 需要**重启客户端**：四块缓冲（176MB）与第二条 RT 管线在
+        //   native init 时按模式创建，运行期改值不生效。
+        this.addOptionRow(performanceButton("间接光模式(1=SHaRC,需重启)", pendingIndirectMode,
+                List.of(0, 1), value -> pendingIndirectMode = value));
+        // 2026-10-26 稀疏渲染：每帧按像素白噪声只让约 N% 的像素跑 RT 求值，
+        // 其余像素把 RT 项按 0 处理，靠历史/降噪补。深度、运动矢量、各类引导图
+        // 始终密写（否则 DLSS/RR 会看到洞）。0 = 关 = 全像素计算（旧档）。
+        this.addOptionRow(performanceButton("稀疏渲染采样率%(0=关)", pendingSparseRatePercent,
+                List.of(0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100),
+                value -> pendingSparseRatePercent = value));
         // 2026-10-09 运动矢量**调试图**（诊断用，出厂 0 = 关）。
         //   1 = 幅值热图：黑 = 零位移。静止时**整屏应当全黑**；出现均匀灰 = 有相机
         //       成分漏进了 MV。移动物体是一团亮斑。
@@ -1239,18 +1301,32 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                 .create(Component.literal("体积云质量"),
                         (button, value) -> this.pendingCloudQuality = value));
  // 2026-10-18 范围校正：
-        //   云团大小 1.0 = 参考（噪声 tile ≈ 层厚×8）；>2 基本没有团块感
+        //   云的大小 1.0 = 参考（噪声 tile ≈ 层厚×8）；>2 基本没有团块感
         //   层厚 128~2000：参考整层只有 206 格，16 km 必然糊成一片
         // 上限必须与 RTXSettingsConfig 的 validCloudSetting、JNI 校验逐字一致。
-        this.addOptionRow(cloudSlider("云团大小", 0.25, 2.0, 0.05,
-                pendingCloudSize, "%.2f 倍", value -> pendingCloudSize = (float) value));
+        //
+        // 2026-10-28 **云量 / 云大小彻底解耦**（这两条滑条以前是耦合的：
+        // 调云量会把每一朵云一起削大削小，因为云量被塞进了密度阈值）：
+        //   · 云的大小   → base 噪声周期（着色器里 noiseScale = 0.55²/size）
+        //                  ⇒ 只改"每朵多大"，值越大云越大
+        //   · 云量       → 分布遮罩 presence（整片区域有/无云，软化宽度固定）
+        //                  ⇒ 只改"多少朵"，云体本身的形状不被削减
+        // 滑条显示"云的大小倍率"（越大云越大），而存档/UBO 里存的是 **noiseScale**
+        // （越大云越小，基座周期 = HP_BASE_TILE / noiseScale）⇒ 显示值 = 0.55 / 存档值。
+        // 为什么不反过来改着色器：那会让存量存档（cloudSize=1.45）从"格胞 460 格"
+        // 跳到 3196 格（> 1.5× 层厚）⇒ 云被竖着拉成柱子（2026-10-28 实机确认）。
+        // 着色器侧另有"格胞 ≤ 层厚/2"的钳制兜底（cloud_v5_core.glsl 的 minNoiseScale）。
+        final float sizeRef = 0.55f;
+        final float sizeSlider = sizeRef / Math.max(pendingCloudSize, 0.05f);
+        this.addOptionRow(cloudSlider("云的大小", 0.30, 2.0, 0.05, sizeSlider, "%.2f 倍",
+                value -> pendingCloudSize = sizeRef / (float) value));
+        this.addOptionRow(cloudSlider("云量（分布密度）", 0.10, 0.90, 0.01,
+                pendingCloudCoverage, "%.2f", value -> pendingCloudCoverage = (float) value));
         this.addOptionRow(cloudSlider("云底高度", 96.0, 4000.0, 16.0,
                 pendingCloudBottom, "%.0f", value -> pendingCloudBottom = (float) value));
         // 2026-10-19：上限 2000 → 5000（厚层才有体积；3D 噪声不怕竖条）
         this.addOptionRow(cloudSlider("云层厚度", 128.0, 5000.0, 16.0,
                 pendingCloudThickness, "%.0f", value -> pendingCloudThickness = (float) value));
-        this.addOptionRow(cloudSlider("云量", 0.10, 0.90, 0.01,
-                pendingCloudCoverage, "%.2f", value -> pendingCloudCoverage = (float) value));
         // 参考出厂 VOLUMETRIC_CLOUDS_DENSITY = 1.0，本滑杆出厂 5.0 对应它
         // （换算在 volumetric_clouds_v2.comp 的 V2_DENSITY_GUI_REFERENCE）。
         this.addOptionRow(cloudSlider("云体密度", 0.25, 5.0, 0.05,
@@ -1311,6 +1387,30 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                 value -> pendingCloudSilver = (float) value));
         this.flushOptionRow();
 
+        // 2026-10-25 **v5（HP）全参数**：28 项，一项不漏地接到滑条上。
+        // 表格驱动（RTXSettingsConfig.CLOUD_HP_LABELS / CLOUD_HP_RANGES），
+        // 每一条改完立刻下发 + 落盘；不再需要 28 个 pending 字段。
+        this.addSectionHeader("体积云 · HP 全参数（v5）");
+        float[] hpValues = RTXSettingsConfig.getCloudHpSettings().toParamArray();
+        for(int hpIndex = 0; hpIndex < RTXSettingsConfig.CLOUD_HP_LABELS.length; ++hpIndex)
+        {
+            final int hpSlot = hpIndex;
+            final float[] hpRange = RTXSettingsConfig.CLOUD_HP_RANGES[hpSlot];
+            this.addOptionRow(cloudSlider(RTXSettingsConfig.CLOUD_HP_LABELS[hpSlot],
+                    hpRange[0], hpRange[1], hpRange[2], hpValues[hpSlot], "%.3f",
+                    value -> {
+                        float[] next = RTXSettingsConfig.getCloudHpSettings().toParamArray();
+                        next[hpSlot] = (float) value;
+                        RTXSettingsConfig.CloudHpSettings updated =
+                                new RTXSettingsConfig.CloudHpSettings(next);
+                        if(!NativeVulkan.isLoaded()
+                                || NativeVulkan.setCloudHpParams(updated.toParamArray())) {
+                            RTXSettingsConfig.setCloudHpSettings(updated);
+                        }
+                    }));
+        }
+        this.flushOptionRow();
+
         this.addSectionHeader("体积云 · 步进（性能 / 画质）");
         // 2026-10-19：这两项原来是 v3 的「高度梯度 / 银边强度」，退役后复用为步进覆盖。
         // 0 = 跟随质量档（低 32 / 中 48 / 高 64 步），>0 = 直接指定。
@@ -1352,9 +1452,13 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         // （偏移 1536 / 1552）严格一致；apply 在设置面板的「确定」里统一提交。
         // 8 项 = 偶数 ⇒ 两列配对，正好 4 行，不需要落单占满整行。
         // =================================================================
-        this.addSectionHeader("体积云 · UE 模型（多散射 / 受光）");
+        // 2026-10-26：UE 体积云已删除，本节只剩 **HDRP 也会读**的四项
+        // （ueCloudA = msOctaves / 每阶贡献 / 每阶遮蔽 / 散射亮度补偿）。
+        // 后四项（ueCloudB：地面反照贡献 / 云 AO / 逐采样大气透射 / 天气图倍率）
+        // v5 着色器完全不读，滑条已撤掉 —— 留着只会让人以为调了有用。
+        this.addSectionHeader("体积云 · 多次散射 / 能量");
 
-        for(int i = 0; i < RTXSettingsConfig.UE_CLOUD_PARAM_COUNT; i++) {
+        for(int i = 0; i < 4; i++) {
 
             this.addOptionRow(
                     this.makeUeCloudSlider(
@@ -1380,40 +1484,12 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                         (button, value) -> msMeanReproject = value));
         this.flushOptionRow();
 
-        this.addSectionHeader("平面云");
- // 2026-10-09 平面云：一个高度平面 + 多八度 2D FBM，
-        // 9 项 = 1 开关 + 8 滑块（highCloudParams 段）。
-        this.addOptionRow(CycleButton.builder(
-                        enabled -> Component.literal(enabled ? "开" : "关"),
-                        this.pendingPlaneCloudEnabled)
-                .withValues(false, true)
-                .create(Component.literal("平面云"),
-                        (button, enabled) -> this.pendingPlaneCloudEnabled = enabled));
-        this.addOptionRow(cloudSlider("平面云高度", -20000, 200000, 100,
-                pendingPlaneCloudHeightOffset, "%.0f 格",
-                value -> pendingPlaneCloudHeightOffset = (float) value));
-        this.addOptionRow(cloudSlider("平面云尺度", 0.01, 20, 0.01,
-                pendingPlaneCloudScale, "%.2f 倍",
-                value -> pendingPlaneCloudScale = (float) value));
-        this.addOptionRow(cloudSlider("平面云速度", 0, 20, 0.05,
-                pendingPlaneCloudSpeed, "%.2f",
-                value -> pendingPlaneCloudSpeed = (float) value));
-        this.addOptionRow(cloudSlider("平面云密度", 0, 100, 0.1,
-                pendingPlaneCloudDensity, "%.1f",
-                value -> pendingPlaneCloudDensity = (float) value));
-        this.addOptionRow(cloudSlider("平面云覆盖率", 0, 1, 0.01,
-                pendingPlaneCloudCoverage, "%.2f",
-                value -> pendingPlaneCloudCoverage = (float) value));
-        this.addOptionRow(cloudSlider("平面云八度", 1, 8, 1,
-                pendingPlaneCloudOctaves, "%.0f",
-                value -> pendingPlaneCloudOctaves = (float) value));
-        this.addOptionRow(cloudSlider("平面云淡出", 1000, 300000, 1000,
-                pendingPlaneCloudFadeDistance, "%.0f 格",
-                value -> pendingPlaneCloudFadeDistance = (float) value));
-        this.addOptionRow(cloudSlider("平面云亮度", 0, 6, 0.05,
-                pendingPlaneCloudBrightness, "%.2f",
-                value -> pendingPlaneCloudBrightness = (float) value));
-        this.flushOptionRow();
+        // 2026-10-26 **撤掉「平面云」整节**：它是遗留的 2D 高空云（一个高度平面 +
+        // 8 个 octave 的 2D FBM），和 HDRP 体积云是两套完全不同的东西，却把开关
+        // 挂在同一个 lane（highCloudParams0.x）上 —— 默认开着时天上会多出一层
+        // 27 km 高、碎成一颗颗、以 UV 速度平移的橘色团块（用户实测截图）。
+        // 现在 native 默认已改 0，入口也删掉：想要 2D 高空云请单独做一套，别再和
+        // 体积云共用一个开关。配置字段保留（旧存档能正常读，值恒为 false）。
 
         this.addSectionHeader("大气透视");
         // 2026-10-10 借鉴（同一 cloudAerialParams 尾块）：
@@ -1827,6 +1903,7 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                         (button, value) -> this.postTonemapMode = value));
         // 2026-10-23 调色调（用户要求）：线性光 R/G/B 通道增益，作用在色彩映射**之前**
         // ⇒ 等效相机白平衡（1 = 逐位恒等）。色温可以靠 R/B 反向拉。
+        // 想整体偏冷：R 降 / B 升（例如 0.90 / 0.98 / 1.14）。
         this.addOptionRow(cloudSlider("调色 R 增益", 0.25, 2.5, 0.01,
         postGainR, "%.2f", value -> postGainR = (float)value));
         this.addOptionRow(cloudSlider("调色 G 增益", 0.25, 2.5, 0.01,
@@ -1836,13 +1913,16 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         // 自动曝光参与度：0 = 关闭自动曝光（画面只随场景亮度走）；出厂 0.6。
         this.addOptionRow(cloudSlider("自动曝光强度", 0.0, 1.0, 0.05,
         postExposureStrength, "%.2f", value -> postExposureStrength = (float)value));
-        // 对比：作用于 Uchimura/GT 曲线的 a（其它映射下此旋钮不生效）。
+        // 对比：作用于 Uchimura/GT 曲线的 a（其它映射下此旋钮不生效；
+        // 想让所有映射都吃对比，用「色彩分级」里的「显示对比」）。
         this.addOptionRow(cloudSlider("对比度", 0.5, 2.0, 0.05,
         postContrast, "%.2f 倍", value -> postContrast = (float)value));
         this.addOptionRow(cloudSlider("饱和度", 0.0, 2.0, 0.05,
         postSaturation, "%.2f 倍", value -> postSaturation = (float)value));
         this.addOptionRow(cloudSlider("Gamma", 1.8, 2.6, 0.02,
         postGamma, "%.2f", value -> postGamma = (float)value));
+        this.flushOptionRow();
+
         // 2026-10-07 泛光强度（后处理链第 9 个 lane）。0 = 关 = **逐位恒等**
         //（合成着色器整屏早退）。阈值/软膝等观感常量暂时写死在 bloom_prefilter.comp。
         this.addOptionRow(cloudSlider("泛光强度", 0.0, 2.0, 0.05,
@@ -1879,14 +1959,106 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         // 2026-10-06 远云剥离 RR。开 = 云层在输出分辨率渲染、合成挪到 RR evaluate
         // 之后 ⇒ 远云清晰度不再被 RR 档位的上采样限死（关 = 旧档：云进 RR 颜色
         // 输入）。开着时"云分辨率下限"与"远淡出随RR档位"对远云都已无意义。代价
-        // 是云 pass 的像素数按 (输出/render)² 增长。本页控件数因此为奇数，这只
-        // 开关正好占掉末尾一个整行（见上面关于配对的注释）。
+        // 是云 pass 的像素数按 (输出/render)² 增长。
         this.addOptionRow(CycleButton.builder(
                         enabled -> Component.literal(enabled ? "开" : "关"),
                         this.pendingCloudPostRrComposite)
                 .withValues(false, true)
                 .create(Component.literal("远云脱离RR"),
                         (button, enabled) -> this.pendingCloudPostRrComposite = enabled));
+        this.flushOptionRow();
+
+        // 2026-10-26（用户要求）：色彩分级的**入口**。色彩映射本身留在本页切换，
+        // 这里只是往下一个子页 —— 点进去是 24 项逐色调的详细参数（黑白场 / 逐通道
+        // Lift-Gamma-Gain / 分离色调 / 自然饱和度 / 褪色 / 暗角 / 色相旋转 …）。
+        // 入口占满一整行，且放在本页最后，不和其它旋钮混排。
+        // ⚠ 这里直接走 list.addBig（不用 addOptionRow），所以**必须自己判 section** ——
+        // addOptionRow 的页过滤在这个调用上不生效，否则每页都会多出一个按钮。
+        this.flushOptionRow();
+        if(this.section == this.page) {
+            this.list.addBig(
+                    Button.builder(
+                                    Component.literal("▸ 色彩分级 · 详细参数（独立页面）"),
+                                    button -> this.openPage(PAGE_COLORGRADE))
+                            .width(310)
+                            .build());
+        }
+
+        // =====================================================
+        // 2026-10-26 「色彩分级」子页（从「后处理」页进入，不是 hub 上的独立分类）
+        //
+        // 内容 = 4 个预设 + 24 项逐色调参数（RTXSettingsConfig.COLOR_GRADE_* 表驱动）：
+        //   ① 曝光与黑白场  ② 逐通道 Lift/Gamma/Gain（ASC-CDL）
+        //   ③ 分离色调（暗部 / 亮部各推一个色相）④ 氛围（饱和度 / 褪色 / 暗角 / 色相）
+        //
+        // 这些滑条**拖动即生效**（与「体积云 HP 全参数」同款，不进 pending 草稿，
+        // 所以本页不需要按「应用」也能看到变化）；预设同理，只改这 24 项，
+        // 色彩映射模式仍由「后处理」页决定（冰岛/格陵兰建议配 AgX）。
+        // =====================================================
+        this.section = PAGE_COLORGRADE;
+
+        // 预设只改这 24 项，"曲线"（色彩映射模式）仍由上一页决定 —— 冰岛/格陵兰
+        // 这两套是照 AgX 调的，配 GT/Uchimura 也能用，只是高光更硬一点。
+        this.addSectionHeader("预设（只改分级；色彩映射请在后处理页选，推荐 AgX）");
+        this.addOptionRow(Button.builder(
+                        Component.literal("预设：冰岛 · 冷寂"),
+                        button -> this.applyColorGradePreset(PRESET_ICELAND))
+                .width(150).build());
+        this.addOptionRow(Button.builder(
+                        Component.literal("预设：格陵兰 · 极夜"),
+                        button -> this.applyColorGradePreset(PRESET_GREENLAND))
+                .width(150).build());
+        this.addOptionRow(Button.builder(
+                        Component.literal("预设：晨雾 · 苍灰"),
+                        button -> this.applyColorGradePreset(PRESET_MIST))
+                .width(150).build());
+        this.addOptionRow(Button.builder(
+                        Component.literal("预设：复位（中性）"),
+                        button -> this.applyColorGradePreset(PRESET_NEUTRAL))
+                .width(150).build());
+        this.flushOptionRow();
+
+        // 24 项：表驱动（RTXSettingsConfig.COLOR_GRADE_LABELS / COLOR_GRADE_RANGES），
+        // 拖动立刻 setColorGradeParams + 落盘。
+        float[] cgValues = RTXSettingsConfig.getColorGradeSettings().toParamArray();
+        for(int cgIndex = 0; cgIndex < RTXSettingsConfig.COLOR_GRADE_LABELS.length; ++cgIndex)
+        {
+            if(cgIndex == 0)
+            {
+                this.addSectionHeader("① 曝光与黑白场");
+            }
+            if(cgIndex == 5)
+            {
+                this.addSectionHeader("② 逐通道 Lift / Gamma / Gain（ASC-CDL）");
+            }
+            if(cgIndex == 14)
+            {
+                this.addSectionHeader("③ 分离色调（暗部 / 亮部各推一个色相）");
+            }
+            if(cgIndex == 18)
+            {
+                this.addSectionHeader("④ 氛围（饱和度 / 褪色 / 暗角 / 色相）");
+            }
+
+            final int cgSlot = cgIndex;
+            final float[] cgRange = RTXSettingsConfig.COLOR_GRADE_RANGES[cgSlot];
+            // 步进 >= 1 的值（色相、曝光档）不需要小数位。
+            final String cgFormat =
+                    cgRange[2] >= 1.0f ? "%.0f"
+                            : (cgRange[2] >= 0.01f ? "%.2f" : "%.3f");
+            this.addOptionRow(cloudSlider(RTXSettingsConfig.COLOR_GRADE_LABELS[cgSlot],
+                    cgRange[0], cgRange[1], cgRange[2], cgValues[cgSlot], cgFormat,
+                    value -> {
+                        float[] next = RTXSettingsConfig.getColorGradeSettings().toParamArray();
+                        next[cgSlot] = (float) value;
+                        RTXSettingsConfig.ColorGradeSettings updated =
+                                new RTXSettingsConfig.ColorGradeSettings(next);
+                        if(!NativeVulkan.isLoaded()
+                                || NativeVulkan.setColorGradeParams(updated.toParamArray())) {
+                            RTXSettingsConfig.setColorGradeSettings(updated);
+                        }
+                    }));
+        }
         this.flushOptionRow();
 
         this.section = PAGE_MATERIAL;
@@ -1932,15 +2104,15 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
                         double snapped =
                                 Math.round(
-                                        this.value * 100.0
-                                ) / 100.0;
+                                        this.value * 10000.0
+                                ) / 10000.0;
 
 
                         this.setMessage(
                                 Component.literal(
                                         String.format(
                                                 java.util.Locale.ROOT,
-                                                "无直射光环境亮度: %.2f",
+                                                "无直射光环境亮度: %.4f",
                                                 snapped
                                         )
                                 )
@@ -1953,8 +2125,8 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
                         double snapped =
                                 Math.round(
-                                        this.value * 100.0
-                                ) / 100.0;
+                                        this.value * 10000.0
+                                ) / 10000.0;
 
 
                         this.value =
@@ -2070,6 +2242,52 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
         this.addOptionRow(
                 pomSamplingButton
+        );
+
+        // =====================================================
+        // 2026-10-25 近场 GI 采样率（性能）
+        //
+        // 只降 GI 信号的发射频率，像素照常每帧全写 ⇒ 不出锯齿；代价是 GI 方差变大，
+        // 由 DLSS-RR 时间累积抹平。实测（室内固定站位）rt 18.04 → 10.79ms。
+        // =====================================================
+
+        CycleButton<Integer> giNearRateButton =
+                CycleButton.builder(
+                                level -> Component.literal(
+                                        level == 0 ? "全速"
+                                                : (level == 1 ? "半速" : "四分之一")
+                                ),
+                                this.pendingGiNearRate
+                        )
+                        .withValues(0, 1, 2)
+                        .create(
+                                Component.literal("GI 近场采样"),
+                                (button, level) -> this.pendingGiNearRate = level
+                        );
+
+        this.addOptionRow(
+                giNearRateButton
+        );
+
+        // =====================================================
+        // 2026-10-25 光泽反射按粗糙度降速（性能）
+        // =====================================================
+
+        CycleButton<Boolean> glossyRoughLodButton =
+                CycleButton.builder(
+                                enabled -> Component.literal(
+                                        enabled ? "按粗糙度降速" : "全速"
+                                ),
+                                this.pendingGlossyRoughLod
+                        )
+                        .withValues(false, true)
+                        .create(
+                                Component.literal("光泽采样"),
+                                (button, enabled) -> this.pendingGlossyRoughLod = enabled
+                        );
+
+        this.addOptionRow(
+                glossyRoughLodButton
         );
 
         // =====================================================
@@ -2666,7 +2884,8 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                         this.pendingGlossyFullDistance,
                         this.pendingDynamicRtasInterval,
                         this.pendingMaxRtParticles,
-                        this.pendingRtSpp
+                        this.pendingRtSpp,
+                        this.pendingVolumetricRestir
                 );
         if(!NativeVulkan.isLoaded() ||
                 NativeVulkan.setPerformanceSettings(updatedPerformance))
@@ -2906,6 +3125,36 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                     NativeVulkan.getGiRoulette();
             allApplied = false;
         }
+        // 2026-10-26：直接光采样模式 / 稀疏渲染采样率。与上面同一套路：
+        // 切换只写 UBO 的 sparseParams，下一帧生效，不重建资源。
+        if(!NativeVulkan.isLoaded() || NativeVulkan.setDirectLightMode(
+                this.pendingDirectLightMode)) {
+            RTXSettingsConfig.setDirectLightMode(
+                    this.pendingDirectLightMode);
+        } else {
+            this.pendingDirectLightMode =
+                    NativeVulkan.getDirectLightMode();
+            allApplied = false;
+        }
+        // 2026-10-28 间接光模式：写入配置后需重启客户端才生效（见 UI 行的说明）。
+        if(!NativeVulkan.isLoaded() || NativeVulkan.setIndirectMode(
+                this.pendingIndirectMode)) {
+            RTXSettingsConfig.setIndirectMode(
+                    this.pendingIndirectMode);
+        } else {
+            this.pendingIndirectMode =
+                    NativeVulkan.getIndirectMode();
+            allApplied = false;
+        }
+        if(!NativeVulkan.isLoaded() || NativeVulkan.setSparseRatePercent(
+                this.pendingSparseRatePercent)) {
+            RTXSettingsConfig.setSparseRatePercent(
+                    this.pendingSparseRatePercent);
+        } else {
+            this.pendingSparseRatePercent =
+                    NativeVulkan.getSparseRatePercent();
+            allApplied = false;
+        }
         // 2026-10-22：运动矢量已改为引擎内部固定策略，界面不再下发。
         // 由 NativeVulkan 静态初始化时统一设成"像素档 + 只发实体层"。
         // 2026-10-09：运动矢量调试视图（0 = 关 / 1 = 幅值热图 / 2 = 有向色）。
@@ -2928,6 +3177,15 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         } else {
             this.pendingSunMarchFarDistance =
                     NativeVulkan.getSunMarchFarDistance();
+            allApplied = false;
+        }
+
+        RTXSettingsConfig.CloudHpSettings updatedCloudHp =
+                new RTXSettingsConfig.CloudHpSettings(
+                        RTXSettingsConfig.getCloudHpSettings().toParamArray());
+        if(!NativeVulkan.isLoaded() || NativeVulkan.setCloudHpParams(updatedCloudHp.toParamArray())) {
+            RTXSettingsConfig.setCloudHpSettings(updatedCloudHp);
+        } else {
             allApplied = false;
         }
 
@@ -3452,6 +3710,36 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         }
 
         // =====================================================
+        // 2026-10-25 两个性能档（会话内生效，不写配置）
+        // =====================================================
+
+        if(
+                !NativeVulkan.setGiNearRate(
+                        this.pendingGiNearRate
+                )
+        )
+        {
+            this.pendingGiNearRate =
+                    NativeVulkan.getGiNearRate();
+
+            allApplied =
+                    false;
+        }
+
+        if(
+                !NativeVulkan.setGlossyRoughLod(
+                        this.pendingGlossyRoughLod
+                )
+        )
+        {
+            this.pendingGlossyRoughLod =
+                    NativeVulkan.getGlossyRoughLod();
+
+            allApplied =
+                    false;
+        }
+
+        // =====================================================
         // 2026-10-22 UE 风格体积云八项（索引同 NativeVulkan.setUeCloudParam）
         // =====================================================
 
@@ -3676,7 +3964,9 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     ) {
         return CycleButton.builder(
                         value -> Component.literal(
-                                value == 0 ? "Off" : Integer.toString(value)
+                                value == 5
+                                        ? "关闭"
+                                        : value == 0 ? "Off" : Integer.toString(value)
                         ),
                         current
                 )
@@ -3846,7 +4136,84 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.waterFftDetail = fft.detail();
     }
 
+    // =====================================================
+    // 2026-10-26 调色预设（「后处理 → 色彩分级」子页顶部的四个按钮）
+    //
+    // **只改色彩分级那 24 项**（setColorGradeParams + 落盘，与滑条同一条路径）。
+    // 色彩映射模式 / 三通道增益 / 自动曝光 / 对比 / 饱和 / gamma 一律不动 ——
+    // 那些仍归「后处理」页（用户 2026-10-26 明确要求色彩映射留在后处理页）。
+    // 冰岛 / 格陵兰这两套是照 AgX 调的，配 GT/Uchimura 也能用，只是高光更硬一点。
+    //
+    // 24 项的顺序与 RTXSettingsConfig.COLOR_GRADE_LABELS 严格一致，改一处必须改另一处。
+    // 数值全部落在 COLOR_GRADE_RANGES 内（ColorGradeSettings 构造里还会再钳一次）。
+    // =====================================================
+    private static final int PRESET_NEUTRAL = 0;
+    private static final int PRESET_ICELAND = 1;
+    private static final int PRESET_GREENLAND = 2;
+    private static final int PRESET_MIST = 3;
+
+    // 冰岛 · 冷寂：降饱和 + 青蓝阴影 + 轻微褪色/暗角。
+    // 这一套是照"冰岛黑沙滩那种阴天"调的：亮部不刺眼、暗部偏青、整体发灰。
+    private static final float[] GRADE_ICELAND = {
+            0.10f, 0.015f, 0.94f, 1.05f, 0.17f,
+            0.008f, 0.014f, 0.024f,
+            0.98f, 1.00f, 1.05f,
+            0.94f, 1.00f, 1.07f,
+            195.0f, 0.32f, 215.0f, 0.15f,
+            -0.08f, 0.16f, 0.20f, 0.62f, -6.0f, 0.05f
+    };
+
+    // 格陵兰 · 极夜：压曝光 + 更强蓝 + 暗角收边，饱和度再收一档。
+    private static final float[] GRADE_GREENLAND = {
+            -0.25f, 0.02f, 0.88f, 1.12f, 0.14f,
+            0.005f, 0.010f, 0.026f,
+            0.96f, 1.00f, 1.08f,
+            0.90f, 1.00f, 1.12f,
+            205.0f, 0.45f, 220.0f, 0.10f,
+            -0.15f, 0.10f, 0.34f, 0.50f, -10.0f, 0.02f
+    };
+
+    // 晨雾 · 苍灰：抬黑压白最狠的一档，几乎无色，只剩亮度结构（最"寂寞"的一档）。
+    private static final float[] GRADE_MIST = {
+            0.20f, 0.05f, 0.85f, 0.90f, 0.20f,
+            0.030f, 0.032f, 0.036f,
+            1.00f, 1.00f, 1.00f,
+            0.98f, 1.00f, 1.02f,
+            180.0f, 0.15f, 210.0f, 0.10f,
+            -0.25f, 0.30f, 0.12f, 0.70f, 0.0f, 0.0f
+    };
+
+    private void applyColorGradePreset(int preset) {
+        float[] grade = RTXSettingsConfig.DEFAULT_COLOR_GRADE.clone();
+
+        if(preset == PRESET_ICELAND) {
+            grade = GRADE_ICELAND.clone();
+        } else if(preset == PRESET_GREENLAND) {
+            grade = GRADE_GREENLAND.clone();
+        } else if(preset == PRESET_MIST) {
+            grade = GRADE_MIST.clone();
+        }
+
+        // 只动分级 24 项 —— 色彩映射模式 / 三通道增益 / 曝光 / 对比 / 饱和 / gamma
+        // 全在「后处理」页由用户自己管，预设不越界去改它们（2026-10-26 用户要求）。
+        // 与滑条同一条路径：先 native 接受，再审过才落盘。
+        RTXSettingsConfig.ColorGradeSettings updated =
+                new RTXSettingsConfig.ColorGradeSettings(grade);
+        if(!NativeVulkan.isLoaded()
+                || NativeVulkan.setColorGradeParams(updated.toParamArray())) {
+            RTXSettingsConfig.setColorGradeSettings(updated);
+        }
+
+        // 滑条位置是构建时从字段读的，所以换完预设要重建这一页。
+        if(this.minecraft != null) {
+            this.minecraft.execute(this::rebuildPage);
+        } else {
+            this.rebuildPage();
+        }
+    }
+
     private static Component postTonemapLabel(int mode) {
+
         switch (mode) {
             case 1: return Component.literal("AgX");
             case 2: return Component.literal("PBR 中性");
@@ -4052,7 +4419,7 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                                             "返回"
                                     ),
                                     button ->
-                                            this.openPage(PAGE_HUB)
+                                            this.openPage(this.parentPage())
                             )
                             .width(
                                     150
@@ -4065,6 +4432,13 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.layout.addToFooter(
                 footer
         );
+    }
+
+
+    // 2026-10-26 子页的「返回」目标：色彩分级是从「后处理」点进去的，返回就回后处理，
+    // 别一下子甩回 hub（否则调一格就要重新点两次才能回到邻居旋钮）。
+    private int parentPage() {
+        return this.page == PAGE_COLORGRADE ? PAGE_POST : PAGE_HUB;
     }
 
 
@@ -4103,6 +4477,8 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.addOptionRow(this.hubButton("降雨", PAGE_RAIN));
         this.addOptionRow(this.hubButton("水面", PAGE_WATER));
         this.addOptionRow(this.hubButton("材质与画面", PAGE_MATERIAL));
+        // 2026-10-26：色彩分级**不**在 hub 上单开分类 —— 它是「后处理」页里的
+        // 子页（用户要求：色彩映射留在后处理，另给一个入口点进详细调色）。
         this.addOptionRow(this.hubButton("后处理", PAGE_POST));
         this.flushOptionRow();
     }

@@ -257,6 +257,15 @@ def rtxRuntimeShaderFiles = [
 		// 远场太阳阴影图生产者（2026-10-01）。1024²，rgen 的远场分支采样它；
 		// 漏打包会在 createSunShadowFarResources 的 loadSpv 处直接抛异常。
 		"rt_sun_shadow_far.comp.spv",
+		// 体积光 froxel + ReSTIR 的 INITIAL 阶段（2026-10-26，ORION_VOL_RESTIR
+		// 默认 0）。缺这个 SPV 时宿主会打印 "[VOL RESTIR] pipeline unavailable"
+		// 并整体降级（不 dispatch），不会中断其余渲染 —— 但开了开关就等于没效果。
+		"vol_restir.comp.spv",
+		"vol_restir_temporal.comp.spv",
+		"vol_restir_spatial.comp.spv",
+		"vol_restir_visibility.comp.spv",
+		"vol_restir_integrate.comp.spv",
+		"vol_restir_composite.comp.spv",
 		"rr_sdr_post.comp.spv",
 		"rr_hdr_encode.comp.spv",
 		"rr_ae_histogram.comp.spv",

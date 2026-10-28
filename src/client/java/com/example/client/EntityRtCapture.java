@@ -334,19 +334,23 @@ public final class EntityRtCapture {
     }
 
     /**
-     * 2026-10-06：把实体帧窗口提前到"第一人称手部/手持物提交之前"，并且**幂等**。
+     * 打开实体帧窗口，**幂等**（每帧恰恰一次原生 {@code beginEntityFrame()}）。
      *
-     * <p>26.3 的 {@code GameRenderer.render} 里，手部是
-     * {@code FirstPersonHandsAndItemsRenderer.submitHandsWithItems(...)} 提交后**立刻**
-     * 由 {@code renderAllFeatures} 落进顶点缓冲的，位置在世界渲染（{@code renderLevel}）
-     * <b>之前</b>。而 mod 的窗口一直开在 {@code LevelRenderer.render} 的 HEAD 里
-     * ⇒ 手的顶点全部落在窗口之外，被 {@code captureVertex} 静默丢弃 —— 这就是
-     * "第一人称手部一直不渲染"。</p>
+     * <p>⚠ 2026-10-25 修正（旧注释与 26.3 源码不符）：26.3 的实际顺序是
+     * {@code GameRenderer.renderLevel()} → {@code levelRenderer.render(...)}（世界）
+     * → {@code render3dHud(...)} → {@code renderItemInHand(...)}（第一人称手/手持物）。
+     * 也就是说<b>手在世界之后提交</b>，而不是旧注释写的"手在世界之前"。</p>
      *
-     * <p>这里只是把开口提前；`LevelRenderer` 那一处改为同样调用本方法，于是两条
-     * 路径都安全：手部存在时由手先开，第三人称/无手时由世界渲染开。原生的
-     * {@code beginEntityFrame()}（清空顶点数组）必须**每帧恰好一次**，所以由这里的
-     * 布尔量把关。</p>
+     * <p>由此得到的真实故障（2026-10-25 现场核对）：旧代码在
+     * {@code LevelRenderer.render} 的 RETURN 就调用 {@code endEntityFrame()}，
+     * 而手的 feature 批次要到之后 {@code render3dHud} 里才 prepareGroup ⇒
+     * Java 侧照常捕获（slot、LabPBR 都解析过），但 {@code NativeVulkan.uploadEntityBatch}
+     * 撞上原生门禁 {@code if(!g_entityFrameOpen) return;} 被<b>静默丢弃</b>。
+     * 结论：<b>手是有的（有几何、有材质），只是完全不参与光追</b>。</p>
+     *
+     * <p>所以窗口必须跨"世界 + 手"两段：世界开始时在这里打开，手提交完由
+     * {@link #finishEntityFrame()} 收帧（见 {@code GameRendererMixin} 的 prepareFrame
+     * 注入点）；第三人称/无 HUD 等没有手的帧由 {@code renderLevel} 的 RETURN 兜底。</p>
      */
     public static void beginEarlyFrame() {
         if (entityFrameOpen) {
@@ -370,8 +374,21 @@ public final class EntityRtCapture {
     /**
      * 进入手部阶段：开窗 + 标记"这一段提交的是手"。
      *
-     * <p>标记的用途只有一个：让 {@link #isLocalPlayerProxyState} 不要把手判成
-     * 本地玩家身体代理（那会落到主相机看不见的 LOCAL_PLAYER 层）。</p>
+     * <p>⚠ 2026-10-25：<b>没有调用者，是死代码，不要再接回来。</b> 原来调用它的
+     * {@code FirstPersonHandsAndItemsRendererMixin} 已经从仓库里删除（grep 可证）。
+     * 更关键的是这个标记的两条用途现在<b>都是错的</b>：</p>
+     * <ul>
+     *   <li>顶点旋转（{@link #captureVertex} 里的 {@code handRotation}）：26.3 的
+     *       {@code GameRenderer.renderItemInHand} 已经把
+     *       {@code viewRotationMatrix.invert()} 乘进 PoseStack（GameRenderer.java:384），
+     *       顶点已是"世界朝向 + 相机相对"，与 ENTITY 层同口径 ⇒ 再旋一次会把
+     *       手转到侧面/背后；</li>
+     *   <li>代理豁免（{@link #isLocalPlayerProxyState}）：26.3 第一人称手臂走
+     *       {@code submitModelPart}，state 是 {@code Unit.INSTANCE}（不是
+     *       {@code AvatarRenderState}），本来就不会命中 id 回退，不需要豁免。</li>
+     * </ul>
+     * <p>因此手的帧窗口问题改由 {@link #beginEarlyFrame()} + {@link #finishEntityFrame()}
+     * 的时序解决，与 handPhase 无关。</p>
      */
     public static void beginHandPhase() {
         if (!handPhaseLogged) {
@@ -431,9 +448,13 @@ public final class EntityRtCapture {
     }
 
     /**
-     * Closes the frame. The text run is the one batch that is not bounded by a
-     * single model submit, so it is flushed here rather than in endModel's
-     * caller. Must run before {@code NativeVulkan.endEntityFrame()}.
+     * Closes the Java-side capture window (text run flush + counters). The text
+     * run is the one batch that is not bounded by a single model submit, so it
+     * is flushed here rather than in endModel's caller.
+     *
+     * <p>⚠ 2026-10-25：不要直接调用它来收帧 —— 必须走 {@link #finishEntityFrame()}，
+     * 那个方法才会连同 {@code NativeVulkan.endEntityFrame()} 一起收（原生门禁是
+     * {@code g_entityFrameOpen}，只关 Java 标记会让手/实体几何继续被静默丢弃）。</p>
      */
     public static void endFrame() {
         captureFrameActive = false;
@@ -481,6 +502,35 @@ public final class EntityRtCapture {
                             // "开关生效且此刻确实在招牌区"的判据（见 TEXT_CAPTURE_ENABLED）。
                             + " disabled=" + (TEXT_CAPTURE_ENABLED ? 0 : 1));
         }
+    }
+
+    /**
+     * 2026-10-25：收实体帧 —— Java 标记 + 原生 {@code endEntityFrame()} 一起收，幂等。
+     *
+     * <p>调用时序（26.3）：</p>
+     * <ol>
+     *   <li>{@code LevelRenderer.render} HEAD → {@link #beginEarlyFrame()} 开窗（世界实体）；</li>
+     *   <li>{@code GameRenderer.render3dHud → renderItemInHand}：手/手持物提交，
+     *       {@code FeatureRenderDispatcher.prepareFrame} 返回后由 {@code GameRendererMixin}
+     *       调用本方法 —— 此时手顶点已经进了实体批次，且<b>早于</b>
+     *       {@code createRenderPass("Item in hand")}（RT 注入就发生在那个 render pass
+     *       的 vkCmdBeginRendering 之前），所以同帧就能看到手，没有一帧延迟；</li>
+     *   <li>第三人称 / 隐藏 HUD / 无手帧走不到上面那一步 ⇒
+     *       {@code GameRenderer.renderLevel} 的 RETURN 兜底调用本方法。</li>
+     * </ol>
+     *
+     * <p>为什么必须在这里收而不是在 {@code LevelRenderer.render} 的 RETURN：手晚于世界，
+     * 提前收会把手的批次挡在原生门禁 {@code if(!g_entityFrameOpen) return;} 外面
+     * —— 这正是 2026-10-25 之前"手完全不参与光追"的原因。</p>
+     */
+    public static void finishEntityFrame() {
+        if (!entityFrameOpen) {
+            // 已经收过（手路径 + renderLevel 兜底会各调一次）。原生 endEntityFrame 自身
+            // 也按 g_entityFrameOpen 幂等，但这里早退可以避免 text perf 行重复打印。
+            return;
+        }
+        endFrame();
+        NativeVulkan.endEntityFrame();
     }
 
     /**
@@ -802,14 +852,58 @@ public final class EntityRtCapture {
     // 于是 MV 同时含平移与旋转，且对纯平移与旧口径**数值等价**
     // （delta = 纯平移时，逐顶点结果恰好等于那个平移常量）。
     //
-    // ⚠ 仍然不建模**骨骼动画**（setupAnim 摆动的四肢、尾巴、披风形变）：
-    //   那是逐骨的，需要上一帧的逐顶点位置，本通道拿不到。所以"走路时摆臂"
-    //   那一部分依旧没有 MV —— 但它叠在根平移上、且幅度远小于根运动，
-    //   比"整项缺失"好得多。详见交付文档「已知限制」。
+    // ⚠ 2026-10-26 更新：setupAnim 摆动的四肢 / 尾巴 / 披风形变现在**有** MV 了
+    //   —— 不靠根位姿，而是缓存上一帧同批次的逐顶点位置直接做差（见下面的
+    //   LIMB_MV_ENABLED / entityVertexHistories）。拿不到可信历史时（首帧 /
+    //   顶点数变了 / 上一帧没提交）仍退回这里的根位姿增量。
     // =====================================================
     private static final java.util.HashMap<
             net.minecraft.world.entity.EntityType<?>, java.util.ArrayList<double[]>>
             entityMotionTrackers = new java.util.HashMap<>();
+
+    /**
+     * 2026-10-26 四肢摆动 / 披风 / 尾巴等**逐顶点姿态动画**进 MV。
+     *
+     * <p>根位姿增量只能表达"整个实体怎么动"，setupAnim 摆动的四肢在它看来是不动的。
+     * 这里按 Remix 的做法（geometry_resolver 用上一帧蒙皮顶点位置）缓存上一帧同一
+     * (模型, RenderType) 提交的顶点位置，本帧同下标相减：
+     * {@code motion = p_prev − p_cur}。顶点顺序由模型结构决定（同一模型逐帧不变），
+     * 所以下标就是对应关系；顶点数变了（部件显隐 / 换模型）或上一帧没提交这批判次
+     * 时返回 null，整批退回根位姿增量 —— 与旧口径逐位相同，不会产生错配的运动。</p>
+     *
+     * <p>键里的 {@code RenderType} 用身份相等（RenderTypes 的工厂是记忆化的，
+     * 同一贴图逐帧返回同一实例）；{@code Model} 同理是渲染器持有的单例。</p>
+     */
+    private static final boolean LIMB_MV_ENABLED = resolveLimbMvEnabled();
+
+    private static boolean resolveLimbMvEnabled() {
+        String raw = System.getProperty("orion.limbMv");
+        if (raw == null) {
+            raw = System.getenv("ORION_LIMB_MV");
+        }
+        return raw == null || !"0".equalsIgnoreCase(raw.trim());
+    }
+
+    /**
+     * 顶点位置历史表：键是 tracker 记录（{@code double[]}，数组的 equals/hashCode
+     * 就是身份语义），与记录同生命周期 —— 记录被 prune 掉时这里一起删。
+     */
+    private static final java.util.HashMap<
+            double[], java.util.HashMap<ModelBatchKey, VertexHistory>>
+            entityVertexHistories = new java.util.HashMap<>();
+
+    /** 单个实体最多缓存多少条 (模型, RenderType) 历史；超了整体清空、下一帧重建。 */
+    private static final int ENTITY_VERTEX_HISTORY_MAX_KEYS = 32;
+
+    /** 一批模型几何的稳定身份：同一实体的同一提交逐帧对应。 */
+    private record ModelBatchKey(Model<?> model, RenderType renderType) {}
+
+    /** 一条 (模型, RenderType) 批次的上一帧顶点位置（相机相对，与顶点缓冲同序）。 */
+    private static final class VertexHistory {
+        /** 采样的帧号；只有恰好上一帧的数据才能当 p_prev 用。 */
+        private int frame = Integer.MIN_VALUE;
+        private float[] positions;
+    }
 
     /** 本帧序号（beginFrame 自增），同时充当记录的"最后匹配帧"。 */
     private static int entityMotionFrame;
@@ -862,6 +956,7 @@ public final class EntityRtCapture {
         record[T_Z] = z;
         record[T_FRAME] = entityMotionFrame;
         setIdentityDelta(record);
+        entityVertexHistories.put(record, new java.util.HashMap<>());
         return record;
     }
 
@@ -999,8 +1094,9 @@ public final class EntityRtCapture {
         final double y = renderState.y;
         final double z = renderState.z;
 
-        // 本帧根位姿：与顶点同一空间（世界减相机），含平移 + 整体旋转，
-        // 不含 setupAnim 的逐骨动画（见类内 tracker 说明与交付文档的已知限制）。
+        // 本帧根位姿：与顶点同一空间（世界减相机），含平移 + 整体旋转。
+        // setupAnim 的逐骨动画不在根位姿里，由顶点位置历史单独覆盖（见
+        // LIMB_MV_ENABLED）；这里是拿不到历史时的兜底。
         final com.mojang.blaze3d.vertex.PoseStack.Pose rootPose = submit.pose();
         final Matrix4f currentPose = rootPose != null ? rootPose.pose() : null;
 
@@ -1027,6 +1123,7 @@ public final class EntityRtCapture {
 
         if (best != null && bestDistance <= ENTITY_MOTION_MATCH_RADIUS_SQ) {
             applyRecordedMotion(batch, best);
+            attachVertexHistory(batch, submit, best);
             return;
         }
 
@@ -1051,6 +1148,8 @@ public final class EntityRtCapture {
             final double[] record = entityMotionTracker(x, y, z);
             writePose(record, currentPose);
             trackers.add(record);
+            // 仍然挂上历史：本帧 uploadBatch 会把顶点位置记进去，下一帧就有 p_prev 了。
+            attachVertexHistory(batch, submit, record);
             return;
         }
 
@@ -1083,10 +1182,29 @@ public final class EntityRtCapture {
         writePose(candidate, currentPose);
 
         applyRecordedMotion(batch, candidate);
+        attachVertexHistory(batch, submit, candidate);
 
         if (trackers.size() > ENTITY_MOTION_MAX_TRACKERS_PER_TYPE) {
             pruneEntityMotionTrackers();
         }
+    }
+
+    /**
+     * 把该记录所属的顶点位置历史挂到批次上。没有历史（开关关闭 / 记录刚被 prune）
+     * 时保持 null ⇒ uploadBatch 退回根位姿增量。
+     */
+    private static void attachVertexHistory(
+            ActiveBatch batch, ModelFeatureRenderer.Submit<?> submit, double[] record) {
+        if (!LIMB_MV_ENABLED) {
+            return;
+        }
+        final java.util.HashMap<ModelBatchKey, VertexHistory> history =
+                entityVertexHistories.get(record);
+        if (history == null) {
+            return;
+        }
+        batch.vertexHistory = history;
+        batch.vertexHistoryKey = new ModelBatchKey(submit.model(), submit.renderType());
     }
 
     /** 清掉太久没被匹配到的记录（以及随之变空的类型）。 */
@@ -1104,6 +1222,8 @@ public final class EntityRtCapture {
                 final double[] record = trackers.get(index);
                 if (entityMotionFrame - (int)record[T_FRAME] > ENTITY_MOTION_MAX_AGE_FRAMES) {
                     trackers.remove(index);
+                    // 顶点位置历史与记录同生命周期，否则表会随实体消失一直涨。
+                    entityVertexHistories.remove(record);
                 }
             }
 
@@ -1118,6 +1238,9 @@ public final class EntityRtCapture {
             boolean localPlayerProxy) {
         if (activeBatch.get() != null) throw new IllegalStateException("Nested entity model capture");
         Identifier texture = resolveSampler0(submit.renderType());
+        // ⚠ 2026-10-25：handPhase 恒为 false（beginHandPhase 无调用者），本段是死代码。
+        // 且"把手贴图换成方块图集"的诊断前提已不成立 —— 手看不见不是贴图解不出来，
+        // 而是手在 endEntityFrame 之后提交、被原生门禁丢弃（见 beginEarlyFrame）。
         if (handPhase) {
             // 2026-10-06 诊断：第一人称手的贴图是玩家皮肤。本仓库注释里记过
             // "26.3 的皮肤走 PlayerSkinRenderCache，Sampler0 的 location 与
@@ -1192,6 +1315,10 @@ public final class EntityRtCapture {
         // 与玩家坐标放在一起：如果顶点数 > 0 但包围盒远离玩家坐标，说明"捕获到了但
         // 位置不对"（第一人称的手是相机相对空间，与实体层同空间，理论应贴近玩家）；
         // 如果压根没有这一行，说明手根本没被捕获。
+        // ⚠ 2026-10-25：handPhase 恒 false ⇒ 这条 [RTX-HAND] 读数永远不会打印。
+        // 要确认"手是否进了 RT"，不要再等这条日志，直接看 [RTX-HAND] 的替代物：
+        // 手批次现在与实体同窗口，若仍看不见，先查 handRotation 是否被误开、以及
+        // 相机近平面/实例 mask，而不是贴图。
         if (handPhase && !handBatchLogged) {
             handBatchLogged = true;
             Minecraft minecraft = Minecraft.getInstance();
@@ -1325,41 +1452,69 @@ public final class EntityRtCapture {
         // =====================================================
         // 2026-10-17 运动矢量：位移通道（逐顶点）。
         //
-        // 旧口径是"整批一个平移常量"，因为位移只来自根位置差。现在位移是
-        // `p_prev = delta · p_cur` 的仿射增量 ⇒ 必须逐顶点算，否则旋转不起作用。
+        // 旧口径是"整批一个平移常量"，因为位移只来自根位置差。现在位移按顶点算。
+        //
+        // 2026-10-26：优先用**上一帧同批次顶点位置**做差（四肢摆动 / 披风形变进
+        // MV，见 LIMB_MV_ENABLED 与 attachVertexHistory）。只有拿不到可信历史
+        // （新实体 / 顶点数变了 / 上一帧没提交这一批 / 开关关闭）时，才退回根位姿
+        // 增量 `p_prev = delta · p_cur` —— 那条路与旧实现逐位相同。
         //
         // 位置直接从**已经写好的顶点缓冲**里读（绝对下标 getFloat，不改 position），
         // 所以与上传给 native 的几何**逐顶点同源**：不可能出现"位移按另一份坐标算"
         // 这种错位（这正是本通道历史上最容易踩的坑）。
         //
-        // 成本：每顶点 9 乘 6 加 + 3 次绝对读；实体层顶点数在千级 ⇒ 每帧万级浮点运算，
-        // 与模型捕获本身（每顶点 12 个 float 的拷贝 + 变换）同量级，可忽略。
-        //
-        // hasPoseDelta == false（文字/末地门/通用几何/静止实体/首帧）时**传 0**：
-        // native 会把该段补 0，比在这里填一份全零缓冲更省，语义也完全相同。
+        // 成本：每顶点 3 次减法 + 3 次数组写（原来就是每顶点 9 乘 6 加）；
+        // 内存：每实体每 (模型, RenderType) 一份 float[3N]，随 tracker 记录一起回收。
         // =====================================================
         long motionPointer = 0L;
-        if (batch.hasPoseDelta && batch.vertexCount > 0) {
-            final int need = batch.vertexCount * 3 * Float.BYTES;
-            if (batch.motionScratch == null || batch.motionScratch.capacity() < need) {
-                batch.motionScratch = ByteBuffer.allocateDirect(need).order(ByteOrder.nativeOrder());
-            } else {
-                batch.motionScratch.clear();
+        if (batch.vertexCount > 0) {
+            final int motionFloats = batch.vertexCount * 3;
+            final boolean useVertexHistory = batch.vertexHistoryIsPreviousFrame(motionFloats);
+            final float[] positionStore = batch.vertexHistoryPositions(motionFloats);
+            final boolean needMotion = useVertexHistory || batch.hasPoseDelta;
+            if (needMotion || positionStore != null) {
+                final ByteBuffer motion = needMotion ? batch.motionScratchFor(motionFloats) : null;
+                final ByteBuffer positions = batch.buffer;
+                final float[] delta = batch.poseDelta;
+                boolean anyMotion = false;
+                for (int vertex = 0; vertex < batch.vertexCount; ++vertex) {
+                    final int offset = vertex * BYTES_PER_VERTEX;
+                    final float px = positions.getFloat(offset);
+                    final float py = positions.getFloat(offset + 4);
+                    final float pz = positions.getFloat(offset + 8);
+                    if (needMotion) {
+                        final float mx;
+                        final float my;
+                        final float mz;
+                        if (useVertexHistory) {
+                            final int motionIndex = vertex * 3;
+                            mx = positionStore[motionIndex] - px;
+                            my = positionStore[motionIndex + 1] - py;
+                            mz = positionStore[motionIndex + 2] - pz;
+                        } else {
+                            mx = delta[0] * px + delta[1] * py + delta[2] * pz + delta[3] - px;
+                            my = delta[4] * px + delta[5] * py + delta[6] * pz + delta[7] - py;
+                            mz = delta[8] * px + delta[9] * py + delta[10] * pz + delta[11] - pz;
+                        }
+                        anyMotion |= mx != 0.0F || my != 0.0F || mz != 0.0F;
+                        motion.putFloat(mx).putFloat(my).putFloat(mz);
+                    }
+                    if (positionStore != null) {
+                        final int motionIndex = vertex * 3;
+                        positionStore[motionIndex] = px;
+                        positionStore[motionIndex + 1] = py;
+                        positionStore[motionIndex + 2] = pz;
+                    }
+                }
+                if (positionStore != null) {
+                    batch.storeVertexHistory(positionStore);
+                }
+                // 全 0 时不传：native 会补 0，语义相同，也避免静止实体白白多传 12B/顶点。
+                if (needMotion && anyMotion) {
+                    motion.flip();
+                    motionPointer = MemoryUtil.memAddress(motion);
+                }
             }
-            final ByteBuffer positions = batch.buffer;
-            final float[] delta = batch.poseDelta;
-            for (int vertex = 0; vertex < batch.vertexCount; ++vertex) {
-                final int offset = vertex * BYTES_PER_VERTEX;
-                final float px = positions.getFloat(offset);
-                final float py = positions.getFloat(offset + 4);
-                final float pz = positions.getFloat(offset + 8);
-                final float nx = delta[0] * px + delta[1] * py + delta[2] * pz + delta[3];
-                final float ny = delta[4] * px + delta[5] * py + delta[6] * pz + delta[7];
-                final float nz = delta[8] * px + delta[9] * py + delta[10] * pz + delta[11];
-                batch.motionScratch.putFloat(nx - px).putFloat(ny - py).putFloat(nz - pz);
-            }
-            batch.motionScratch.flip();
-            motionPointer = MemoryUtil.memAddress(batch.motionScratch);
         }
 
         NativeVulkan.uploadEntityBatch(batch.textureSlot, MemoryUtil.memAddress(batch.buffer), batch.vertexCount, BYTES_PER_VERTEX, motionPointer);
@@ -1385,6 +1540,11 @@ public final class EntityRtCapture {
         // model batch and retain one local reference for the whole call.
         ActiveBatch batch = activeBatch.get();
         if (batch == null) return;
+        // ⚠ 2026-10-25：handPhase 恒 false ⇒ 本段不执行，而且**不应该**执行。
+        // GameRenderer.renderItemInHand 已把 viewRotationMatrix.invert() 乘进 PoseStack
+        // （GameRenderer.java:384），传到这里的手顶点已经是"世界朝向 + 相机相对"，
+        // 与 ENTITY 层同口径；再乘一次 handRotation 会把手转到侧面/背后。
+        // 下面的 M·v / Mᵀ·v 三选一属于 26.2 的旧空间假设，保留只为历史可读。
         if (handPhase && handTransformMode != 0) {
             // 2026-10-06 第一人称手：顶点是**视图空间**的（手臂相对眼睛的偏移，没有
             // 相机旋转），而实体层用的是"世界朝向 + 相机相对"。缺的这一步只能是
@@ -2324,7 +2484,8 @@ public final class EntityRtCapture {
         //
         // 语义：对顶点 p（世界减相机空间），`p_prev = delta · p`。
         // 一个批次 = 一个模型的一次 submit ⇒ 整批共用同一个增量（同一个刚体）。
-        // 含平移与整体旋转；**不含** setupAnim 的逐骨动画（见 tracker 说明）。
+        // 含平移与整体旋转。这是**兜底**增量：模型批次若有上一帧顶点位置历史，
+        // 逐顶点运动由那份历史给出（含 setupAnim 的四肢摆动），不再用这个矩阵。
         //
         // 为什么增量在 beginModel 处算、却在这里逐顶点应用：
         //   · 只有 beginModel 的 submit 里有实体上下文（身份 + 根位姿）；
@@ -2335,8 +2496,14 @@ public final class EntityRtCapture {
         private boolean hasPoseDelta;
         /** 平移三元组（诊断/日志用；真正的 MV 由 {@link #poseDelta} 逐顶点算）。 */
         private float motionX, motionY, motionZ;
-        /** 位移通道暂存（每顶点 3 个 float）。只在 hasPoseDelta 时才填、才上传。 */
+        /** 位移通道暂存（每顶点 3 个 float）。只在需要时才填、才上传。 */
         private ByteBuffer motionScratch;
+        /**
+         * 2026-10-26 四肢摆动 MV：该批次所属实体的顶点位置历史表 + 本批判次的键。
+         * 两者为 null（文字 / 通用几何 / 开关关闭）⇒ 退回 {@link #poseDelta}。
+         */
+        private java.util.HashMap<ModelBatchKey, VertexHistory> vertexHistory;
+        private ModelBatchKey vertexHistoryKey;
 
         private static final int PENDING_VERTEX_FLOATS = 5;
         private final float[] pendingQuadVertices = new float[4 * PENDING_VERTEX_FLOATS];
@@ -2368,12 +2535,67 @@ public final class EntityRtCapture {
             hasPoseDelta = false;
             java.util.Arrays.fill(poseDelta, 0.0F);
             motionX = motionY = motionZ = 0.0F;
+            vertexHistory = null;
+            vertexHistoryKey = null;
             return this;
         }
 
         private CapturingVertexConsumer captureConsumer() {
             consumer.reset();
             return consumer;
+        }
+
+        /**
+         * 本批次顶点位置的落点数组；null = 这一批不缓存（文字/通用几何/开关关闭）。
+         * 命中上一帧时返回历史数组本身（读一个下标、写同一个下标，原地滚动）。
+         */
+        private float[] vertexHistoryPositions(int floats) {
+            if (vertexHistory == null || vertexHistoryKey == null) {
+                return null;
+            }
+            final VertexHistory entry = vertexHistory.get(vertexHistoryKey);
+            if (entry != null && entry.positions != null && entry.positions.length == floats) {
+                return entry.positions;
+            }
+            return new float[floats];
+        }
+
+        /** 历史里这一批是否恰好是上一帧采样的（帧号连续才信任下标对应关系）。 */
+        private boolean vertexHistoryIsPreviousFrame(int floats) {
+            if (vertexHistory == null || vertexHistoryKey == null) {
+                return false;
+            }
+            final VertexHistory entry = vertexHistory.get(vertexHistoryKey);
+            return entry != null
+                    && entry.frame == entityMotionFrame - 1
+                    && entry.positions != null
+                    && entry.positions.length == floats;
+        }
+
+        /** 把本帧位置登记为下一帧的 p_prev。 */
+        private void storeVertexHistory(float[] positions) {
+            VertexHistory entry = vertexHistory.get(vertexHistoryKey);
+            if (entry == null) {
+                // 键数有上限：宁可整表清空（下一帧全部退回根增量），也不让异常模型
+                // 无限攒内存。
+                if (vertexHistory.size() >= ENTITY_VERTEX_HISTORY_MAX_KEYS) {
+                    vertexHistory.clear();
+                }
+                entry = new VertexHistory();
+                vertexHistory.put(vertexHistoryKey, entry);
+            }
+            entry.positions = positions;
+            entry.frame = entityMotionFrame;
+        }
+
+        private ByteBuffer motionScratchFor(int floats) {
+            final int need = floats * Float.BYTES;
+            if (motionScratch == null || motionScratch.capacity() < need) {
+                motionScratch = ByteBuffer.allocateDirect(need).order(ByteOrder.nativeOrder());
+            } else {
+                motionScratch.clear();
+            }
+            return motionScratch;
         }
 
         private void capture(float x, float y, float z, int color, float u, float v) {

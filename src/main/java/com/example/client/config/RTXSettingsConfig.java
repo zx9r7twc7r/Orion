@@ -126,7 +126,7 @@ public final class RTXSettingsConfig {
 // =====================================================
 
     private static float noDirectLightAmbient =
-            0.01f;
+            0.0001f;
 
 
 // =====================================================
@@ -386,6 +386,245 @@ public final class RTXSettingsConfig {
     // （批次1-B：第四分量原为"透光残量"尾巴，已升格为 Hillaire octave 级联
     //   贡献 con——octave o 贡献 con^o、偏心率逐级退化；JAR 从未发布过旧键，
     //   JSON 键直接改名 cloudMsOctaveStrength。）
+    // ------------------------------------------------------------------
+    // 2026-10-25 v5（HPVolumeCloud 移植）的 28 项全参数。CameraUBO 尾块
+    // hpShapeA..hpMiscA 的东西，顺序与 `setCloudHpParams(float[28])` 严格一致。
+    // 用**数组**装：28 个 float 逐个声明会连带 28 个 pending 字段 / 28 个滑条
+    // 各写一遍，加一项就要改四处；数组 + 下面两张表让 UI 与校验都能循环生成。
+    //   · 记录内部 clone 一份，外部拿到的是副本（record 装数组必须做防御性拷贝）
+    //   · sanitized() 负责"旧存档没有这个字段/长度不对"时回落出厂值并逐项钳制
+    // ------------------------------------------------------------------
+    public static final float[] DEFAULT_CLOUD_HP = {
+            0.55f, 0.7f, 0.85f, 0.08f, 0.4f, 0.15f, 0.75f, 2.0f, 0.45f, 0.45f, 2.2f, 1.0f, 1.0f, 0.25f, 0.35f, 0.6f, 0.85f, 0.3f, 0.6f, 1.0f, 0.0f, 1.0f, 0.1f, 1.0f, 0.5f, 1.0f, 0.3f, 1.0f
+    };
+    public static final String[] CLOUD_HP_LABELS = {
+            "Cu 侵蚀强度",
+            "Tcu 侵蚀强度",
+            "Cb 侵蚀强度",
+            "云底平滑高度",
+            "Wispy 边缘宽度",
+            "Wispy 外延",
+            "Wispy 顶高",
+            "Wispy 顶硬度",
+            "Wispy 权重",
+            "Billowy 权重",
+            "顶部拉伸上限",
+            "顶部拉伸强度",
+            "覆盖度标定",
+            "Sc 强度",
+            "Sc 高度压缩",
+            "Sc 胞厚",
+            "前向偏心率",
+            "后向偏心率",
+            "phi 前向强度",
+            "phi 深度幂",
+            "phi 深度偏移",
+            "phi 压缩",
+            "散射 OD 尺度",
+            "散射曲线幂",
+            "MS 偏心率",
+            "AO 向上尺度",
+            "远处淡出起点",
+            "粉末效应（保留）"
+    };
+    public static final float[][] CLOUD_HP_RANGES = {
+            { 0.0f, 1.5f, 0.01f },
+            { 0.0f, 1.5f, 0.01f },
+            { 0.0f, 1.5f, 0.01f },
+            { 0.0f, 0.3f, 0.005f },
+            { 0.01f, 1.0f, 0.01f },
+            { 0.0f, 0.5f, 0.01f },
+            { 0.0f, 0.99f, 0.01f },
+            { 0.0f, 4.0f, 0.1f },
+            { 0.0f, 2.0f, 0.01f },
+            { 0.0f, 2.0f, 0.01f },
+            { 1.0f, 3.0f, 0.05f },
+            { 0.0f, 1.0f, 0.01f },
+            { 0.2f, 3.0f, 0.05f },
+            { 0.0f, 1.0f, 0.01f },
+            { 0.05f, 1.0f, 0.01f },
+            { 0.0f, 1.0f, 0.01f },
+            { 0.0f, 1.0f, 0.01f },
+            { 0.0f, 1.0f, 0.01f },
+            { 0.0f, 2.0f, 0.01f },
+            { 0.0f, 2.0f, 0.01f },
+            { -0.3f, 0.5f, 0.01f },
+            { 0.0f, 3.0f, 0.05f },
+            { 0.01f, 0.5f, 0.005f },
+            { 0.5f, 3.0f, 0.05f },
+            { 0.0f, 1.0f, 0.01f },
+            { 0.0f, 2.0f, 0.01f },
+            { 0.0f, 0.95f, 0.01f },
+            { 0.0f, 1.0f, 0.01f }
+    };
+
+    public record CloudHpSettings(float[] values) {
+        public static final int COUNT = 28;
+
+        public CloudHpSettings {
+            if(values == null || values.length != COUNT)
+                throw new IllegalArgumentException("cloud hp needs " + COUNT + " values");
+            values = values.clone();
+            for(int i = 0; i < COUNT; ++i)
+            {
+                if(!Float.isFinite(values[i]))
+                    throw new IllegalArgumentException("Invalid cloud hp value #" + i);
+                float lo = CLOUD_HP_RANGES[i][0];
+                float hi = CLOUD_HP_RANGES[i][1];
+                values[i] = Math.min(Math.max(values[i], lo), hi);
+            }
+        }
+
+        /** 旧存档 / 长度不符 / 含 NaN 时回落出厂值，其余逐项钳制。 */
+        public static CloudHpSettings sanitized(float[] raw) {
+            float[] out = DEFAULT_CLOUD_HP.clone();
+            if(raw != null)
+            {
+                for(int i = 0; i < COUNT && i < raw.length; ++i)
+                {
+                    if(Float.isFinite(raw[i])) out[i] = raw[i];
+                }
+            }
+            return new CloudHpSettings(out);
+        }
+
+        public float value(int index) {
+            return values[index];
+        }
+
+        public float[] toParamArray() {
+            return values.clone();
+        }
+    }
+
+    private static CloudHpSettings cloudHpSettings =
+            new CloudHpSettings(DEFAULT_CLOUD_HP.clone());
+    public static synchronized CloudHpSettings getCloudHpSettings() { return cloudHpSettings; }
+    public static synchronized void setCloudHpSettings(CloudHpSettings settings) {
+        cloudHpSettings = java.util.Objects.requireNonNull(settings);
+        markDirty();
+    }
+
+    // 2026-10-26 **色彩分级**（设置页「色彩映射与调色」）24 项。
+    // 与 CloudHpSettings 同一套写法（数组 + 表驱动），原因也一样：24 个 float
+    // 逐个声明会连带 24 个 pending 字段 / 24 条滑条再写一遍。
+    //
+    // 作用点：rr_sdr_post.comp 里 **tonemap + gamma + 饱和度之后** 的显示域，
+    // 顺序 = 黑白场 → 支点对比 → 逐通道 Lift/Gamma/Gain → 色相旋转 →
+    // 分离色调 → 自然饱和度 → 褪色 → 绿/品红 → 暗角。
+    // 全部取中性值时着色器整块跳过 ⇒ 没调过的人画面逐位不变。
+    //
+    // 走**独立** JNI：NativeVulkan.setColorGradeParams(float[24])。
+    // 范围必须与 cpp/VulkanCore.cpp 的 setColorGradeParams 钳制逐项一致。
+    public static final float[] DEFAULT_COLOR_GRADE = {
+            0.00f, 0.00f, 1.00f, 1.00f, 0.18f,
+            0.00f, 0.00f, 0.00f,
+            1.00f, 1.00f, 1.00f,
+            1.00f, 1.00f, 1.00f,
+            200.0f, 0.00f, 45.00f, 0.00f,
+            0.00f, 0.00f, 0.00f, 0.60f, 0.00f, 0.00f
+    };
+    public static final String[] COLOR_GRADE_LABELS = {
+            "手动曝光（档）",
+            "黑点",
+            "白点",
+            "显示对比",
+            "对比支点",
+            "Lift R（阴影偏红）",
+            "Lift G（阴影偏绿）",
+            "Lift B（阴影偏蓝）",
+            "Gamma R（中间调）",
+            "Gamma G",
+            "Gamma B",
+            "Gain R（高光偏红）",
+            "Gain G",
+            "Gain B",
+            "阴影色相（度）",
+            "阴影着色强度",
+            "高光色相（度）",
+            "高光着色强度",
+            "自然饱和度",
+            "褪色 / 发灰",
+            "暗角强度",
+            "暗角半径",
+            "色相旋转（度）",
+            "绿 / 品红"
+    };
+    /** { 最小值, 最大值, 步进 } —— 必须与 cpp 侧钳制一致。 */
+    public static final float[][] COLOR_GRADE_RANGES = {
+            { -4.0f, 4.0f, 0.05f },
+            { 0.0f, 0.3f, 0.005f },
+            { 0.7f, 1.5f, 0.01f },
+            { 0.5f, 2.0f, 0.01f },
+            { 0.05f, 0.95f, 0.01f },
+            { -0.15f, 0.15f, 0.005f },
+            { -0.15f, 0.15f, 0.005f },
+            { -0.15f, 0.15f, 0.005f },
+            { 0.5f, 2.0f, 0.01f },
+            { 0.5f, 2.0f, 0.01f },
+            { 0.5f, 2.0f, 0.01f },
+            { 0.5f, 2.0f, 0.01f },
+            { 0.5f, 2.0f, 0.01f },
+            { 0.5f, 2.0f, 0.01f },
+            { 0.0f, 360.0f, 1.0f },
+            { 0.0f, 1.0f, 0.01f },
+            { 0.0f, 360.0f, 1.0f },
+            { 0.0f, 1.0f, 0.01f },
+            { -1.0f, 1.0f, 0.01f },
+            { 0.0f, 1.0f, 0.01f },
+            { 0.0f, 1.0f, 0.01f },
+            { 0.1f, 1.2f, 0.01f },
+            { -180.0f, 180.0f, 1.0f },
+            { -1.0f, 1.0f, 0.01f }
+    };
+
+    public record ColorGradeSettings(float[] values) {
+        public static final int COUNT = 24;
+
+        public ColorGradeSettings {
+            if(values == null || values.length != COUNT)
+                throw new IllegalArgumentException("color grade needs " + COUNT + " values");
+            values = values.clone();
+            for(int i = 0; i < COUNT; ++i)
+            {
+                if(!Float.isFinite(values[i]))
+                    throw new IllegalArgumentException("Invalid color grade value #" + i);
+                float lo = COLOR_GRADE_RANGES[i][0];
+                float hi = COLOR_GRADE_RANGES[i][1];
+                values[i] = Math.min(Math.max(values[i], lo), hi);
+            }
+        }
+
+        /** 旧存档 / 长度不符 / 含 NaN 时回落出厂值，其余逐项钳制。 */
+        public static ColorGradeSettings sanitized(float[] raw) {
+            float[] out = DEFAULT_COLOR_GRADE.clone();
+            if(raw != null)
+            {
+                for(int i = 0; i < COUNT && i < raw.length; ++i)
+                {
+                    if(Float.isFinite(raw[i])) out[i] = raw[i];
+                }
+            }
+            return new ColorGradeSettings(out);
+        }
+
+        public float value(int index) {
+            return values[index];
+        }
+
+        public float[] toParamArray() {
+            return values.clone();
+        }
+    }
+
+    private static ColorGradeSettings colorGradeSettings =
+            new ColorGradeSettings(DEFAULT_COLOR_GRADE.clone());
+    public static synchronized ColorGradeSettings getColorGradeSettings() { return colorGradeSettings; }
+    public static synchronized void setColorGradeSettings(ColorGradeSettings settings) {
+        colorGradeSettings = java.util.Objects.requireNonNull(settings);
+        markDirty();
+    }
+
     public record CloudMsSettings(
             float phiIntensity,
             float phiDepthPow,
@@ -1677,6 +1916,28 @@ public final class RTXSettingsConfig {
             1;
 
     // =====================================================
+    // 2026-10-26 直接光模式 + 稀疏渲染（CameraUBO.sparseParams 尾块）。
+    //
+    // 两者出厂都是 0/0 = 传统 RIS + 稀疏关 ⇒ 与接这两项之前逐位一致。
+    //   directLightMode  : 0 = 传统 RIS / 1 = RTXDI 式时域 reservoir（WRS）
+    //   sparseRatePercent: 0 = 关 / 100 = 全采样（白噪声逐像素抽签）
+    // 都是运行时原子量，Apply 下一帧生效，无新 spv 变体。
+    // =====================================================
+    private static int directLightMode =
+            0;
+
+    /**
+     * 2026-10-28 间接光模式（对齐 Remix 的 IntegrateIndirectMode）。
+     * 0 = GI（出厂，逐位等于改动前）/ 1 = SHaRC 空间哈希辐射缓存。
+     * ⚠ SHaRC 的缓冲与 RT 管线在 native init 时创建 ⇒ 切换后**需重启客户端**。
+     */
+    private static int indirectMode =
+            0;
+
+    private static int sparseRatePercent =
+            0;
+
+    // =====================================================
     // 2026-10-09 运动矢量（DLSS-RR）**调试视图**（0 = 关，**出厂默认**）。
     //
     // 为什么需要它：MV 出错在画面上只表现为"残影/拖尾"，看不出到底是"根本没写"
@@ -1721,7 +1982,7 @@ public final class RTXSettingsConfig {
             32;
 
     public static final PerformanceSettings DEFAULT_PERFORMANCE_SETTINGS =
-            new PerformanceSettings(1, 1, 1, 2, 2, 2, 1, 64, 2, 256, 1.0f);
+            new PerformanceSettings(1, 1, 1, 2, 2, 2, 1, 64, 2, 256, 1.0f, 0);
 
     private static PerformanceSettings performanceSettings =
             DEFAULT_PERFORMANCE_SETTINGS;
@@ -2067,6 +2328,51 @@ public final class RTXSettingsConfig {
         }
     }
 
+    /** 2026-10-26：直接光模式。0 = 传统 RIS（出厂）/ 1 = RTXDI 式时域 reservoir。 */
+    public static synchronized int getDirectLightMode() {
+        return directLightMode;
+    }
+
+    public static synchronized void setDirectLightMode(
+            int mode
+    ) {
+        final int clamped = mode == 0 ? 0 : 1;
+        if (directLightMode != clamped) {
+            directLightMode = clamped;
+            markDirty();
+        }
+    }
+
+    /** 2026-10-28：间接光模式。0 = GI（出厂）/ 1 = SHaRC（需重启生效）。 */
+    public static synchronized int getIndirectMode() {
+        return indirectMode;
+    }
+
+    public static synchronized void setIndirectMode(
+            int mode
+    ) {
+        final int clamped = mode == 0 ? 0 : 1;
+        if (indirectMode != clamped) {
+            indirectMode = clamped;
+            markDirty();
+        }
+    }
+
+    /** 2026-10-26：稀疏渲染采样率 %（0 = 关，出厂；100 = 全采样）。 */
+    public static synchronized int getSparseRatePercent() {
+        return sparseRatePercent;
+    }
+
+    public static synchronized void setSparseRatePercent(
+            int percent
+    ) {
+        final int clamped = Math.max(0, Math.min(100, percent));
+        if (sparseRatePercent != clamped) {
+            sparseRatePercent = clamped;
+            markDirty();
+        }
+    }
+
     /**
      * 2026-10-09 运动矢量调试视图。0 = 关（出厂）/ 1 = 幅值热图 / 2 = 有向色。
      *
@@ -2321,8 +2627,8 @@ public final class RTXSettingsConfig {
         }
 
 
-        // 固定为已确认的 0.01 步进。
-        float rounded = Math.round(value * 100.0f) / 100.0f;
+        // 2026-10-27：步进从 0.01 改为 0.0001（用户要求环境底光可设到 0.0001）。
+        float rounded = Math.round(value * 10000.0f) / 10000.0f;
         if (Float.compare(noDirectLightAmbient, rounded) != 0) {
             noDirectLightAmbient = rounded;
             markDirty();
@@ -2981,7 +3287,7 @@ public final class RTXSettingsConfig {
             srMode = RR_MODE_PERFORMANCE;
 
             noDirectLightAmbient =
-                    0.01f;
+                    0.0001f;
 
             pomDepth =
                     0.03f;
@@ -3058,7 +3364,7 @@ public final class RTXSettingsConfig {
                 srMode = RR_MODE_PERFORMANCE;
 
                 noDirectLightAmbient =
-                        0.01f;
+                        0.0001f;
 
                 pomDepth =
                         0.03f;
@@ -3120,6 +3426,12 @@ public final class RTXSettingsConfig {
 
                 giRoulette =
                         1;
+
+                directLightMode =
+                        0;
+
+                sparseRatePercent =
+                        0;
 
                 sunMarchFarDistance =
                         32;
@@ -3210,13 +3522,13 @@ public final class RTXSettingsConfig {
                 noDirectLightAmbient =
                         Math.round(
                                 data.noDirectLightAmbient *
-                                        100.0f
-                        ) / 100.0f;
+                                        10000.0f
+                        ) / 10000.0f;
 
             } else {
 
                 noDirectLightAmbient =
-                        0.01f;
+                        0.0001f;
             }
 
 
@@ -3409,6 +3721,9 @@ public final class RTXSettingsConfig {
                         validCloudSetting(data.planeCloudBrightness, 1.0f, 0, 6, 0.05f));
                 // phi_fwd + 散射级联（2026-10-02）。缺键回落出厂默认（同 record
                 // 字段初值），与 highCloudSettings 的缺键策略一致。
+                cloudHpSettings = CloudHpSettings.sanitized(data.cloudHp);
+                // 2026-10-26 色彩分级 24 项：缺键/长度不符 ⇒ 逐项回落中性值。
+                colorGradeSettings = ColorGradeSettings.sanitized(data.colorGrade);
                 cloudMsSettings = new CloudMsSettings(
                         validCloudSetting(data.cloudPhiIntensity, 1.5f, 0, 6, 0.05f),
                         validCloudSetting(data.cloudPhiDepthPow, 1.0f, 0, 2, 0.05f),
@@ -3777,6 +4092,23 @@ public final class RTXSettingsConfig {
                             ? 1
                             : (data.giRoulette == 0 ? 0 : 1);
 
+            // 2026-10-26 直接光模式 / 稀疏渲染：缺键 = 出厂 0/0（旧画面）。
+            directLightMode =
+                    data.directLightMode == null
+                            ? 0
+                            : (data.directLightMode == 0 ? 0 : 1);
+
+            // 2026-10-28 间接光模式：缺键 = 出厂 0（GI），旧存档不会突然变成 SHaRC。
+            indirectMode =
+                    data.indirectMode == null
+                            ? 0
+                            : (data.indirectMode == 0 ? 0 : 1);
+
+            sparseRatePercent =
+                    data.sparseRatePercent == null
+                            ? 0
+                            : Math.max(0, Math.min(100, data.sparseRatePercent));
+
             sunMarchFarDistance =
                     data.sunMarchFarDistance == null
                             ? 32
@@ -3808,7 +4140,8 @@ public final class RTXSettingsConfig {
                             validSetting(data.dynamicRtasInterval, 2, 1, 8),
                             validSetting(data.maxRtParticles, 256, 0, 256),
                             // 2026-10-06 每像素采样数（spp）：0.5 = 棋盘交错。
-                            validCloudSetting(data.rtSpp, 1.0f, 0.5f, 4.0f, 0.5f)
+                            validCloudSetting(data.rtSpp, 1.0f, 0.5f, 4.0f, 0.5f),
+                validSetting(data.volumetricRestir, 0, 0, 1)
                     );
 
             rainSettings =
@@ -3921,7 +4254,7 @@ public final class RTXSettingsConfig {
             srMode = RR_MODE_PERFORMANCE;
 
             noDirectLightAmbient =
-                    0.01f;
+                    0.0001f;
 
             pomDepth =
                     0.03f;
@@ -3978,6 +4311,12 @@ public final class RTXSettingsConfig {
             //（unbiased，只改方差），实测 −7.8ms 整帧。
             giRoulette =
                     1;
+
+            directLightMode =
+                    0;
+
+            sparseRatePercent =
+                    0;
 
             sunMarchFarDistance =
                     32;
@@ -4164,6 +4503,9 @@ public final class RTXSettingsConfig {
             data.planeCloudOctaves = (float) planeCloudSettings.octaves();
             data.planeCloudFadeDistance = planeCloudSettings.fadeDistance();
             data.planeCloudBrightness = planeCloudSettings.brightness();
+            data.cloudHp = cloudHpSettings.toParamArray();
+            // 2026-10-26 色彩分级 24 项（见 ColorGradeSettings）。
+            data.colorGrade = colorGradeSettings.toParamArray();
             data.cloudPhiIntensity = cloudMsSettings.phiIntensity();
             data.cloudPhiDepthPow = cloudMsSettings.phiDepthPow();
             data.cloudPhiDepthBias = cloudMsSettings.phiDepthBias();
@@ -4344,6 +4686,15 @@ public final class RTXSettingsConfig {
             data.giRoulette =
                     giRoulette;
 
+            data.directLightMode =
+                    directLightMode;
+
+            data.indirectMode =
+                    indirectMode;
+
+            data.sparseRatePercent =
+                    sparseRatePercent;
+
             data.sunMarchFarDistance =
                     sunMarchFarDistance;
 
@@ -4373,6 +4724,7 @@ public final class RTXSettingsConfig {
             data.dynamicRtasInterval = performanceSettings.dynamicRtasInterval();
             data.maxRtParticles = performanceSettings.maxRtParticles();
             data.rtSpp = performanceSettings.rtSpp();
+        data.volumetricRestir = performanceSettings.volumetricRestir();
 
             data.rainOpacity = rainSettings.opacity();
             data.rainStreakLength = rainSettings.streakLength();
@@ -4719,6 +5071,10 @@ public final class RTXSettingsConfig {
         Float cloudBottom;
         Float cloudThickness;
         Float cloudCoverage;
+        // 2026-10-25 v5（HP）28 项全参数，见 CloudHpSettings。
+        float[] cloudHp;
+        // 2026-10-26 色彩分级 24 项，见 ColorGradeSettings。
+        float[] colorGrade;
         Float cloudDensity;
         Float cloudDetailStrength;
         Float cloudWindSpeed;
@@ -4841,6 +5197,18 @@ public final class RTXSettingsConfig {
         Integer giRoulette =
                 null;
 
+        /** 2026-10-26 直接光模式（缺键 = 0 = 传统 RIS）。 */
+        Integer directLightMode =
+                null;
+
+        /** 2026-10-28 间接光模式（缺键 = 0 = GI；1 = SHaRC）。 */
+        Integer indirectMode =
+                null;
+
+        /** 2026-10-26 稀疏渲染采样率 %（缺键 = 0 = 关）。 */
+        Integer sparseRatePercent =
+                null;
+
         Integer sunMarchFarDistance =
                 null;
 
@@ -4877,6 +5245,9 @@ public final class RTXSettingsConfig {
         Integer glossyFullDistance;
         Integer dynamicRtasInterval;
         Integer maxRtParticles;
+        // 2026-10-26 体积光 froxel + ReSTIR 总开关（0 = 关，1 = 开）。
+        // 缺键回落 0：老配置打开本版时不会突然多出一层雾里的光。
+        Integer volumetricRestir;
         // 2026-10-06 每像素采样数（spp）：0.5 / 1 / 2 / 3 / 4。boxed：缺键回落 1.0。
         Float rtSpp;
 
@@ -4951,7 +5322,14 @@ public final class RTXSettingsConfig {
              * </ul>
              * 写 CameraUBO.rtSampleParams.x，由 rt_test.rgen 的 main() 消费。
              */
-            float rtSpp
+            float rtSpp,
+            /**
+             * 2026-10-26：体积光 froxel + ReSTIR 开关。
+             * 打开后主 trace 之后的 recordVolumeRestir 会跑五个 compute 阶段
+             * （initial/temporal/spatial/integrate/composite），并在水下让位给
+             * 旧的光柱 pass。首次打开的那一帧会建资源与管线，可能有一帧卡顿。
+             */
+            int volumetricRestir
     ) {
         public PerformanceSettings {
             if(aoNearSamples < 0 || aoNearSamples > 4 ||
@@ -4964,7 +5342,8 @@ public final class RTXSettingsConfig {
                     glossyFullDistance < 16 || glossyFullDistance > 96 ||
                     dynamicRtasInterval < 1 || dynamicRtasInterval > 8 ||
                     maxRtParticles < 0 || maxRtParticles > 256 ||
-                    !Float.isFinite(rtSpp) || rtSpp < 0.5f || rtSpp > 4.0f) {
+                    !Float.isFinite(rtSpp) || rtSpp < 0.5f || rtSpp > 4.0f ||
+                    volumetricRestir < 0 || volumetricRestir > 1) {
                 throw new IllegalArgumentException("Invalid RT performance settings");
             }
         }
@@ -5160,16 +5539,23 @@ public final class RTXSettingsConfig {
         }
     }
 
+    // 2026-10-28：coverage 与 size 已**解耦**（旧版把云量塞进密度阈值，调云量会把每朵云
+    // 一起削小）：
+    //   coverage → 分布遮罩 presence（整片区域有/无云）⇒ 只影响"多少朵"
+    //   size     → base 噪声周期（着色器 noiseScale = 0.55²/size）⇒ 只影响"每朵多大"，
+    //              值越大云越大（0.55 = 出厂，逐位等同旧档）
     public record CloudSettings(
             boolean enabled,
             float bottom,
             float thickness,
+            /** 云量 / 分布密度：只决定哪些区域有云（整朵出现或消失）。 */
             float coverage,
             float density,
             float detailStrength,
             float windSpeed,
             float evolution,
             int quality,
+            /** 云的大小：base 噪声周期的倒数倍率（越大云越大），0.55 = 出厂。 */
             float size,
             float distribution,
             float baseFeather,
