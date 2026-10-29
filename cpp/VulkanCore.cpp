@@ -1944,7 +1944,7 @@ static uint32_t perfL10AblationRequestedStage()
             return PERF_L10_ABLATION_OFF;
         }
         const std::string text(raw);
-        // 级表长度 **17**（PERF_L10_ABLATION_STAGE_COUNT 在本函数之后才定义，所以
+        // 级表长度 **20**（PERF_L10_ABLATION_STAGE_COUNT 在本函数之后才定义，所以
         // 这里只能写字面量；两处 % 15 都是"静默取模"，改动级数时必须同步改，
         // 否则 ORION_PERF_ABLATION=16 会被折成 1 = noRtao —— 完全错误的臂）。
         const std::size_t alt = text.find("alt:");
@@ -1963,7 +1963,7 @@ static uint32_t perfL10AblationRequestedStage()
                 if(value >= 0)
                 {
                     g_perfL10AblationAltStages.push_back(
-                        static_cast<uint32_t>(value % 17));
+                        static_cast<uint32_t>(value % 20));
                 }
                 if(comma == std::string::npos)
                 {
@@ -1983,7 +1983,7 @@ static uint32_t perfL10AblationRequestedStage()
         {
             return PERF_L10_ABLATION_SWEEP;
         }
-        return static_cast<uint32_t>(value % 17);
+        return static_cast<uint32_t>(value % 20);
     }();
     return request;
 }
@@ -2005,6 +2005,8 @@ static bool perfL10AblationAltMode(uint32_t request)
 // the last stages at all.  120 frames still outlasts the 60-frame counter
 // window (two windows per stage) while keeping the whole cycle at 1800 frames.
 constexpr uint64_t PERF_L10_ABLATION_FRAMES_PER_STAGE = 120u;
+// 20 级（原 18）。2026-10-29 追加 18 "noPom" / 19 "noPomSelfShadow"（拆材质求值内部）
+// 18 级（原 17）。2026-10-29 追加 "noMatEval"（材质求值价格上界，见 rt_test.rchit main）
 // 17 级（原 16）。2026-10-07 追加 "rrOff"：GI 俄罗斯轮盘改成默认开后，必须留一个
 // "强制关"的级，否则这一项的收益再也无法复测（stage 11 = 强制开）。
 // 2026-10-12 追加的 "noIndirectPom"（POM 用途分级）已于 2026-10-21 撤销：
@@ -2014,7 +2016,9 @@ constexpr uint64_t PERF_L10_ABLATION_FRAMES_PER_STAGE = 120u;
 // 删条目会让 noVoxelDda 从 16 掉到 15，历史口径全部错位。
 // 2026-10-13 追加 "noVoxelDda"（stage 16）：体素 DDA 遍历。在此之前 rt 相位那十几
 // 毫秒里没有任何一项能归因到体素遍历 —— 它是"优化 DDA 这一大块"的前置口径。
-constexpr uint32_t PERF_L10_ABLATION_STAGE_COUNT = 17u;
+// 2026-10-29 追加 "noMatEval"（stage 17）：命中后跳过材质解析（上界口径）。
+// 2026-10-29 再追加 18 "noPom" / 19 "noPomSelfShadow"（拆材质求值内部）。
+constexpr uint32_t PERF_L10_ABLATION_STAGE_COUNT = 20u;
 
 // Must stay in the same order as the stage table in shaders/rt_test.rgen.
 static const char* const PERF_L10_ABLATION_STAGE_NAMES
@@ -2036,7 +2040,10 @@ static const char* const PERF_L10_ABLATION_STAGE_NAMES
     "tierHalf",
     "rrOff",     // 2026-10-07：轮盘默认开之后，用它复测"开 → 关"的代价
     "spare15",       // 2026-10-21：原 noIndirectPom 已撤销（POM 不可砍），槽位保留防档号位移
-    "noVoxelDda"     // 2026-10-13：关掉体素 DDA 遍历（棱缝门 + 本地光二级弹射）
+    "noVoxelDda",    // 2026-10-13：关掉体素 DDA 遍历（棱缝门 + 本地光二级弹射）
+    "noMatEval",     // 2026-10-29：命中后跳过材质解析（量"材质求值"的价格上界）
+    "noPom",         // 2026-10-29：getPOMDepthScale()=0 ⇒ POM 主 march + 自阴影全走早退
+    "noPomSelfShadow"// 2026-10-29：只关 POM 自阴影（24 采样），主 march 照跑
 };
 
 static uint32_t g_perfL10AblationStage = 0u;
@@ -2345,9 +2352,23 @@ static size_t sectionRebuildBatchCapOverride()
 static size_t effectiveSectionRebuildBatchCap()
 {
     const size_t overrideCap = sectionRebuildBatchCapOverride();
-    return overrideCap > 0u
-        ? std::min(overrideCap, g_sectionRebuildBatchCap)
-        : g_sectionRebuildBatchCap;
+
+    // 2026-10-29：override 现在**直接生效，可以放大也可以缩小**。
+    //
+    // 旧实现是 min(override, g_sectionRebuildBatchCap)，而自适应值在流式加载时
+    // 被"中断减半 / 批内完成 +2"压到 14~24 ⇒ ORION_GEOMETRY_BATCH_CAP=64 会被
+    // 悄悄吃掉，等于没设。做"提高每帧采用吞吐能否压住捕获积压"的 A/B 时，
+    // 这会得出"放大 cap 无效"的错误结论（实测 [RT GEOMETRY] cap= 一直 14~24）。
+    //
+    // 不设 env（返回 0）时逐位回到原来的自适应逻辑，行为不变。
+    // ⚠ 放大后单帧可能搬更多段 ⇒ 尖刺变大；预算（sectionRebuildTimeBudgetMs）
+    //   仍会在块与块之间中断，所以必须与 ORION_GEOMETRY_BUDGET_MS 一起调。
+    if(overrideCap > 0u)
+    {
+        return overrideCap;
+    }
+
+    return g_sectionRebuildBatchCap;
 }
 
 // 2026-10-08：重建调用总数 + 上一次 counters 日志的基线，用来算**每次调用搬了几块**
@@ -5659,7 +5680,10 @@ struct RTSectionAS
     // 走 refit 时：不 retire、不重分配 chunk、不改 AS 句柄，只把新顶点拷回原 vertex buffer，
     // 然后以 UPDATE 模式重录 BLAS。OMM 段（micromap 无 update 模式）与顶点数变化的段仍走重建。
     //
-    // ⚠ ALLOW_UPDATE 会让 AS 略大、遍历略慢 ⇒ 由 env 闸门默认关闭，A/B 时打开。
+    // 2026-10-29：**默认改为开**（sectionBLASRefitEnabled 现在默认 true）。
+    // 同局 A/B 实测（19:01 那局，marker 热切换）：createN/retireN 2228 → 617，
+    // asChunkMB 512.4 → 510.4（无内存代价），frame/trace 各 −0.1/−0.28 ms。
+    // 回退：ORION_AS_REFIT=0（硬关），或放 run/as_refit.off（热切换）。
     // =====================================================
     bool refitCapable = false;
     VkDeviceSize updateScratchSize = 0;
@@ -5669,6 +5693,12 @@ struct RTSectionAS
     // 2026-10-21：本段几何按 4 顶点/quad 存 + 共享索引（仅 SOLID/opaque 桶）。
     // 见 sectionQuadIndexAddress 与 uploadChunk 的 indexedSolidQuads。
     bool indexedGeometry = false;
+
+    // 2026-10-29：建 AS 时是否给了 VK_GEOMETRY_OPAQUE_BIT_KHR。
+    // 原因：MODE_UPDATE（refit）要求 geometry.flags 与建 AS 时**逐位一致**，而
+    // recordSectionBLASBuild 此前把 flags 硬写成 0 ⇒ 一次 refit 之后 SOLID 段
+    // 就丢了 OPAQUE，硬件会退回去跑 .rahit（遍历变慢，正好抵消 refit 的收益）。
+    bool opaqueGeometry = false;
 
     // 2026-10-21 地形 32B 顶点：GPU 侧步长与"是否压缩"。
     // 见 SectionVertex / SECTION_VERTEX_32B_ENABLED（必须与 SPV 同步）。
@@ -9561,14 +9591,30 @@ bool g_atlasDirty = false;
 // 纹素内相同、相邻纹素硬跳变，屏幕上是与贴图纹素同尺寸的方块网格（16× 材质
 // 时约 1/16 格），也就是"PBR 太阳反光一块一块"。
 //
-// 这里给 binding 4 / 5 单独一个 LINEAR + CLAMP_TO_EDGE、只取 mip0 的采样器：
+// 这里给 binding 4 / 5 单独一个 LINEAR + CLAMP_TO_EDGE 的采样器：
 //   · 法线/粗糙度在纹素间线性过渡 ⇒ 高光连续；
-//   · 只读 mip0（着色器本来就用 textureLod(..., 0.0)），不会跨 mip 跳变；
+//   · 采样 LOD 由着色器的显式 pbrLod 决定（2026-10-19 起），采样器不得再钳它
+//     —— 见下面 maxLod 处 2026-10-29 的根因说明；
 //   · CLAMP_TO_EDGE + 着色器侧的 safeMin/safeMax 半纹素内缩 ⇒ 双线性足迹
 //     不会读进相邻 sprite。
 // albedo（binding 3）仍用 g_atlasSampler，像素艺术不受影响。
 // =====================================================
 VkSampler g_pbrAtlasSampler = VK_NULL_HANDLE;
+
+// 2026-10-29：maxLod 放开（修"高光一块一块"）的**运行期回退闸**。
+//   ORION_PBR_MIP 未设 / 非 '0' 开头 => 放开（默认，修复生效）
+//   ORION_PBR_MIP=0            => maxLod 回 0.0f（逐位回到改动前的"永远 mip0"）
+// 只在建采样器时读一次（与 sharcEnabled 等同一种写法），不影响逐帧成本。
+static bool pbrAtlasMipLodEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_PBR_MIP");
+        return raw == nullptr || raw[0] == '\0' || raw[0] != '0';
+    }();
+
+    return cached;
+}
 
 static void ensurePbrAtlasSampler()
 {
@@ -9580,17 +9626,40 @@ static void ensurePbrAtlasSampler()
     VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     info.magFilter = VK_FILTER_LINEAR;
     info.minFilter = VK_FILTER_LINEAR;
-    info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    // 2026-10-29：NEAREST -> LINEAR。mipmapMode 只在 LOD 落在两级之间时才起作用：
+    // 着色器传的是连续 pbrLod，NEAREST 会把相邻像素硬切到不同 mip，形成等距环带。
+    info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
     info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     info.mipLodBias = 0.0f;
+    // anisotropy 仍关：VkDevice 由 Java/RenderPearl 侧创建（同 probeSerSupport 的
+    // 说明），native 侧无法确认 samplerAnisotropy 特性是否启用 ⇒ 在这里开它是
+    // 未定义行为。要开需先确认 Java 侧的 VkPhysicalDeviceFeatures 链。
     info.anisotropyEnable = VK_FALSE;
     info.maxAnisotropy = 1.0f;
     info.compareEnable = VK_FALSE;
     info.compareOp = VK_COMPARE_OP_NEVER;
     info.minLod = 0.0f;
-    info.maxLod = 0.0f;
+    // ========================================================================
+    // 2026-10-29 根因修复：原来这里是 0.0f。
+    //
+    // 着色器（cpp/shaders/material_resolve.glsl:1240-1248 / :1300-1305）从
+    // 2026-10-19 起用**显式 LOD**：
+    //     pbrMaxLod = clamp(min(4, log2(pbrSpriteTexels) - 1), 0, ...)
+    //     pbrLod    = clamp(log2(pbrWorldPerPixel / pbrTexelWorld), 0, pbrMaxLod)
+    //     baseNormalSample = textureLod(normalAtlas, basePbrTexCoord, pbrLod)
+    // 而 textureLod 的 lod 会被采样器 clamp 到 [minLod, maxLod] = [0, 0]
+    // ⇒ pbrLod 恒为 0 ⇒ **永远采样 mip0**。那轮"加完整 mip 链 + 显式 LOD"因此完全
+    // 没生效：远处一个像素覆盖多个纹素时，法线取到的仍是 mip0 的随机值，太阳 GGX
+    // 高光碎成块 —— 这就是"太阳高光一块一块一直没修掉"的直接原因。
+    //
+    // 现在放开到 VK_LOD_CLAMP_NONE(1000)：真正的上界由着色器的 pbrMaxLod 决定(≤4)，
+    // 采样器只负责不要把它钳死。图集 mip 链是全的（uploadTextureToVRAM 按
+    // log2(max(w,h)) 生成，image view 的 levelCount = mipLevels），放开安全。
+    // ========================================================================
+    info.maxLod =
+        pbrAtlasMipLodEnabled() ? VK_LOD_CLAMP_NONE : 0.0f;
     info.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     info.unnormalizedCoordinates = VK_FALSE;
 
@@ -9601,7 +9670,11 @@ static void ensurePbrAtlasSampler()
         return;
     }
 
-    RTLog("[PBR SAMPLER] linear _n/_s sampler created (mip0, clamp-to-edge)");
+    RTLog(
+        std::string("[PBR SAMPLER] linear _n/_s sampler created "
+                    "(mip LINEAR, maxLod=") +
+        (pbrAtlasMipLodEnabled() ? "NONE" : "0/ORION_PBR_MIP=0") +
+        ", clamp-to-edge, aniso=off)");
 }
 
 // The albedo view a resource reload is about to retire.  The old view is freed
@@ -10400,6 +10473,82 @@ static bool rtxMemTypeIsDeviceLocal(uint32_t memoryTypeIndex)
     ) != 0u;
 }
 
+
+// ============================================================
+// 2026-10-29 OPT-EXT②：VK_EXT_memory_priority 分层
+//
+// 【策略是自创的】官方规范只定义语义（priority ∈ [0,1]，驱动在显存压力下
+// 先驱逐低优先级分配），没有给"什么该低"的推荐值。这里的假设是：
+//   · host-visible / staging  → 0.80（马上要被读回或上传，尽量别动）
+//   · device-local 且 ≥ 8 MiB → 0.35（section 顶点/BLAS/历史缓冲，可重建，
+//                                    也是本工程最大的一块：asTrueMB 574MiB）
+//   · 其余 device-local       → 0.50（中性）
+// 只影响驱动驱逐顺序，不影响任何数据正确性。
+//
+// 关掉：ORION_MEM_PRIORITY=0（或 false）。扩展未启用时自动失效（用函数指针
+// 存在性判定，不依赖 feature 查询）。
+// ============================================================
+static bool rtxMemPriorityEnabled()
+{
+    static const bool enabled = []()
+    {
+        const char* raw = std::getenv("ORION_MEM_PRIORITY");
+
+        if(
+            raw != nullptr &&
+            (raw[0] == '0' || raw[0] == 'f' || raw[0] == 'F')
+        )
+        {
+            fprintf(
+                stderr,
+                "[MEM PRIORITY] disabled by ORION_MEM_PRIORITY\n"
+            );
+
+            fflush(stderr);
+            return false;
+        }
+
+        if(g_device == VK_NULL_HANDLE)
+        {
+            return false;
+        }
+
+        const bool available =
+            vkGetDeviceProcAddr(
+                g_device,
+                "vkSetDeviceMemoryPriorityEXT") != nullptr;
+
+        // 一次性确认日志：没有这行就无法区分"扩展没启用"与"分配路径没走"。
+        fprintf(
+            stderr,
+            "[MEM PRIORITY] enabled=%d"
+            " hostVisible=0.80 largeDeviceLocal=0.35 default=0.50\n",
+            available ? 1 : 0
+        );
+
+        fflush(stderr);
+
+        return available;
+    }();
+
+    return enabled;
+}
+
+static float rtxMemPriorityForAllocation(const VkMemoryAllocateInfo& allocateInfo)
+{
+    if(!rtxMemTypeIsDeviceLocal(allocateInfo.memoryTypeIndex))
+    {
+        return 0.80f;
+    }
+
+    if(allocateInfo.allocationSize >= (8ull << 20ull))
+    {
+        return 0.35f;
+    }
+
+    return 0.50f;
+}
+
 // ⚠ 上面两行 #undef 就是为这里服务的：本函数体必须调用真的 vkAllocateMemory。
 static VkResult rtxTrackedAllocateMemory(
     VkDevice device,
@@ -10407,8 +10556,25 @@ static VkResult rtxTrackedAllocateMemory(
     const VkAllocationCallbacks* allocator,
     VkDeviceMemory* memory)
 {
+    // 2026-10-29 OPT-EXT②：把 VkMemoryPriorityAllocateInfoEXT 插在调用方原链
+    // 的最前面。原 pNext（dedicated allocation 等）挂到它后面，语义不变。
+    VkMemoryAllocateInfo prioritizedInfo{};
+    const VkMemoryAllocateInfo* effectiveInfo = allocateInfo;
+    VkMemoryPriorityAllocateInfoEXT priorityInfo{};
+
+    if(allocateInfo != nullptr && rtxMemPriorityEnabled())
+    {
+        prioritizedInfo = *allocateInfo;
+        priorityInfo.sType =
+            VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT;
+        priorityInfo.pNext = const_cast<void*>(allocateInfo->pNext);
+        priorityInfo.priority = rtxMemPriorityForAllocation(*allocateInfo);
+        prioritizedInfo.pNext = &priorityInfo;
+        effectiveInfo = &prioritizedInfo;
+    }
+
     const VkResult result =
-        vkAllocateMemory(device,allocateInfo,allocator,memory);
+        vkAllocateMemory(device,effectiveInfo,allocator,memory);
 
     if(
         result == VK_SUCCESS &&
@@ -11832,6 +11998,444 @@ static void releaseTextureUploadScratch()
     g_textureUploadStagingBytes = 0u;
 }
 
+// ============================================================================
+// 2026-10-29（P2a）：PBR 图集「按 sprite 生成 mip」—— ORION_PBR_SPRITE_MIP（默认开）
+//
+// 病灶：图集是一张连续纹理，sprite 之间没有 padding。整图 box（vkCmdBlitImage 逐级
+// 1/2）在第 l 级把 2^l 个原 texel 平均成一个，于是**双线性足迹在方块边界处会跨进
+// 邻居 sprite**，渗色宽度 = 1 个 mip texel = 2^l 个原 texel：
+//     mip0 ≈ 1/128 方格（肉眼不可见，这就是"以前没有"）
+//     mip4 ≈ 16/128 = 1/8 方格（明显的一条接缝带）
+// 用户报的"方块与方块之间的分界线"就是它。
+//
+// 做法：逐级只对**每个 sprite 矩形内部**做 2x2 box，然后把矩形外扩 1 圈、用最近的
+// 内部像素填充（只填未被内部写过的像素，避免破坏邻居）。这样任意一级的边界处取到的
+// 都是本 sprite 自己的边缘值 ⇒ 跨 sprite 渗色为 0。
+//
+// 为什么放在这里而不是 shader 里内缩 UV：内缩会让边缘纹理被压缩且与 POM 的 UV 改写
+// 打架；而且真因在 mip 数据本身。
+//
+// 回退：ORION_PBR_SPRITE_MIP=0 逐位回到原来的整图 blit 路径（旧代码未删）。
+// ============================================================================
+struct PbrSpriteRect
+{
+    uint32_t x = 0u;
+    uint32_t y = 0u;
+    uint32_t w = 0u;
+    uint32_t h = 0u;
+};
+
+static std::vector<PbrSpriteRect> g_pbrSpriteRects;
+
+static bool pbrSpriteMipEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_PBR_SPRITE_MIP");
+        return raw == nullptr || raw[0] == '\0' || raw[0] != '0';
+    }();
+
+    return cached;
+}
+
+// 单级：按 sprite 矩形做 2x2 box，再把矩形外扩 1 圈填边缘。
+static void pbrDownsampleLevelBySprite(
+    const uint8_t* prev, uint32_t prevW, uint32_t prevH,
+    uint8_t* cur, uint32_t curW, uint32_t curH,
+    uint32_t level,
+    std::vector<uint8_t>& written)
+{
+    written.assign(size_t(curW) * size_t(curH), 0u);
+
+    // 第 1 遍：矩形内部。
+    for (const PbrSpriteRect& rect : g_pbrSpriteRects)
+    {
+        const uint32_t rx = rect.x >> level;
+        const uint32_t ry = rect.y >> level;
+
+        if (rx >= curW || ry >= curH)
+        {
+            continue;
+        }
+
+        const uint32_t rw = std::max(1u, rect.w >> level);
+        const uint32_t rh = std::max(1u, rect.h >> level);
+        const uint32_t cw = std::min(rw, curW - rx);
+        const uint32_t ch = std::min(rh, curH - ry);
+
+        for (uint32_t y = 0u; y < ch; ++y)
+        {
+            const uint32_t sy0 = std::min(prevH - 1u, (ry + y) * 2u);
+            const uint32_t sy1 = std::min(prevH - 1u, sy0 + 1u);
+
+            for (uint32_t x = 0u; x < cw; ++x)
+            {
+                const uint32_t sx0 = std::min(prevW - 1u, (rx + x) * 2u);
+                const uint32_t sx1 = std::min(prevW - 1u, sx0 + 1u);
+
+                const uint8_t* p00 = prev + (size_t(sy0) * prevW + sx0) * 4u;
+                const uint8_t* p10 = prev + (size_t(sy0) * prevW + sx1) * 4u;
+                const uint8_t* p01 = prev + (size_t(sy1) * prevW + sx0) * 4u;
+                const uint8_t* p11 = prev + (size_t(sy1) * prevW + sx1) * 4u;
+
+                uint8_t* d = cur + (size_t(ry + y) * curW + (rx + x)) * 4u;
+
+                for (uint32_t c = 0u; c < 4u; ++c)
+                {
+                    const uint32_t sum =
+                        uint32_t(p00[c]) + uint32_t(p10[c]) +
+                        uint32_t(p01[c]) + uint32_t(p11[c]);
+                    d[c] = static_cast<uint8_t>((sum + 2u) / 4u);
+                }
+
+                written[size_t(ry + y) * curW + (rx + x)] = 1u;
+            }
+        }
+    }
+
+    // 第 2 遍：外扩 1 圈（只填未写过的像素）。
+    for (const PbrSpriteRect& rect : g_pbrSpriteRects)
+    {
+        const uint32_t rx = rect.x >> level;
+        const uint32_t ry = rect.y >> level;
+
+        if (rx >= curW || ry >= curH)
+        {
+            continue;
+        }
+
+        const uint32_t rw = std::max(1u, rect.w >> level);
+        const uint32_t rh = std::max(1u, rect.h >> level);
+        const uint32_t cw = std::min(rw, curW - rx);
+        const uint32_t ch = std::min(rh, curH - ry);
+
+        const int32_t x0 = int32_t(rx) - 1;
+        const int32_t y0 = int32_t(ry) - 1;
+        const int32_t x1 = int32_t(rx + cw);
+        const int32_t y1 = int32_t(ry + ch);
+
+        for (int32_t y = y0; y <= y1; ++y)
+        {
+            if (y < 0 || y >= int32_t(curH))
+            {
+                continue;
+            }
+
+            for (int32_t x = x0; x <= x1; ++x)
+            {
+                if (x < 0 || x >= int32_t(curW))
+                {
+                    continue;
+                }
+
+                if (written[size_t(y) * curW + size_t(x)] != 0u)
+                {
+                    continue;
+                }
+
+                const int32_t cx =
+                    x < int32_t(rx)
+                        ? int32_t(rx)
+                        : (x >= int32_t(rx + cw - 1u) ? int32_t(rx + cw - 1u) : x);
+                const int32_t cy =
+                    y < int32_t(ry)
+                        ? int32_t(ry)
+                        : (y >= int32_t(ry + ch - 1u) ? int32_t(ry + ch - 1u) : y);
+
+                const uint8_t* s = cur + (size_t(cy) * curW + size_t(cx)) * 4u;
+                uint8_t* d = cur + (size_t(y) * curW + size_t(x)) * 4u;
+
+                d[0] = s[0];
+                d[1] = s[1];
+                d[2] = s[2];
+                d[3] = s[3];
+            }
+        }
+    }
+}
+
+// 按 sprite 生成 mip 链并上传（RGBA8）。失败时清掉半成品，由调用方决定回退。
+static void uploadPbrSpriteMippedToVRAM(
+    void* pixels, uint32_t width, uint32_t height,
+    VkImage& image, VkDeviceMemory& memory, VkImageView& view)
+{
+    auto fail = [&](const char* why)
+    {
+        RTLog(std::string("[PBR SPRITE MIP] ") + why);
+        if (view != VK_NULL_HANDLE)
+        {
+            vkDestroyImageView(g_device, view, nullptr);
+            view = VK_NULL_HANDLE;
+        }
+        if (memory != VK_NULL_HANDLE)
+        {
+            vkFreeMemory(g_device, memory, nullptr);
+            memory = VK_NULL_HANDLE;
+        }
+        if (image != VK_NULL_HANDLE)
+        {
+            vkDestroyImage(g_device, image, nullptr);
+            image = VK_NULL_HANDLE;
+        }
+    };
+
+    if (width < 2u || height < 2u || g_pbrSpriteRects.empty())
+    {
+        fail("degenerate input");
+        return;
+    }
+
+    uint32_t mipLevels = 1u;
+    for (uint32_t s = std::max(width, height); s > 1u; s >>= 1u)
+    {
+        ++mipLevels;
+    }
+
+    std::vector<VkDeviceSize> offsets(mipLevels, 0u);
+    VkDeviceSize totalBytes = 0u;
+    for (uint32_t l = 0u; l < mipLevels; ++l)
+    {
+        offsets[l] = totalBytes;
+        const uint32_t lw = std::max(1u, width >> l);
+        const uint32_t lh = std::max(1u, height >> l);
+        totalBytes += VkDeviceSize(lw) * VkDeviceSize(lh) * 4u;
+    }
+
+    // 与 uploadTextureToVRAM 同一约定：进入时先等上一次提交。
+    if (g_textureUploadFencePending && g_textureUploadFence != VK_NULL_HANDLE)
+    {
+        check(
+            vkWaitForFences(
+                g_device, 1u, &g_textureUploadFence, VK_TRUE,
+                std::numeric_limits<uint64_t>::max()),
+            "wait previous texture upload fence failed");
+        g_textureUploadFencePending = false;
+    }
+
+    void* stagingMapped = acquireTextureUploadStaging(totalBytes);
+    if (stagingMapped == nullptr)
+    {
+        fail("staging map failed");
+        return;
+    }
+
+    uint8_t* stagingBytes = static_cast<uint8_t*>(stagingMapped);
+    const uint8_t* sourceBytes = static_cast<const uint8_t*>(pixels);
+    const size_t mip0Bytes = size_t(width) * size_t(height) * 4u;
+
+    std::memcpy(stagingBytes + offsets[0], sourceBytes, mip0Bytes);
+
+    std::vector<uint8_t> prev(sourceBytes, sourceBytes + mip0Bytes);
+    std::vector<uint8_t> cur;
+    std::vector<uint8_t> written;
+
+    for (uint32_t l = 1u; l < mipLevels; ++l)
+    {
+        const uint32_t lw = std::max(1u, width >> l);
+        const uint32_t lh = std::max(1u, height >> l);
+
+        cur.assign(size_t(lw) * size_t(lh) * 4u, 0u);
+
+        pbrDownsampleLevelBySprite(
+            prev.data(), std::max(1u, width >> (l - 1u)), std::max(1u, height >> (l - 1u)),
+            cur.data(), lw, lh, l, written);
+
+        std::memcpy(stagingBytes + offsets[l], cur.data(), cur.size());
+        prev.swap(cur);
+    }
+
+    VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.extent.width = width;
+    imageInfo.extent.height = height;
+    imageInfo.extent.depth = 1u;
+    imageInfo.mipLevels = mipLevels;
+    imageInfo.arrayLayers = 1u;
+    imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    if (vkCreateImage(g_device, &imageInfo, nullptr, &image) != VK_SUCCESS)
+    {
+        image = VK_NULL_HANDLE;
+        fail("vkCreateImage failed");
+        return;
+    }
+
+    VkMemoryRequirements memReq{};
+    vkGetImageMemoryRequirements(g_device, image, &memReq);
+
+    uint32_t typeIndex = 0xFFFFFFFFu;
+    try
+    {
+        typeIndex = findMemoryType(
+            g_physicalDevice, memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    }
+    catch (const std::exception& e)
+    {
+        RTLog(std::string("[PBR SPRITE MIP] no memory type: ") + e.what());
+    }
+
+    if (typeIndex == 0xFFFFFFFFu)
+    {
+        fail("no DEVICE_LOCAL memory type");
+        return;
+    }
+
+    VkMemoryAllocateInfo memAlloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    memAlloc.allocationSize = memReq.size;
+    memAlloc.memoryTypeIndex = typeIndex;
+
+    if (vkAllocateMemory(g_device, &memAlloc, nullptr, &memory) != VK_SUCCESS)
+    {
+        memory = VK_NULL_HANDLE;
+        fail("vkAllocateMemory failed");
+        return;
+    }
+
+    if (vkBindImageMemory(g_device, image, memory, 0u) != VK_SUCCESS)
+    {
+        fail("vkBindImageMemory failed");
+        return;
+    }
+
+    if (g_textureUploadCommandBuffer == VK_NULL_HANDLE)
+    {
+        VkCommandBufferAllocateInfo cbAlloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cbAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbAlloc.commandPool = g_rtCommandPool;
+        cbAlloc.commandBufferCount = 1u;
+
+        if (vkAllocateCommandBuffers(g_device, &cbAlloc, &g_textureUploadCommandBuffer) != VK_SUCCESS)
+        {
+            g_textureUploadCommandBuffer = VK_NULL_HANDLE;
+            fail("vkAllocateCommandBuffers failed");
+            return;
+        }
+    }
+
+    VkCommandBuffer cmd = g_textureUploadCommandBuffer;
+    vkResetCommandBuffer(cmd, 0u);
+
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &begin);
+
+    VkImageMemoryBarrier toDst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toDst.image = image;
+    toDst.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    toDst.subresourceRange.baseMipLevel = 0u;
+    toDst.subresourceRange.levelCount = mipLevels;
+    toDst.subresourceRange.baseArrayLayer = 0u;
+    toDst.subresourceRange.layerCount = 1u;
+    toDst.srcAccessMask = 0u;
+    toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0u, 0u, nullptr, 0u, nullptr, 1u, &toDst);
+
+    std::vector<VkBufferImageCopy> regions(mipLevels);
+    for (uint32_t l = 0u; l < mipLevels; ++l)
+    {
+        regions[l] = VkBufferImageCopy{};
+        regions[l].bufferOffset = offsets[l];
+        regions[l].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        regions[l].imageSubresource.mipLevel = l;
+        regions[l].imageSubresource.baseArrayLayer = 0u;
+        regions[l].imageSubresource.layerCount = 1u;
+        regions[l].imageExtent.width = std::max(1u, width >> l);
+        regions[l].imageExtent.height = std::max(1u, height >> l);
+        regions[l].imageExtent.depth = 1u;
+    }
+
+    vkCmdCopyBufferToImage(
+        cmd,
+        g_textureUploadStaging,
+        image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        mipLevels,
+        regions.data());
+
+    VkImageMemoryBarrier toRead = toDst;
+    toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    toRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        0u, 0u, nullptr, 0u, nullptr, 1u, &toRead);
+
+    vkEndCommandBuffer(cmd);
+
+    if (g_textureUploadFence == VK_NULL_HANDLE)
+    {
+        VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+
+        if (vkCreateFence(g_device, &fenceInfo, nullptr, &g_textureUploadFence) != VK_SUCCESS)
+        {
+            g_textureUploadFence = VK_NULL_HANDLE;
+            fail("vkCreateFence failed");
+            return;
+        }
+    }
+
+    vkResetFences(g_device, 1u, &g_textureUploadFence);
+
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1u;
+    submit.pCommandBuffers = &cmd;
+
+    if (vkQueueSubmit(g_queue, 1u, &submit, g_textureUploadFence) != VK_SUCCESS)
+    {
+        fail("vkQueueSubmit failed");
+        return;
+    }
+
+    g_textureUploadFencePending = true;
+
+    VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    viewInfo.image = image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.baseMipLevel = 0u;
+    viewInfo.subresourceRange.levelCount = mipLevels;
+    viewInfo.subresourceRange.baseArrayLayer = 0u;
+    viewInfo.subresourceRange.layerCount = 1u;
+
+    if (vkCreateImageView(g_device, &viewInfo, nullptr, &view) != VK_SUCCESS)
+    {
+        view = VK_NULL_HANDLE;
+        fail("vkCreateImageView failed");
+        return;
+    }
+
+    {
+        const double totalMb = static_cast<double>(totalBytes) / 1048576.0;
+        char line[320];
+        std::snprintf(
+            line, sizeof(line),
+            "[PBR SPRITE MIP] sprite-aligned mip chain uploaded. size=%ux%u levels=%u "
+            "rects=%u bytesMB=%.1f",
+            width, height, mipLevels,
+            static_cast<unsigned>(g_pbrSpriteRects.size()), totalMb);
+        RTLog(line);
+    }
+}
+
 // === 新增：统一的物理显存泵入管线 ===
 //
 // 加固（2026-10-08）：原实现把 vkCreateImage / vkAllocateMemory / vkBindImageMemory /
@@ -11840,6 +12444,565 @@ static void releaseTextureUploadScratch()
 // 就是 vkGetImageMemoryRequirements 拿到空 image，驱动在 nvoglv64.dll 里读近空地址
 // 0x3ec 崩溃。现在每一步都查返回值：失败即回收本次半成品句柄、打日志、安全返回，
 // 绝不把空句柄留在运行路径上。
+#include "bc7enc.h"
+
+// ============================================================================
+// 2026-10-29（P2b）：PBR 图集 BC7 压缩 —— ORION_PBR_BC7（默认开）
+//
+// 为什么是 BC7：8 bpp（RGBA8 是 32 bpp）⇒ 图集显存 4×。8192² 两张：
+//   RGBA8 + mip ≈ 682 MiB  ->  BC7 + mip ≈ 171 MiB
+// 与 RTX Remix 的口径一致（`rtx_texture.h:217` 用 BC7_UNORM，不是 _SRGB）。
+//
+// 编码器：bc7enc_rdo（Richard Geldreich，MIT / public domain，
+// cpp/external/bc7enc/）。它的行为正好契合我们两张图集：
+//   · 块内 alpha 全 255 ⇒ 用 mode 1（无 alpha 段，解码 alpha 精确 255）
+//     —— specular 的 `255 = 无自发光` 语义因此**不会被插值破坏**；
+//   · 块内有 alpha<255 ⇒ 强制 mode 6（8-bit alpha 端点 + 7-bit index）
+//     —— normal 的 POM 高度（a 通道）拿到 BC7 能给的最好精度。
+// 参数用 **linear weights**（不用默认的 YCbCr 感知加权）：这是法线/粗糙度数据
+// 纹理，不是颜色。
+//
+// mip 链复用 P2a 的「按 sprite 矩形降采样」：跨 sprite 渗色在压缩前就已经消掉，
+// BC7 只是把每级数据换成块编码 —— 两个改动正交，各自可单独回退。
+// ============================================================================
+static bool pbrBc7Enabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_PBR_BC7");
+        return raw == nullptr || raw[0] == '\0' || raw[0] != '0';
+    }();
+
+    return cached;
+}
+
+// 2026-10-29：二分开关 —— ORION_PBR_BC7_PARTS=normal|specular 只压其中一张。
+// 用途：定位"材质变亮"到底来自 normal（法线/AO/POM 高度）还是 specular
+// （粗糙度/F0/自发光掩码）。未设或其它值 = 两张都压。
+static bool pbrBc7PartEnabled(bool isNormalTexture)
+{
+    static const int partMode = []()
+    {
+        const char* raw = std::getenv("ORION_PBR_BC7_PARTS");
+
+        if (raw == nullptr || raw[0] == '\0')
+        {
+            return 0; // both
+        }
+
+        if (std::strcmp(raw, "normal") == 0)
+        {
+            return 1;
+        }
+
+        if (std::strcmp(raw, "specular") == 0)
+        {
+            return 2;
+        }
+
+        return 0;
+    }();
+
+    if (partMode == 0)
+    {
+        return true;
+    }
+
+    return partMode == 1 ? isNormalTexture : !isNormalTexture;
+}
+
+// 由 uploadPBRAtlases 在每次 uploadTextureToVRAM 之前设置（normal 先、specular 后）。
+static bool g_pbrBc7AllowForNextUpload = true;
+
+static bool pbrBc7Supported()
+{
+    static const bool cached = []()
+    {
+        if (g_physicalDevice == VK_NULL_HANDLE)
+        {
+            return false;
+        }
+
+        VkPhysicalDeviceFeatures features{};
+        vkGetPhysicalDeviceFeatures(g_physicalDevice, &features);
+        return features.textureCompressionBC == VK_TRUE;
+    }();
+
+    return cached;
+}
+
+static void pbrBc7ParamsInit(bc7enc_compress_block_params& params)
+{
+    bc7enc_compress_block_params_init(&params);
+
+    // 数据纹理：linear 权重（默认的 perceptual 会把 YCbCr 误差权重压到色度上，
+    // 对法线/粗糙度是错的）。
+    bc7enc_compress_block_params_init_linear_weights(&params);
+
+    // 速度/质量折中：mode 1 的分区搜索降到 16（默认 64），uber 0。
+    // 8192² 全 mip 约 89 MPix，作为加载期一次性成本。
+    params.m_max_partitions = 16u;
+    params.m_uber_level = 0u;
+    params.m_mode17_partition_estimation_filterbank = true;
+}
+
+// 单线程编码 [blockRow0, blockRow1) 这一段块行（边界不足 4 的像素用 clamp 复制）。
+static void pbrEncodeBc7BlockRows(
+    const uint8_t* rgba, uint32_t width, uint32_t height,
+    uint32_t blocksX, uint8_t* dst,
+    const bc7enc_compress_block_params& params,
+    uint32_t blockRow0, uint32_t blockRow1)
+{
+    uint8_t block[64];
+
+    // 2026-10-29：alpha 全 255 的块用一套「只允许 mode 1」的参数副本。
+    // mode 1 没有 alpha 段，解码 alpha 恒为 255 —— 这正是 specular 图集
+    // `255 = 无自发光` 需要的语义（见下面逐块的说明）。
+    bc7enc_compress_block_params opaqueParams = params;
+    opaqueParams.m_mode_mask = 1u << 1u;
+
+    for (uint32_t by = blockRow0; by < blockRow1; ++by)
+    {
+        for (uint32_t bx = 0u; bx < blocksX; ++bx)
+        {
+            for (uint32_t py = 0u; py < 4u; ++py)
+            {
+                uint32_t sy = by * 4u + py;
+
+                if (sy >= height)
+                {
+                    sy = height - 1u;
+                }
+
+                for (uint32_t px = 0u; px < 4u; ++px)
+                {
+                    uint32_t sx = bx * 4u + px;
+
+                    if (sx >= width)
+                    {
+                        sx = width - 1u;
+                    }
+
+                    std::memcpy(
+                        block + (size_t(py) * 4u + px) * 4u,
+                        rgba + (size_t(sy) * width + sx) * 4u,
+                        4u);
+                }
+            }
+
+            // 2026-10-29：块内 alpha 全 255 ⇒ 强制 mode 1。
+            //
+            // 离线自检实测（同一参数 + 官方 bc7decomp 解码）：bc7enc 对这种块会选
+            // mode 6 并把 alpha 解成 **254**；而 specular 的 alpha 是自发光掩码，
+            // shader 判据是 `emissiveCode >= 255 ? 0 : code/254` ⇒ 254 = 满自发光
+            // ⇒ 整片材质像自发光一样亮。mode 1 无 alpha 段，解出的 alpha 精确 255。
+            //
+            // 代价：每块多 16 次字节比较；opaque 块失去 mode 6 的 RGB 自由度，
+            // 但这类块（无高度、无自发光）本来就不需要 alpha 精度。
+            bool opaqueAlpha = true;
+
+            for (uint32_t i = 0u; i < 16u; ++i)
+            {
+                if (block[i * 4u + 3u] != 255u)
+                {
+                    opaqueAlpha = false;
+                    break;
+                }
+            }
+
+            bc7enc_compress_block(
+                dst + (size_t(by) * blocksX + bx) * 16u,
+                block,
+                opaqueAlpha ? &opaqueParams : &params);
+        }
+    }
+}
+
+// 2026-10-29：把一整级 RGBA8 编码成 BC7 块，**按块行分片并行**。
+//
+// 实测单线程 16384x8192 全链 57 秒/张（两张 111 秒，渲染线程全程阻塞），
+// 而 bc7enc 的查找表只在 bc7enc_compress_block_init() 里填一次、之后只读
+// （bc7enc.cpp:109/112 的 g_bc7_mode_1/7_optimal_endpoints），
+// 所以并行只受 CPU 核数限制。16 线程预期 3~5 秒/张。
+//
+// 每级 spawn 一次（mip 链必须逐级串行：第 l 级依赖第 l-1 级的结果），
+// 线程创建开销相对每级几十毫秒的编码可忽略。
+static void pbrEncodeBc7Level(
+    const uint8_t* rgba, uint32_t width, uint32_t height,
+    uint8_t* dst, const bc7enc_compress_block_params& params)
+{
+    const uint32_t blocksX = (width + 3u) / 4u;
+    const uint32_t blocksY = (height + 3u) / 4u;
+
+    uint32_t threads = std::thread::hardware_concurrency();
+
+    if (threads == 0u)
+    {
+        threads = 1u;
+    }
+
+    threads = std::min<uint32_t>(threads, 16u);
+    threads = std::min<uint32_t>(threads, blocksY);
+
+    if (threads <= 1u)
+    {
+        pbrEncodeBc7BlockRows(
+            rgba, width, height, blocksX, dst, params, 0u, blocksY);
+        return;
+    }
+
+    const uint32_t rowsPerThread = (blocksY + threads - 1u) / threads;
+
+    std::vector<std::thread> workers;
+    workers.reserve(threads);
+
+    for (uint32_t t = 0u; t < threads; ++t)
+    {
+        const uint32_t row0 = t * rowsPerThread;
+        const uint32_t row1 = std::min(blocksY, row0 + rowsPerThread);
+
+        if (row0 >= row1)
+        {
+            break;
+        }
+
+        workers.emplace_back(
+            [rgba, width, height, blocksX, dst, &params, row0, row1]()
+            {
+                pbrEncodeBc7BlockRows(
+                    rgba, width, height, blocksX, dst, params, row0, row1);
+            });
+    }
+
+    for (std::thread& worker : workers)
+    {
+        worker.join();
+    }
+}
+
+// 按 sprite 生成 mip 链 + 逐级 BC7 编码 + 上传。失败返回空 view，由调用方回退。
+static void uploadPbrBc7SpriteMipped(
+    void* pixels, uint32_t width, uint32_t height,
+    VkImage& image, VkDeviceMemory& memory, VkImageView& view)
+{
+    auto fail = [&](const char* why)
+    {
+        RTLog(std::string("[PBR BC7] ") + why);
+        if (view != VK_NULL_HANDLE)
+        {
+            vkDestroyImageView(g_device, view, nullptr);
+            view = VK_NULL_HANDLE;
+        }
+        if (memory != VK_NULL_HANDLE)
+        {
+            vkFreeMemory(g_device, memory, nullptr);
+            memory = VK_NULL_HANDLE;
+        }
+        if (image != VK_NULL_HANDLE)
+        {
+            vkDestroyImage(g_device, image, nullptr);
+            image = VK_NULL_HANDLE;
+        }
+    };
+
+    if (width < 4u || height < 4u || g_pbrSpriteRects.empty())
+    {
+        fail("degenerate input");
+        return;
+    }
+
+    static const bool bc7EncoderReady = []()
+    {
+        bc7enc_compress_block_init();
+        return true;
+    }();
+    (void)bc7EncoderReady;
+
+    bc7enc_compress_block_params params;
+    pbrBc7ParamsInit(params);
+
+    // 2026-10-29 诊断：源图 alpha 分布。specular 的 alpha 是自发光掩码
+    // （255 = 无自发光），若"变亮"来自它，这里应能看到 255 占比极高；
+    // normal 的 alpha 是 POM 高度，本来就大量 != 255。
+    {
+        const uint8_t* probe = static_cast<const uint8_t*>(pixels);
+        const size_t pixelCount = size_t(width) * size_t(height);
+        size_t exact255 = 0u;
+
+        for (size_t i = 0u; i < pixelCount; ++i)
+        {
+            if (probe[i * 4u + 3u] == 255u)
+            {
+                ++exact255;
+            }
+        }
+
+        RTLog("[PBR BC7] src alpha: ==255 " + std::to_string(exact255) +
+              " / " + std::to_string(pixelCount) +
+              " (!=255 " + std::to_string(pixelCount - exact255) + ")");
+    }
+
+    uint32_t mipLevels = 1u;
+    for (uint32_t s = std::max(width, height); s > 1u; s >>= 1u)
+    {
+        ++mipLevels;
+    }
+
+    std::vector<VkDeviceSize> offsets(mipLevels, 0u);
+    VkDeviceSize totalBytes = 0u;
+
+    for (uint32_t l = 0u; l < mipLevels; ++l)
+    {
+        offsets[l] = totalBytes;
+
+        const uint32_t lw = std::max(1u, width >> l);
+        const uint32_t lh = std::max(1u, height >> l);
+        const uint32_t bx = (lw + 3u) / 4u;
+        const uint32_t by = (lh + 3u) / 4u;
+
+        totalBytes += VkDeviceSize(bx) * VkDeviceSize(by) * 16u;
+    }
+
+    if (g_textureUploadFencePending && g_textureUploadFence != VK_NULL_HANDLE)
+    {
+        check(
+            vkWaitForFences(
+                g_device, 1u, &g_textureUploadFence, VK_TRUE,
+                std::numeric_limits<uint64_t>::max()),
+            "wait previous texture upload fence failed");
+        g_textureUploadFencePending = false;
+    }
+
+    void* stagingMapped = acquireTextureUploadStaging(totalBytes);
+    if (stagingMapped == nullptr)
+    {
+        fail("staging map failed");
+        return;
+    }
+
+    uint8_t* stagingBytes = static_cast<uint8_t*>(stagingMapped);
+
+    {
+        const auto encodeStart = std::chrono::steady_clock::now();
+
+        const uint8_t* sourceBytes = static_cast<const uint8_t*>(pixels);
+        const size_t mip0Bytes = size_t(width) * size_t(height) * 4u;
+
+        std::vector<uint8_t> prev(sourceBytes, sourceBytes + mip0Bytes);
+        std::vector<uint8_t> cur;
+        std::vector<uint8_t> written;
+
+        pbrEncodeBc7Level(
+            prev.data(), width, height, stagingBytes + offsets[0], params);
+
+        for (uint32_t l = 1u; l < mipLevels; ++l)
+        {
+            const uint32_t lw = std::max(1u, width >> l);
+            const uint32_t lh = std::max(1u, height >> l);
+
+            cur.assign(size_t(lw) * size_t(lh) * 4u, 0u);
+
+            pbrDownsampleLevelBySprite(
+                prev.data(), std::max(1u, width >> (l - 1u)), std::max(1u, height >> (l - 1u)),
+                cur.data(), lw, lh, l, written);
+
+            pbrEncodeBc7Level(cur.data(), lw, lh, stagingBytes + offsets[l], params);
+            prev.swap(cur);
+        }
+
+        const double encodeMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - encodeStart).count();
+
+        RTLog("[PBR BC7] encoded size=" + std::to_string(width) + "x" + std::to_string(height) +
+              " levels=" + std::to_string(mipLevels) +
+              " rects=" + std::to_string(g_pbrSpriteRects.size()) +
+              " compressedMB=" + std::to_string(double(totalBytes) / 1048576.0) +
+              " encodeMs=" + std::to_string(encodeMs));
+    }
+
+    VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.extent.width = width;
+    imageInfo.extent.height = height;
+    imageInfo.extent.depth = 1u;
+    imageInfo.mipLevels = mipLevels;
+    imageInfo.arrayLayers = 1u;
+    imageInfo.format = VK_FORMAT_BC7_UNORM_BLOCK;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    if (vkCreateImage(g_device, &imageInfo, nullptr, &image) != VK_SUCCESS)
+    {
+        image = VK_NULL_HANDLE;
+        fail("vkCreateImage(BC7) failed");
+        return;
+    }
+
+    VkMemoryRequirements memReq{};
+    vkGetImageMemoryRequirements(g_device, image, &memReq);
+
+    uint32_t typeIndex = 0xFFFFFFFFu;
+    try
+    {
+        typeIndex = findMemoryType(
+            g_physicalDevice, memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    }
+    catch (const std::exception& e)
+    {
+        RTLog(std::string("[PBR BC7] no memory type: ") + e.what());
+    }
+
+    if (typeIndex == 0xFFFFFFFFu)
+    {
+        fail("no DEVICE_LOCAL memory type");
+        return;
+    }
+
+    VkMemoryAllocateInfo memAlloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    memAlloc.allocationSize = memReq.size;
+    memAlloc.memoryTypeIndex = typeIndex;
+
+    if (vkAllocateMemory(g_device, &memAlloc, nullptr, &memory) != VK_SUCCESS)
+    {
+        memory = VK_NULL_HANDLE;
+        fail("vkAllocateMemory failed");
+        return;
+    }
+
+    if (vkBindImageMemory(g_device, image, memory, 0u) != VK_SUCCESS)
+    {
+        fail("vkBindImageMemory failed");
+        return;
+    }
+
+    if (g_textureUploadCommandBuffer == VK_NULL_HANDLE)
+    {
+        VkCommandBufferAllocateInfo cbAlloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cbAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbAlloc.commandPool = g_rtCommandPool;
+        cbAlloc.commandBufferCount = 1u;
+
+        if (vkAllocateCommandBuffers(g_device, &cbAlloc, &g_textureUploadCommandBuffer) != VK_SUCCESS)
+        {
+            g_textureUploadCommandBuffer = VK_NULL_HANDLE;
+            fail("vkAllocateCommandBuffers failed");
+            return;
+        }
+    }
+
+    VkCommandBuffer cmd = g_textureUploadCommandBuffer;
+    vkResetCommandBuffer(cmd, 0u);
+
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &begin);
+
+    VkImageMemoryBarrier toDst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toDst.image = image;
+    toDst.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    toDst.subresourceRange.baseMipLevel = 0u;
+    toDst.subresourceRange.levelCount = mipLevels;
+    toDst.subresourceRange.baseArrayLayer = 0u;
+    toDst.subresourceRange.layerCount = 1u;
+    toDst.srcAccessMask = 0u;
+    toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0u, 0u, nullptr, 0u, nullptr, 1u, &toDst);
+
+    std::vector<VkBufferImageCopy> regions(mipLevels);
+    for (uint32_t l = 0u; l < mipLevels; ++l)
+    {
+        regions[l] = VkBufferImageCopy{};
+        regions[l].bufferOffset = offsets[l];
+        regions[l].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        regions[l].imageSubresource.mipLevel = l;
+        regions[l].imageSubresource.baseArrayLayer = 0u;
+        regions[l].imageSubresource.layerCount = 1u;
+        regions[l].imageExtent.width = std::max(1u, width >> l);
+        regions[l].imageExtent.height = std::max(1u, height >> l);
+        regions[l].imageExtent.depth = 1u;
+    }
+
+    vkCmdCopyBufferToImage(
+        cmd,
+        g_textureUploadStaging,
+        image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        mipLevels,
+        regions.data());
+
+    VkImageMemoryBarrier toRead = toDst;
+    toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    toRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        0u, 0u, nullptr, 0u, nullptr, 1u, &toRead);
+
+    vkEndCommandBuffer(cmd);
+
+    if (g_textureUploadFence == VK_NULL_HANDLE)
+    {
+        VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+
+        if (vkCreateFence(g_device, &fenceInfo, nullptr, &g_textureUploadFence) != VK_SUCCESS)
+        {
+            g_textureUploadFence = VK_NULL_HANDLE;
+            fail("vkCreateFence failed");
+            return;
+        }
+    }
+
+    vkResetFences(g_device, 1u, &g_textureUploadFence);
+
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1u;
+    submit.pCommandBuffers = &cmd;
+
+    if (vkQueueSubmit(g_queue, 1u, &submit, g_textureUploadFence) != VK_SUCCESS)
+    {
+        fail("vkQueueSubmit failed");
+        return;
+    }
+
+    g_textureUploadFencePending = true;
+
+    VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    viewInfo.image = image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_BC7_UNORM_BLOCK;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.baseMipLevel = 0u;
+    viewInfo.subresourceRange.levelCount = mipLevels;
+    viewInfo.subresourceRange.baseArrayLayer = 0u;
+    viewInfo.subresourceRange.layerCount = 1u;
+
+    if (vkCreateImageView(g_device, &viewInfo, nullptr, &view) != VK_SUCCESS)
+    {
+        view = VK_NULL_HANDLE;
+        fail("vkCreateImageView(BC7) failed");
+        return;
+    }
+
+    RTLog("[PBR BC7] atlas uploaded as BC7_UNORM (mip chain, sprite-aligned)");
+}
+
 static void uploadTextureToVRAM(void* pixels, uint32_t width, uint32_t height, VkImage& image, VkDeviceMemory& memory, VkImageView& view) {
     if (pixels == nullptr || width == 0u || height == 0u) {
         RTLog("[PBR VRAM] invalid pixel payload, upload skipped");
@@ -11854,6 +13017,37 @@ static void uploadTextureToVRAM(void* pixels, uint32_t width, uint32_t height, V
         g_rtCommandPool == VK_NULL_HANDLE) {
         RTLog("[PBR VRAM] device/queue/pool unavailable, upload skipped");
         return;
+    }
+
+    // 2026-10-29（P2a）：有 sprite 矩形表且闸门打开时，走「按 sprite 生成 mip」。
+    // 目的与原理见 uploadPbrSpriteMippedToVRAM 上方那段说明；闸门关或表为空时
+    // 完全落在下面的旧路径（整图 vkCmdBlitImage 生成 mip），逐位同旧档。
+    if (pbrSpriteMipEnabled() && !g_pbrSpriteRects.empty())
+    {
+        // 2026-10-29（P2b）：先试 BC7（4× 显存）；失败或驱动不支持则退到 RGBA8
+        // 的同款「按 sprite mip」路径，再失败才退到整图 blit。三级回退都不丢图集。
+        if (pbrBc7Enabled() && g_pbrBc7AllowForNextUpload && pbrBc7Supported())
+        {
+            uploadPbrBc7SpriteMipped(pixels, width, height, image, memory, view);
+
+            if (view != VK_NULL_HANDLE)
+            {
+                return;
+            }
+
+            RTLog("[PBR BC7] fell back to RGBA8 sprite-mip path");
+        }
+
+        uploadPbrSpriteMippedToVRAM(pixels, width, height, image, memory, view);
+
+        // 成功（view 建出来了）就直接返回；失败时**继续走下面的旧路径** ——
+        // 否则 PBR 图集整个丢失（法线/粗糙度全变中性），比回退到整图 blit 糟得多。
+        if (view != VK_NULL_HANDLE)
+        {
+            return;
+        }
+
+        RTLog("[PBR SPRITE MIP] fell back to whole-atlas blit path");
     }
 
     // 回收本次已创建的 image/memory/view 后返回（命令缓冲与 fence 是常驻共享资源，
@@ -16744,6 +17938,38 @@ struct CapturedSectionUpdate
 static std::mutex g_capturedSectionsMutex;
 static std::vector<CapturedSectionUpdate> g_capturedSections;
 
+// 2026-10-29（B）：捕获队列的**读游标**。
+//
+// 旧路径每帧 `swap(g_capturedSections)` 取走整个队列，再把没采用的部分 move 回
+// 队尾 ⇒ 每帧成本 O(积压长度)。实测（19:01 那局）：积压从 0 涨到 926 段时，
+// [RT GEOMETRY] 的 preLoopMs 从 3.8 线性涨到 73.2 ms，而同一窗口只采用 15 段。
+// 它与捕获速率构成正反馈：preLoop 越贵 ⇒ 帧率越低 ⇒ 采用越慢 ⇒ 积压更快。
+//
+// 现在渲染线程只从**队头**搬 batchCap 个（O(batchCap)），其余原地不动；消费过的
+// 前缀在占到一半时摊还 erase 一次。语义与旧路径一致（FIFO，先捕获的先处理）。
+// 回退：ORION_CAPTURE_CURSOR=0 走旧的 swap/insert 路径。
+static size_t g_capturedSectionsHead = 0u;
+
+static bool captureQueueCursorEnabled()
+{
+    static const bool enabled = []()
+    {
+        const char* raw = std::getenv("ORION_CAPTURE_CURSOR");
+
+        return !(raw != nullptr &&
+                 (raw[0] == '0' || raw[0] == 'f' || raw[0] == 'F'));
+    }();
+
+    return enabled;
+}
+
+// 调用方必须已持 g_capturedSectionsMutex。
+static void resetCapturedSectionsLocked()
+{
+    g_capturedSections.clear();
+    g_capturedSectionsHead = 0u;
+}
+
 static std::thread g_geometryCaptureThread;
 static std::mutex g_geometryCaptureStateMutex;
 static std::condition_variable g_geometryCaptureWake;
@@ -17121,7 +18347,8 @@ static void geometryCaptureWorkerLoop()
 
             if(!g_forceSectionASReset.load(std::memory_order_acquire) &&
                !g_dirtySectionKeys.empty() &&
-               (g_capturedSections.size() + pendingPack.size()) <
+               ((g_capturedSections.size() - g_capturedSectionsHead) +
+                   pendingPack.size()) <
                    GEOMETRY_CAPTURE_MAX_QUEUED)
             {
                 size_t taken = 0u;
@@ -17438,7 +18665,7 @@ static void stopGeometryCaptureWorker()
     g_geometryCaptureStarted = false;
     {
         std::lock_guard<std::mutex> capturedLock(g_capturedSectionsMutex);
-        g_capturedSections.clear();
+        resetCapturedSectionsLocked();
     }
     // 会话尾汇总（渲染线程打，worker 不碰日志流）：
     //   captured  = 捕获线程从脏集合摘走的总数
@@ -21577,28 +22804,40 @@ static bool createSectionOpacityMicromap(
 
 // 2026-10-21：Section BLAS refit 闸门。见 RTSectionAS::refitCapable。
 //
-// 两种打开方式：
-//   1. 环境变量 ORION_AS_REFIT=1 —— 进程内恒开（启动时读一次）；
-//   2. 标记文件 as_refit.on（相对 gameDir，即 run/as_refit.on）—— **运行时可热切换**：
-//      每 600 帧查一次是否存在。用于同一局内原地 A/B，避免为对照重启客户端
-//      （每次重启要付一次冷编）。文件在 = 开，删掉 = 关。
+// 2026-10-29：**默认值改为开**。依据是同局（marker 热切换）A/B：
+//   asCreateN/asRetireN 2228 → 617（−72%），asCreateMs 282 → 260（−7%），
+//   asChunkMB 512.4 → 510.4（无内存代价），frame 19.51 → 19.41，
+//   trace 15.55 → 15.27。此前"ALLOW_UPDATE 让树略大"的顾虑被实测否决。
+//
+// 三档语义：
+//   1. ORION_AS_REFIT=1  —— 进程内恒开（启动读一次，忽略 marker）；
+//   2. ORION_AS_REFIT=0  —— 进程内恒关（硬回退，优先级最高）；
+//   3. 未设             —— 默认开；可用标记文件热切换：
+//                          run/as_refit.off 存在 ⇒ 关（每 600 帧探测一次）。
+//      旧的 run/as_refit.on 不再需要（默认即开），保留它也只是"开"。
 //
 // 热切换只影响**之后的**重建：已经在 refitCapable 状态下的 AS 继续可 refit，
 // 新段则在闸门打开时才开始带 ALLOW_UPDATE。
 static bool sectionBLASRefitEnabled()
 {
-    static const bool envForced = []() -> bool
+    static const int envMode = []() -> int
     {
         const char* raw = std::getenv("ORION_AS_REFIT");
-        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return -1;
+        }
+
+        return (raw[0] == '0') ? 0 : 1;
     }();
 
-    if(envForced)
+    if(envMode >= 0)
     {
-        return true;
+        return envMode == 1;
     }
 
-    static bool markerState = false;
+    static bool markerState = true;
     static uint64_t lastProbeFrame = 0u;
 
     if(g_perfL10FrameSerial - lastProbeFrame >= 600u ||
@@ -21606,8 +22845,8 @@ static bool sectionBLASRefitEnabled()
     {
         lastProbeFrame = g_perfL10FrameSerial;
 
-        std::ifstream marker("as_refit.on");
-        markerState = marker.good();
+        std::ifstream offMarker("as_refit.off");
+        markerState = !offMarker.good();
     }
 
     return markerState;
@@ -21640,6 +22879,41 @@ static constexpr uint32_t SECTION_QUAD_INDEX_MAX_VERTS =
 //
 // ⚠ 改这一行必须同时重编 DLL 与 4 个 SPV（rchit ×2、rahit ×2）。
 static constexpr bool SECTION_INDEXED_TERRAIN_ENABLED = true;
+
+// 2026-10-29 诊断闸门（ORION_INDEXED_TERRAIN=0 关掉索引化布局）。
+//
+// 与上面那句"必须同时重编 4 个 SPV"不冲突：着色器侧**两种布局都编在同一份
+// SPV 里**，按顶点表项 `.w` 的最低位运行期分支（material_resolve.glsl:108
+// `indexedQuads = (sectionAddressEntry.w & 1u) != 0u`）。所以只改这里 + 重编
+// DLL 就能做 A/B；只有改"两布局的语义"时才需要碰 SPV。
+//
+// 用途：用户报"压显存之后方块之间有分界线"。索引化把每 quad 的 6 个展开顶点
+// 收成 4 个角点（逐属性相同，见 uploadChunk 的 repackedVertices），代码上不
+// 应该产生接缝，但 BLAS 用**共享 uint16 索引缓冲**（非 shader 读取），驱动侧
+// 行为只有实测能排除 ⇒ 留一个单开关。
+static bool sectionIndexedTerrainEnvEnabled()
+{
+    static const bool enabled = []()
+    {
+        const char* raw = std::getenv("ORION_INDEXED_TERRAIN");
+
+        const bool on =
+            !(raw != nullptr &&
+              (raw[0] == '0' || raw[0] == 'f' || raw[0] == 'F'));
+
+        fprintf(
+            stderr,
+            "[GEO LAYOUT] indexedTerrain=%d (ORION_INDEXED_TERRAIN)\n",
+            on ? 1 : 0
+        );
+
+        fflush(stderr);
+
+        return on;
+    }();
+
+    return enabled;
+}
 
 static VkBuffer g_sectionQuadIndexBuffer = VK_NULL_HANDLE;
 static VkDeviceMemory g_sectionQuadIndexMemory = VK_NULL_HANDLE;
@@ -21796,6 +23070,7 @@ static bool sectionUsesIndexedGeometry(
     size_t vertexCount)
 {
     return SECTION_INDEXED_TERRAIN_ENABLED &&
+        sectionIndexedTerrainEnvEnabled() &&
         (sectionKey & ~SPATIAL_SECTION_KEY_MASK) == SECTION_AS_CLASS_OPAQUE &&
         vertexCount != 0u &&
         (vertexCount % 4u) == 0u &&
@@ -21868,6 +23143,7 @@ static VkDeviceSize createSectionBLAS(
     section = {};
     section.sectionKey = sectionKey;
     section.indexedGeometry = indexedGeometry;
+    section.opaqueGeometry = opaqueGeometry;
 
     // 2026-10-21 地形 32B：GPU 侧步长在这里定死，record 阶段必须用同一个值。
     // 判据在函数内算（sectionUsesPackedVertices），不依赖调用点传参。
@@ -22365,6 +23641,14 @@ static void recordSectionBLASBuild(
     geometry.geometryType =
         VK_GEOMETRY_TYPE_TRIANGLES_KHR;
 
+    // 2026-10-29 **已回退**：这里曾改成 `section.opaqueGeometry ? OPAQUE : 0`，
+    // 想修"refit 后丢 OPAQUE"的不一致。实机出现大面积几何缺失（meshSec 954 → 3、
+    // TLAS 实例 1500+ → 3），且用 ORION_* 全关也复现 ⇒ 先恢复成改动前的恒 0。
+    //
+    // 为什么它会致命：createSectionBLAS 查询 build size 时用的是**参数** opaqueGeometry，
+    // 而这里用的是**存下来的** section.opaqueGeometry。只要两者在任一时刻不一致
+    // （例如段经 refit/复用路径重建），`geometry.flags` 就与 size 查询口径不同，
+    // 而 flags 会改变 BLAS 内部布局与大小 ⇒ 按旧尺寸分配的 buffer 被按新布局写。
     geometry.flags = 0;
 
     geometry.geometry.triangles =
@@ -26316,7 +27600,7 @@ static void recordGlassAlphaBlend(
         // 建 run/glass_dbg_<n>.flag（n = 9..13）⇒ push.dbgMode = n，删掉即恢复。
         // 读一次并缓存：切档本来就要重启客户端，不值得每帧五次 ifstream。
         static const uint32_t markerDbg = [] {
-            static const uint32_t candidates[] = {1u, 6u, 9u, 10u, 11u, 12u, 13u, 14u};
+            static const uint32_t candidates[] = {1u, 6u, 9u, 10u, 11u, 12u, 13u, 14u, 15u};
 
             for(uint32_t value : candidates)
             {
@@ -46250,6 +47534,147 @@ static void recordVolumeRestir(VkCommandBuffer cmd, uint32_t renderWidth, uint32
 }
 
 
+
+// ============================================================
+// 2026-10-29 OPT-EXT①：GPU 挂死诊断
+//
+// VK_EXT_device_fault + VK_NV_device_diagnostic_checkpoints。
+//
+// 背景：2026-10-21 那次"进世界必崩 / 5s semaphore 超时"排查了四轮才落到
+// "rchit 的 #else 分支少写一条 ray payload ⇒ material_resolve 拿上一条射线的
+// identity 索引 ⇒ buffer_reference 解引用任意地址 ⇒ GPU 挂死"。当时没有任何
+// 设备侧读数可用，只能二分 + 读源码。本函数唯一目的：设备真的丢掉时，把驱动
+// 给的描述/地址与队列最后一个 checkpoint 写进 rt_debug.log，下一次先看日志。
+//
+// 两者都是只读查询，不改变任何渲染行为。扩展未启用时只打一行 "not enabled"。
+// ============================================================
+static void logDeviceFaultDiagnostics(const char* where)
+{
+    if(g_device == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    std::string line = "[GPU FAULT] ";
+    line += (where != nullptr) ? where : "?";
+
+    auto getFaultInfo = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(
+        vkGetDeviceProcAddr(g_device, "vkGetDeviceFaultInfoEXT"));
+
+    if(getFaultInfo == nullptr)
+    {
+        RTLog(line + " : VK_EXT_device_fault not enabled");
+    }
+    else
+    {
+        VkDeviceFaultCountsEXT counts{};
+        counts.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT;
+
+        const VkResult countsResult = getFaultInfo(g_device, &counts, nullptr);
+
+        if(countsResult != VK_SUCCESS)
+        {
+            RTLog(line + " : vkGetDeviceFaultInfoEXT(counts) returned " +
+                std::to_string(static_cast<int>(countsResult)));
+        }
+        else
+        {
+            std::vector<VkDeviceFaultAddressInfoEXT> addressInfos(counts.addressInfoCount);
+            std::vector<VkDeviceFaultVendorInfoEXT> vendorInfos(counts.vendorInfoCount);
+            std::vector<char> vendorBinary(static_cast<size_t>(counts.vendorBinarySize));
+
+            VkDeviceFaultInfoEXT info{};
+            info.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT;
+            info.pAddressInfos = addressInfos.empty() ? nullptr : addressInfos.data();
+            info.pVendorInfos = vendorInfos.empty() ? nullptr : vendorInfos.data();
+            info.pVendorBinaryData = vendorBinary.empty() ? nullptr : vendorBinary.data();
+
+            const VkResult infoResult = getFaultInfo(g_device, nullptr, &info);
+
+            if(infoResult != VK_SUCCESS)
+            {
+                RTLog(line + " : vkGetDeviceFaultInfoEXT(info) returned " +
+                    std::to_string(static_cast<int>(infoResult)));
+            }
+            else
+            {
+                std::stringstream fault;
+                fault << line
+                      << " : description=\"" << info.description << "\""
+                      << " addressInfos=" << counts.addressInfoCount
+                      << " vendorInfos=" << counts.vendorInfoCount
+                      << " vendorBinaryBytes=" << counts.vendorBinarySize;
+
+                for(uint32_t i = 0u; i < counts.addressInfoCount; ++i)
+                {
+                    fault << " | addr[" << i << "]"
+                          << " type=" << static_cast<int>(addressInfos[i].addressType)
+                          << " reported=0x" << std::hex << addressInfos[i].reportedAddress
+                          << " precision=" << addressInfos[i].addressPrecision
+                          << std::dec;
+                }
+
+                for(uint32_t i = 0u; i < counts.vendorInfoCount; ++i)
+                {
+                    fault << " | vendor[" << i << "]=" << vendorInfos[i].description
+                          << " code=0x" << std::hex << vendorInfos[i].vendorFaultCode
+                          << std::dec;
+                }
+
+                RTLog(fault.str());
+            }
+        }
+    }
+
+    // 队列侧 checkpoint：只有 vkCmdSetCheckpointNV 埋过点之后才有内容。
+    auto getCheckpointData = reinterpret_cast<PFN_vkGetQueueCheckpointData2NV>(
+        vkGetDeviceProcAddr(g_device, "vkGetQueueCheckpointData2NV"));
+
+    if(getCheckpointData == nullptr || g_queue == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    uint32_t checkpointCount = 0u;
+    getCheckpointData(g_queue, &checkpointCount, nullptr);
+
+    if(checkpointCount == 0u)
+    {
+        RTLog(line + " : queue has no checkpoint (vkCmdSetCheckpointNV never hit)");
+        return;
+    }
+
+    std::vector<VkCheckpointData2NV> checkpoints(checkpointCount);
+
+    for(uint32_t i = 0u; i < checkpointCount; ++i)
+    {
+        checkpoints[i].sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_2_NV;
+        checkpoints[i].pNext = nullptr;
+    }
+
+    getCheckpointData(g_queue, &checkpointCount, checkpoints.data());
+
+    std::stringstream cp;
+    cp << line << " : checkpoints=" << checkpointCount;
+
+    for(uint32_t i = 0u; i < checkpointCount; ++i)
+    {
+        cp << " | cp[" << i << "] stage=0x" << std::hex << checkpoints[i].stage
+           << " marker=" << std::dec;
+
+        if(checkpoints[i].pCheckpointMarker != nullptr)
+        {
+            cp << static_cast<const char*>(checkpoints[i].pCheckpointMarker);
+        }
+        else
+        {
+            cp << "(null)";
+        }
+    }
+
+    RTLog(cp.str());
+}
+
 static void destroyVolumetricCloudResources()
 {
     // 2026-10-17 修「动一下设置就卡死」：这个函数会销毁**云图 + 直方图 + 描述符池
@@ -46267,6 +47692,8 @@ static void destroyVolumetricCloudResources()
             // rt_debug.log，下一次"卡住"就能立刻区分"我们没同步"与"设备已经没了"。
             RTLog("[CLOUD] vkDeviceWaitIdle before rebuild returned " +
                 std::to_string(static_cast<int>(idleResult)));
+            // 2026-10-29 OPT-EXT①：设备真丢时把驱动侧描述一并落盘。
+            logDeviceFaultDiagnostics("cloudRebuild/vkDeviceWaitIdle");
         }
     }
     if(g_volumetricCloudRenderPipelineV3) vkDestroyPipeline(g_device, g_volumetricCloudRenderPipelineV3, nullptr);
@@ -51805,9 +53232,46 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_probeHDRSurface(
 extern "C"
 
 JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadPBRAtlases(
-    JNIEnv* env, jclass clazz, jlong normalPtr, jlong specularPtr, jint width, jint height)
+    JNIEnv* env, jclass clazz, jlong normalPtr, jlong specularPtr, jint width, jint height,
+    jintArray spriteRects, jint spriteRectCount)
 {
     if (normalPtr == 0 || specularPtr == 0 || width <= 0 || height <= 0) return;
+
+    // 2026-10-29（P2a）：解析 sprite 矩形表（每 4 个 int 一组 x,y,w,h）。
+    // 表为空 / 组数为 0 时清掉上一次的残留，让下面回落到整图 blit。
+    g_pbrSpriteRects.clear();
+
+    if (spriteRects != nullptr && spriteRectCount > 0)
+    {
+        const jsize arrayLen = env->GetArrayLength(spriteRects);
+        const jsize wanted = jsize(spriteRectCount) * 4;
+        const jsize usable = arrayLen < wanted ? arrayLen : wanted;
+
+        if (usable > 0)
+        {
+            std::vector<jint> raw(static_cast<size_t>(usable), 0);
+            env->GetIntArrayRegion(spriteRects, 0, usable, raw.data());
+
+            g_pbrSpriteRects.reserve(static_cast<size_t>(usable / 4));
+
+            for (jsize i = 0; i + 3 < usable; i += 4)
+            {
+                if (raw[i + 2] <= 0 || raw[i + 3] <= 0)
+                {
+                    continue;
+                }
+
+                PbrSpriteRect rect;
+                rect.x = static_cast<uint32_t>(raw[i] < 0 ? 0 : raw[i]);
+                rect.y = static_cast<uint32_t>(raw[i + 1] < 0 ? 0 : raw[i + 1]);
+                rect.w = static_cast<uint32_t>(raw[i + 2]);
+                rect.h = static_cast<uint32_t>(raw[i + 3]);
+                g_pbrSpriteRects.push_back(rect);
+            }
+        }
+
+        env->DeleteLocalRef(spriteRects);
+    }
 
     // 物理防线 2：必须确保 Vulkan Device 与上传所需的物理设备 / 图形队列 /
     // 命令池都处于可用状态。原来只挡了 g_device：只要 g_rtCommandPool 或
@@ -51910,13 +53374,29 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadPBRAtlases(
         void* normalPixels = reinterpret_cast<void*>(normalPtr);
         void* specularPixels = reinterpret_cast<void*>(specularPtr);
         // 将内存地址强制泵入 VRAM
+        // 2026-10-29：normal 先、specular 后；二分开关按这一顺序分别放行。
+        g_pbrBc7AllowForNextUpload = pbrBc7PartEnabled(true);
         uploadTextureToVRAM(normalPixels, static_cast<uint32_t>(width), static_cast<uint32_t>(height), g_normalAtlasImage, g_normalAtlasMemory, g_normalAtlasView);
+
+        g_pbrBc7AllowForNextUpload = pbrBc7PartEnabled(false);
         uploadTextureToVRAM(specularPixels, static_cast<uint32_t>(width), static_cast<uint32_t>(height), g_specularAtlasImage, g_specularAtlasMemory, g_specularAtlasView);
 
         // 设置全局脏标记（等待下一阶段在 renderPass 拦截中绑定至描述符 Binding 4 和 5）
         g_pbrAtlasesDirty = true;
 
         RTLog("[PBR VRAM] CPU -> GPU Native VRAM Copy Success. Pending Descriptor Update.");
+
+        // 2026-10-29：上传完成后立刻归还那块"图像字节 × 1.5 + 64KB"常驻的暂存缓冲。
+        //
+        // 原来只有 [VRAM GOV] 越线时才会归还（见 vramGovernorAct 里 g_vramGovernor.over
+        // 的分支），不越线时它会一直留到进程结束：8192² 图集 ≈ 384MB、16384² ≈ 1.5GB。
+        // 而 uploadPBRAtlases 是**加载期一次性**路径，下次资源重载会按需重建，
+        // 没有逐帧代价 —— 与 Java 侧退役 CPU 副本（TextureAtlasPBRMixin）是同一笔账的两半。
+        //
+        // 安全性：本函数返回前两次 uploadTextureToVRAM 都已把像素 memcpy 进这块暂存，
+        // 而 releaseHugeTextureUploadStaging 会先等 g_textureUploadFencePending 上的
+        // fence（若已信号则微秒级）再销毁，语义与"下一次上传进入时的等待"完全相同。
+        releaseHugeTextureUploadStaging();
     }
     catch (const std::exception& e)
     {
@@ -54171,6 +55651,67 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_slDestroySurface(
 }
 
 
+// ============================================================
+// 2026-10-29 OPT-EXT⑥：HDR 静态元数据上报
+//
+// 现状：HDR-2 已经把 swapchain 强制成 A2B10G10R10 + HDR10_ST2084（见
+// [HDR-2.3 SWAPCHAIN] 那条），pq 编码在 rr_hdr_encode.comp 里做，但从未调用
+// vkSetHdrMetadataEXT ⇒ 显示器拿到的是"没有母带信息的 HDR10"，PQ 到实际
+// nits 的映射只能由驱动/系统猜。
+//
+// 【数值是自创的】规范只定义字段语义，没有推荐值。这里取：
+//   · 原色 = BT.2020（HDR10 母带常色域）、白点 = D65
+//   · maxLuminance 1000 / minLuminance 0.05 nits（HDR10 母带常见档）
+//   · MaxCLL 1000 / MaxFALL 400（保守，宁小不大 —— 报大了会过曝）
+// 若之后实测显示器峰值不同（或编码器上限改了），只需改这四个常数。
+// ============================================================
+static void applyHdrStaticMetadata(VkDevice device, VkSwapchainKHR swapchain)
+{
+    if(device == VK_NULL_HANDLE || swapchain == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    auto setHdrMetadata = reinterpret_cast<PFN_vkSetHdrMetadataEXT>(
+        vkGetDeviceProcAddr(device, "vkSetHdrMetadataEXT"));
+
+    if(setHdrMetadata == nullptr)
+    {
+        fprintf(
+            stderr,
+            "[HDR-2.5 METADATA] VK_EXT_hdr_metadata not enabled\n"
+        );
+
+        fflush(stderr);
+        return;
+    }
+
+    VkHdrMetadataEXT metadata{};
+    metadata.sType = VK_STRUCTURE_TYPE_HDR_METADATA_EXT;
+    metadata.displayPrimaryRed.x = 0.708f;
+    metadata.displayPrimaryRed.y = 0.292f;
+    metadata.displayPrimaryGreen.x = 0.170f;
+    metadata.displayPrimaryGreen.y = 0.797f;
+    metadata.displayPrimaryBlue.x = 0.131f;
+    metadata.displayPrimaryBlue.y = 0.046f;
+    metadata.whitePoint.x = 0.3127f;
+    metadata.whitePoint.y = 0.3290f;
+    metadata.maxLuminance = 1000.0f;
+    metadata.minLuminance = 0.05f;
+    metadata.maxContentLightLevel = 1000.0f;
+    metadata.maxFrameAverageLightLevel = 400.0f;
+
+    setHdrMetadata(device, 1u, &swapchain, &metadata);
+
+    fprintf(
+        stderr,
+        "[HDR-2.5 METADATA] applied primaries=BT2020 white=D65"
+        " maxLum=1000 minLum=0.05 MaxCLL=1000 MaxFALL=400\n"
+    );
+
+    fflush(stderr);
+}
+
 extern "C"
 JNIEXPORT jint JNICALL Java_com_example_vulkan_NativeVulkan_slCreateSwapchain(
     JNIEnv*,
@@ -54274,6 +55815,18 @@ JNIEXPORT jint JNICALL Java_com_example_vulkan_NativeVulkan_slCreateSwapchain(
     );
 
     fflush(stderr);
+
+
+    // 2026-10-29 OPT-EXT⑥：只在真正走 HDR10 输出时上报元数据。
+    if(
+        result == VK_SUCCESS &&
+        swapchainOut != nullptr &&
+        *swapchainOut != VK_NULL_HANDLE &&
+        hdrOutputActive()
+    )
+    {
+        applyHdrStaticMetadata(device, *swapchainOut);
+    }
 
 
     return static_cast<jint>(
@@ -67042,6 +68595,34 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
     {
         CameraUBO* ablateUbo = static_cast<CameraUBO*>(g_cameraUboMapped);
         ablateUbo->perfAblationStage[0] = perfL10AblationStage();
+
+        // 2026-10-29：次级命中 mip bias 写进 historyPadding0（原本全仓无读者的
+        // CameraUBO 槽）。取 float 的位模式，未设 env 时为 0x00000000 ⇒
+        // shader 侧 uintBitsToFloat 得 0.0f ⇒ 与改动前逐位相同。
+        //
+        // ⚠ 生效前提：material_resolve.glsl 需要**重编 SPV**（rchit ×2）。
+        //   未重编时旧 SPV 不读这个 lane，行为完全不变，可安全共存。
+        {
+            static const float secondaryMipBias = []() -> float
+            {
+                const char* raw = std::getenv("ORION_SECONDARY_MIP_BIAS");
+
+                if(raw == nullptr || raw[0] == '\0')
+                {
+                    return 0.0f;
+                }
+
+                const float parsed = static_cast<float>(std::atof(raw));
+
+                // 上限 3：pbrMaxLod 最多 4，再大也只会在 min() 处被夹住，
+                // 这里限制一下避免误设成离谱值。
+                return parsed < 0.0f ? 0.0f : (parsed > 3.0f ? 3.0f : parsed);
+            }();
+
+            uint32_t biasBits = 0u;
+            std::memcpy(&biasBits, &secondaryMipBias, sizeof(biasBits));
+            ablateUbo->historyPadding0 = biasBits;
+        }
         // 2026-10-09 运动矢量调试视图：这一格原本**恒写 0**（保留 lane，全仓无读者）。
         // 改用用户的设置值 —— 写在与 stage 同一处（"本帧上传前"的 CPU 副本），
         // 所以切换视图下一帧就生效，且与 stage 的时序保证完全一致。
@@ -73792,7 +75373,8 @@ static void logNativeMemoryReport()
 
     {
         std::lock_guard<std::mutex> lock(g_capturedSectionsMutex);
-        capturedCount = g_capturedSections.size();
+        capturedCount =
+            g_capturedSections.size() - g_capturedSectionsHead;
     }
 
     // 以下三项只有渲染线程读写（本函数只从渲染线程调用）⇒ 不需要锁。
@@ -74151,6 +75733,30 @@ static int64_t geometryPreLoopLockWaitMs()
 // 连续让出次数：达到 5 次就退回阻塞取锁（见同处注释）。
 static uint32_t g_geometryPreLoopLockSkips = 0u;
 
+// 2026-10-29：preLoop 的细分计时（窗口最大值）。
+//
+// 为什么需要：有界取锁已经实现（try_lock_for 3ms ×4 + 12ms 兜底，失败就 return），
+// 单帧理论上最多等 24ms，但实测 preLoopMs 能到 73.2ms ⇒ 大头不在"等锁"而在
+// **持锁之后的锁内工作**（补传 + 捕获批处理 + 分类拷贝 + dirty 快照 + 最近优先排序）。
+// 只打一个 preLoopMs 分不出这两者，而它们的修法完全不同：
+//   · 等锁重 ⇒ 让位/降频（已有机制，调 ORION_GEOMETRY_LOCK_WAIT_MS）
+//   · 锁内重 ⇒ 缩工作量（这才是 19:05 那局的情况：capHoldMs 同时 35~62）
+// 判读：lockedMs ≈ preLoopMs − lockWaitMs。
+static double g_geometryMaxPreLoopLockWaitMs = 0.0;
+
+// 2026-10-29：preLoop 的**第三段**细分 —— 每 600 帧一次的 counters 日志块
+// （RTLog 写文件 + logNativeMemoryReport + logVramGovernor）。
+//
+// 为什么必须拆出来：这些语句在 preLoop 的时间区间内（rtxPreLoopMarkLog 75395 →
+// rtxPreLoopMarkMid 75545），而 g_geometryMaxPreLoopMs 取的是窗口最大值 ⇒
+// **只要那一帧打了日志，preLoopMs 就被这一帧的打印开销占满**。
+// 实测 19:27~19:31 那局：preLoopMs 4.0 → 34.2、lockWaitMs 恒 ≤3.8、
+// lockSkips 恒 0 —— 差值全是"持锁后的锁内工作"，而其中到底有多少是打印，
+// 此前完全看不到（两个 Mark 时间戳埋了一直没输出）。
+// 判读：logMs ≈ preLoopMs ⇒ 慢在诊断自身（logNativeMemoryReport 遍历
+//       g_rtxMemLive，随泄漏增长）；logMs 小 ⇒ 才真是几何管线。
+static double g_geometryMaxCountersLogMs = 0.0;
+
 // 2026-10-22（第 3 条）：兜底等待的上限，毫秒。
 // 取 12ms —— 略高于捕获线程单次唤醒的时间预算上限（sectionRebuildTimeBudgetMs
 // 的 clamp 上界也是 12ms），所以正常情况下"最后一跳"就能等到。
@@ -74289,6 +75895,8 @@ static bool rebuildWorldGeometry(
     // 兜底：连续让出达到 5 次就退回阻塞取锁，保证几何不会因我们自己的守卫而停更。
     // A/B：ORION_GEOMETRY_LOCK_WAIT_MS=0 时退回改动前的阻塞行为（逐位一致）。
     // =====================================================
+    const auto preLoopLockWaitStart = std::chrono::steady_clock::now();
+
     const auto geometryLockWaitBudget =
         std::chrono::milliseconds(geometryPreLoopLockWaitMs());
     bool preLoopLockAcquired = geometryLockWaitBudget.count() <= 0;
@@ -74344,6 +75952,17 @@ static bool rebuildWorldGeometry(
     {
         // dirty 集与捕获队列都还没动过 ⇒ 下一帧原样重试，不会丢工作。
         return false;
+    }
+
+    {
+        const double lockWaitMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - preLoopLockWaitStart).count();
+
+        if(lockWaitMs > g_geometryMaxPreLoopLockWaitMs)
+        {
+            g_geometryMaxPreLoopLockWaitMs = lockWaitMs;
+        }
     }
 
     {
@@ -74428,7 +76047,7 @@ static bool rebuildWorldGeometry(
             // 直接丢掉，避免同一个键进来两次。它们对应的键本来就会被下面处理。
             {
                 std::lock_guard<std::mutex> capturedLock(g_capturedSectionsMutex);
-                g_capturedSections.clear();
+                resetCapturedSectionsLocked();
             }
 
             std::unordered_map<
@@ -74508,12 +76127,49 @@ static bool rebuildWorldGeometry(
             //
             // 实体键不经过捕获线程（逐帧动，必须同步捕获保新鲜），所以下面那段
             // "实体优先"逻辑原样有效。
+            const size_t batchCap =
+                std::min(maxSectionUpdates, effectiveSectionRebuildBatchCap());
+
+            const bool cursorMode = captureQueueCursorEnabled();
+
             std::vector<CapturedSectionUpdate> capturedBatch;
             {
                 // 锁序：本函数此刻已持 g_chunkMutex ⇒ 再取 g_capturedSectionsMutex，
                 // 与捕获线程的嵌套顺序一致，不会互相等待。
                 std::lock_guard<std::mutex> capturedLock(g_capturedSectionsMutex);
-                capturedBatch.swap(g_capturedSections);
+
+                if(cursorMode)
+                {
+                    // 只搬队头的 batchCap 个（见 g_capturedSectionsHead 的说明）。
+                    const size_t available =
+                        g_capturedSections.size() - g_capturedSectionsHead;
+
+                    const size_t take =
+                        std::min(available, batchCap);
+
+                    capturedBatch.assign(
+                        std::make_move_iterator(
+                            g_capturedSections.begin() + g_capturedSectionsHead),
+                        std::make_move_iterator(
+                            g_capturedSections.begin() + g_capturedSectionsHead + take));
+
+                    g_capturedSectionsHead += take;
+
+                    // 摊还 compact：消费过的前缀占到一半才真正 erase 一次，
+                    // 避免 vector 前面永久留一段空洞把内存顶高。
+                    if(g_capturedSectionsHead >= 256u &&
+                       g_capturedSectionsHead * 2u >= g_capturedSections.size())
+                    {
+                        g_capturedSections.erase(
+                            g_capturedSections.begin(),
+                            g_capturedSections.begin() + g_capturedSectionsHead);
+                        g_capturedSectionsHead = 0u;
+                    }
+                }
+                else
+                {
+                    capturedBatch.swap(g_capturedSections);
+                }
             }
 
             // Snapshot only a bounded prefix of the dirty set. Remaining
@@ -74523,11 +76179,9 @@ static bool rebuildWorldGeometry(
                 g_dirtySectionKeys.find(ENTITY_RT_SPATIAL_KEY) !=
                 g_dirtySectionKeys.end();
 
-            const size_t batchCap =
-                std::min(maxSectionUpdates, effectiveSectionRebuildBatchCap());
             const size_t adoptedCount =
                 std::min(capturedBatch.size(), batchCap);
-            if(adoptedCount < capturedBatch.size())
+            if(!cursorMode && adoptedCount < capturedBatch.size())
             {
                 std::lock_guard<std::mutex> capturedLock(g_capturedSectionsMutex);
                 g_capturedSections.insert(
@@ -74825,7 +76479,8 @@ static bool rebuildWorldGeometry(
         bool capturedPending = false;
         {
             std::lock_guard<std::mutex> capturedLock(g_capturedSectionsMutex);
-            capturedPending = !g_capturedSections.empty();
+            capturedPending =
+                g_capturedSections.size() > g_capturedSectionsHead;
         }
         g_worldGeometryDirty.store(
             !g_dirtySectionKeys.empty() || capturedPending,
@@ -74953,7 +76608,20 @@ static bool rebuildWorldGeometry(
 
         {
             std::lock_guard<std::mutex> capturedLock(g_capturedSectionsMutex);
-            countersLog << " queued=" << g_capturedSections.size();
+            countersLog << " queued="
+            << (g_capturedSections.size() - g_capturedSectionsHead)
+            // 2026-10-29：preLoop 到底是"等锁"还是"自己算"，看这两个就够了。
+            //   实测（19:01 那局）preLoopMs 3.8 → 73.2，而 queued 恒为 0 ⇒
+            //   **不是队列搬运**，是入口等 g_chunkMutex：同窗口 capHoldMs 35~62、
+            //   capWaitMs 68~71。lockSkips = 连续 try_lock 让出次数（5 次后退回阻塞）。
+            //   queued 恒 0 也说明"captured − adopted"的差是**去重丢弃**，不是积压。
+            << " lockSkips=" << g_geometryPreLoopLockSkips
+            // preLoopMs 的细分：lockWaitMs = 抢 g_chunkMutex 的时间；
+            // lockedMs ≈ preLoopMs − lockWaitMs = 持锁后的锁内工作量。
+            << " lockWaitMs=" << g_geometryMaxPreLoopLockWaitMs
+            // logMs = 上一窗口里 counters 日志块自身占用的最大时间。
+            // preLoopMs ≈ lockWaitMs + lockedMs，而 logMs 是 lockedMs 里的一部分。
+            << " logMs=" << g_geometryMaxCountersLogMs;
         }
 
         RTLog(countersLog.str());
@@ -74969,6 +76637,8 @@ static bool rebuildWorldGeometry(
         // 窗口最大值/累计量 → 打完清零，下一行对应下一个窗口。
         g_geometryMaxSectionMs = 0.0;
         g_geometryMaxPreLoopMs = 0.0;
+    g_geometryMaxPreLoopLockWaitMs = 0.0;
+    g_geometryMaxCountersLogMs = 0.0;
         // 2026-10-09（B）三分里的另两段（必须一起清，否则会退化成会话累计值）。
         g_geometryMaxBuildLoopMs = 0.0;
         g_geometryMaxTailMs = 0.0;
@@ -74995,6 +76665,18 @@ static bool rebuildWorldGeometry(
     // 2026-10-13 preLoop 内切：本日志块到此结束（见 rtxPreLoopMarkLog 的说明）。
     const std::chrono::steady_clock::time_point rtxPreLoopMarkMid =
         std::chrono::steady_clock::now();
+
+    {
+        // 2026-10-29：把"日志块"这一段单独计时（两个 Mark 一直都在，只是没输出）。
+        const double countersLogMs =
+            std::chrono::duration<double, std::milli>(
+                rtxPreLoopMarkMid - rtxPreLoopMarkLog).count();
+
+        if(countersLogMs > g_geometryMaxCountersLogMs)
+        {
+            g_geometryMaxCountersLogMs = countersLogMs;
+        }
+    }
 
     if(
         !forceReset &&
@@ -75407,8 +77089,16 @@ static bool rebuildWorldGeometry(
 
                 if(hadPreviousSection)
                 {
+                    // 2026-10-29 refit 前提修复②：与 createSectionBLAS 同口径。
+                    // 索引化 SOLID 的 primitiveCount 是 (verts/4)*2，此前这里恒用
+                    // verts/3 ⇒ asSameTris / asRefitCand 的统计本身是错的。
+                    const bool newIndexedGeometry =
+                        sectionUsesIndexedGeometry(classKey, vertices.size());
+
                     const uint32_t newTriangleCount =
-                        static_cast<uint32_t>(vertices.size() / 3u);
+                        newIndexedGeometry
+                            ? static_cast<uint32_t>((vertices.size() / 4u) * 2u)
+                            : static_cast<uint32_t>(vertices.size() / 3u);
 
                     if(newTriangleCount == previousTriangleCount)
                     {
@@ -75422,7 +77112,7 @@ static bool rebuildWorldGeometry(
                 }
 
                 // =====================================================
-                // 2026-10-21 refit 快路（ORION_AS_REFIT=1 才进）
+                // 2026-10-21 refit 快路（2026-10-29 起**默认进**，见 sectionBLASRefitEnabled）
                 //
                 // 条件全部满足才走，否则原样重建：
                 //   · 旧 AS 建时带 ALLOW_UPDATE（previousRefitCapable）
@@ -75437,8 +77127,14 @@ static bool rebuildWorldGeometry(
                    previousUpdateScratchSize != 0u &&
                    sectionBLASRefitEnabled())
                 {
+                    // 2026-10-29 refit 前提修复②：索引化段同口径（否则永远判不等）。
+                    const bool newIndexedGeometry =
+                        sectionUsesIndexedGeometry(classKey, vertices.size());
+
                     const uint32_t newTriangleCount =
-                        static_cast<uint32_t>(vertices.size() / 3u);
+                        newIndexedGeometry
+                            ? static_cast<uint32_t>((vertices.size() / 4u) * 2u)
+                            : static_cast<uint32_t>(vertices.size() / 3u);
 
                     // 与 createSectionBLAS 完全同口径地算新布局（顶点 + 可选位移尾段）。
                     const uint32_t newMotionFloats =
@@ -75454,7 +77150,7 @@ static bool rebuildWorldGeometry(
                         static_cast<VkDeviceSize>(
                             sectionUsesPackedVertices(
                                 classKey,
-                                false,
+                                newIndexedGeometry,
                                 vertices.size())
                                 ? sizeof(SectionVertex)
                                 : sizeof(Vertex));

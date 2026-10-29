@@ -1174,15 +1174,47 @@ bool pomSmoothSampling()
 }
 
 
-float sampleLabPBRDepthInSprite(
-    vec2 uv,
+// =====================================================
+// 2026-10-29：把 atlasSizeF / lo / hi 拆成显式参数。
+//
+// 自阴影循环（tracePOMSelfShadow）每 hit 调 4~16 次采样，而这三次量在整个
+// hit 内**都是常量**：atlasSizeF 只来自 textureSize()，lo/hi 只由
+// safeMin/safeMax 决定。原实现每次调用都重算它们（floor/ceil 各两条 vec2
+// 运算 + 一次 max，约 10 条指令 × 4~16 次）。
+//
+// 本函数只做参数搬运：采样点、clamp 边界、2x2 足迹、锐利/平滑分档与拆分前
+// **逐位相同**（safeMin/safeMax 不再传入，因为 lo/hi 已含其全部信息）。
+// =====================================================
+vec2 labPBRAtlasSizeF()
+{
+    return vec2(textureSize(normalAtlas, 0));
+}
+
+void labPBRDepthSpriteBounds(
     vec2 safeMin,
-    vec2 safeMax
+    vec2 safeMax,
+    vec2 atlasSizeF,
+    out ivec2 lo,
+    out ivec2 hi
 )
 {
-    vec2 atlasSizeF =
-        vec2(textureSize(normalAtlas, 0));
+    lo =
+        ivec2(floor(safeMin * atlasSizeF + 1.0e-4));
 
+    hi =
+        ivec2(ceil(safeMax * atlasSizeF - 1.0e-4)) - ivec2(1);
+
+    hi =
+        max(hi, lo);
+}
+
+float sampleLabPBRDepthInSpritePrepared(
+    vec2 uv,
+    vec2 atlasSizeF,
+    ivec2 lo,
+    ivec2 hi
+)
+{
     vec2 texelSpace =
         uv * atlasSizeF - 0.5;
 
@@ -1191,15 +1223,6 @@ float sampleLabPBRDepthInSprite(
 
     vec2 f =
         texelSpace - vec2(baseTexel);
-
-    ivec2 lo =
-        ivec2(floor(safeMin * atlasSizeF + 1.0e-4));
-
-    ivec2 hi =
-        ivec2(ceil(safeMax * atlasSizeF - 1.0e-4)) - ivec2(1);
-
-    hi =
-        max(hi, lo);
 
     // 2026-10-18 用户开关：锐利档退回单纹素采样，
     // 默认平滑档继续走下面的双线性。
@@ -1235,6 +1258,31 @@ float sampleLabPBRDepthInSprite(
     return
         1.0 -
         a;
+}
+
+
+// 原入口：算一次边界再转调，行为与拆分前逐位一致（其它调用点不受影响）。
+float sampleLabPBRDepthInSprite(
+    vec2 uv,
+    vec2 safeMin,
+    vec2 safeMax
+)
+{
+    vec2 atlasSizeF =
+        labPBRAtlasSizeF();
+
+    ivec2 lo;
+    ivec2 hi;
+
+    labPBRDepthSpriteBounds(safeMin, safeMax, atlasSizeF, lo, hi);
+
+    return
+        sampleLabPBRDepthInSpritePrepared(
+            uv,
+            atlasSizeF,
+            lo,
+            hi
+        );
 }
 
 
@@ -1301,6 +1349,31 @@ float sampleLabPBRDepthTiled(
 }
 
 
+// 2026-10-29：自阴影专用入口 —— 边界已算好，循环内不再重算。
+// wrap / safeMax 的处理与上面的 sampleLabPBRDepthTiled 完全一致。
+float sampleLabPBRDepthTiledPrepared(
+    vec2 uv,
+    vec2 spriteMin,
+    vec2 spriteSpan,
+    vec2 safeMax,
+    vec2 atlasSizeF,
+    ivec2 lo,
+    ivec2 hi
+)
+{
+    return
+        sampleLabPBRDepthInSpritePrepared(
+            min(
+                wrapPOMSpriteUV(uv, spriteMin, spriteSpan),
+                safeMax
+            ),
+            atlasSizeF,
+            lo,
+            hi
+        );
+}
+
+
 vec2 snapPOMSpriteUVToTexelCenter(
     vec2 uv,
     vec2 safeMin,
@@ -1323,6 +1396,16 @@ float getPOMDepthScale()
     // tracePOMSelfShadow() 走它们**既有**的 "POM off" 早退分支（见各自的
     // pomDepthScale <= 1e-5 判定），所以这里不需要改 march 本身。
     if(g_giRaySkipPOM)
+    {
+        return 0.0;
+    }
+
+    // 2026-10-29 消融档 18「noPom」：POM 主 march 与自阴影的**价格上界**。
+    // 返回 0 让 traceParallax()/tracePOMSelfShadow() 走各自既有的 pomDepthScale<=1e-5
+    // 早退分支，march 本身一个字不改 ⇒ 两者行为与"材质没开视差"逐位相同。
+    // 注意口径：POM 关掉后 displaced uv 也消失，后续采样与 borderScale 一起变简单，
+    // 所以 18 的价格是「POM + 由它派生的一切」，是上界。
+    if(cam.perfAblationStage.x == 18u)
     {
         return 0.0;
     }
@@ -1725,6 +1808,14 @@ float tracePOMSelfShadow(
     float pomDepthScale =
         getPOMDepthScale();
 
+    // 2026-10-29 消融档 19「noPomSelfShadow」：只跳过自阴影的 24 次采样 march
+    // （VL_POM_SELF_SHADOW_MAX_SAMPLES），主 POM march 与 displaced uv 全部保留。
+    // 返回 1.0 = 无遮蔽，与"没有浮雕"那条早退分支同义。
+    if(cam.perfAblationStage.x == 19u)
+    {
+        return 1.0;
+    }
+
 
     if(
         hitDepth01 <= 0.01 ||
@@ -1860,6 +1951,23 @@ float tracePOMSelfShadow(
 #endif
 
 
+    // 2026-10-29：atlasSizeF 与纹素边界在整个 hit 内不变 ⇒ 循环外算一次。
+    // 循环体每步只做 wrap + 采样，不再重复 textureSize / floor / ceil。
+    const vec2 selfShadowAtlasSizeF =
+        labPBRAtlasSizeF();
+
+    ivec2 selfShadowLo;
+    ivec2 selfShadowHi;
+
+    labPBRDepthSpriteBounds(
+        safeMin,
+        safeMax,
+        selfShadowAtlasSizeF,
+        selfShadowLo,
+        selfShadowHi
+    );
+
+
     for(int i = 1; i <= VL_POM_SELF_SHADOW_MAX_SAMPLES; ++i)
     {
         if(i > sampleCount)
@@ -1898,12 +2006,14 @@ float tracePOMSelfShadow(
         // Without this the self-shadow still broke at the block edge even
         // though the traversal above no longer did.
         float blockerDepth =
-            sampleLabPBRDepthTiled(
+            sampleLabPBRDepthTiledPrepared(
                 sampleUV,
                 spriteMin,
                 spriteSpan,
-                safeMin,
-                safeMax
+                safeMax,
+                selfShadowAtlasSizeF,
+                selfShadowLo,
+                selfShadowHi
             );
 #else
         // A light ray leaving the owning sprite has no in-sprite height
@@ -2010,12 +2120,59 @@ void main()
     // GPU 挂死，"Item in hand" 的 RT 注入 5 秒等不到信号量。
     // 延迟档由派发器播种（rt_test.rgen:18041-18042），所以只有生产模式崩。
     payload.hitDistance = gl_HitTEXT;
+    // 2026-10-29 合并 BLAS 基座：normal.x 携带的是**资源槽位**（实例基址 + 几何
+    // 序号），不是裸的 instanceCustomIndex。一 geometry/实例时 gl_GeometryIndexEXT
+    // 恒为 0 ⇒ 与改动前逐位相同；合并后它把同一实例内的多个 Section 区分开
+    // （下游 material_resolve.glsl:48 直接把这个值当 sectionVertexAddressBuffer
+    // 的索引，所以必须在这里就加好，否则会所有 geometry 都读同一段顶点）。
     payload.normal = vec3(
-        float(gl_InstanceCustomIndexEXT),
+        float(gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT),
         float(gl_PrimitiveID),
         attribs.x
     );
     payload.roughness = attribs.y;
+
+    // =====================================================================
+    // 2026-10-29 消融档 17「noMatEval」：跳过材质解析，只把 payload 填成
+    // 中性灰 + 反向法线，让 rgen 的路径继续按"命中了一个普通 opaque 面"走。
+    //
+    // 目的：量「材质求值」（图集采样 / PBR 解码 / POM / 水波 / 玻璃解析）的价格
+    // 上界。HANDOFF-2026-10-29 §3 的分箱延迟材质只有在材质求值占 trace 的可观
+    // 比例时才可能回本，否则固定成本（计数 + 前缀和 + 多一趟 pass）必亏。
+    //
+    // 注意口径：本档连**主射线**的材质求值也一起跳（rchit 无法区分主/次射线），
+    // 且玻璃/水命中会退化成 opaque ⇒ 后续路径变短。因此 17.5 - X 是**上界**：
+    // 若连上界都不足以抵消一次额外 pass，就可以直接终止这条优化方向。
+    //
+    // 生产档（stage 0）走 else 分支，零成本。观感在本档下明显变灰，仅供计数。
+    // =====================================================================
+    if(cam.perfAblationStage.x == 17u)
+    {
+        payload.albedo = vec3(0.18);
+        payload.normal = -normalize(gl_WorldRayDirectionEXT);
+        payload.roughness = 0.5;
+        payload.f0Metal = 0.0;
+        payload.emission = vec3(0.0);
+        payload.parallaxRayTravel = 0.0;
+        payload.pomSelfShadow = 1.0;
+        payload.pomMicroOcclusion = 1.0;
+        payload.glassAlpha = 1.0;
+        payload.prevOffsetX = 0.0;
+        payload.prevOffsetY = 0.0;
+        payload.prevOffsetZ = 0.0;
+        payload.lastGlassFaceT = -1.0;
+        payload.glassFaceBudget = 0.0;
+        payload.glassInside = 0.0;
+        payload.glassEntryT = -1.0;
+        payload.transmittanceAccum = vec3(1.0);
+        payload.glassSurfaceWeightAccum = vec3(0.0);
+        payload.glassBlendAlpha = 1.0;
+        payload.state = makeHitState(
+            getRayPurpose(payload.state), RT_HIT_OPAQUE,
+            RT_WATER_NONE, false, false, 0u);
+        return;
+    }
+
     resolveHitMaterial(gl_WorldRayOriginEXT, gl_WorldRayDirectionEXT);
 }
 

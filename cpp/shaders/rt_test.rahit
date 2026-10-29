@@ -463,9 +463,15 @@ void main() {
 
     // 2026-10-09：表项是 16B，地址在两个低 lane（any-hit 不需要位移段）。
     // 2026-10-21 地形 32B：.w = 该段顶点步长（32/48），取顶点按它分派。
+    // 2026-10-29 合并 BLAS 基座：资源槽位 = 实例基址 + 几何序号。
+    // 现在一条 BLAS 只有一个 geometry ⇒ gl_GeometryIndexEXT 恒为 0，逐位不变；
+    // 合并后同一实例内的多个 Section 靠它区分（slot 在桶内必须连续）。
+    const uint sectionResourceSlot =
+        uint(gl_InstanceCustomIndexEXT) + uint(gl_GeometryIndexEXT);
+
     const uvec4 sectionAddressEntry =
         sectionVertexAddressBuffer.vertexAddresses[
-            gl_InstanceCustomIndexEXT
+            sectionResourceSlot
         ];
 
     uint64_t rawAddr =
@@ -941,7 +947,9 @@ void main() {
                 vec4(chainPaneAlbedo / max(chainAlpha, 1.0e-3), chainAlpha),
                 geometricNormal,
                 gl_HitTEXT,
-                float(gl_InstanceCustomIndexEXT & 0x7fffu));
+                // 2026-10-29：玻璃链缓存键同样要用"槽位"而不是裸实例号，
+                // 否则合并到同一 BLAS 的两个 Section 会共用一条链（互相污染）。
+                float((gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT) & 0x7fffu));
 
         if(chainBackgroundTransparency <
            GLASS_ALPHA_BLEND_MIN_BACKGROUND_TRANSPARENCY)

@@ -1248,6 +1248,39 @@ float pbrLod =
     );
 
 // =====================================================
+// 2026-10-29：次级命中升 mip（降低带宽与缓存压力）
+//
+// 依据：NVIDIA "Ray Tracing Best Practices" 明确把"降低纹理访问分辨率 / 偏移 mip
+// 级别"列为消除 shading divergence 的手段之一，且只对反射/GI 这类次级射线有意义
+// （主射线的纹理清晰度是画质底线）。
+//
+// 实测动机（同局消融，2026-10-29 20:19）：
+//   base 17.51ms / noGlossy 11.22 / noGi 11.49 —— 反射 6.29ms、GI 6.02ms，
+//   而体素 DDA 遍历只占 1.09ms ⇒ 次级命中的成本在"材质求值"，遍历不是大头。
+//
+// 上限仍是 pbrMaxLod：超过它会跨进相邻 sprite（见上面 2026-10-19 的注释），
+// 所以这里只做 min(…, pbrMaxLod)，不抬上限、不跨 sprite、不串色。
+//
+// 取值来源：CameraUBO.historyPadding0（原本全仓无读者的 uint 槽）。
+//   native 侧由 ORION_SECONDARY_MIP_BIAS 写入 float 的位模式；
+//   未设时写 0.0f（位模式 0）⇒ 与改动前逐位相同。
+// =====================================================
+const float secondaryMipBias =
+    uintBitsToFloat(cam.historyPadding0);
+
+if(
+    secondaryMipBias > 0.0 &&
+    getRayPurpose(payload.state) != RT_PURPOSE_PRIMARY_SKY
+)
+{
+    pbrLod =
+        min(
+            pbrLod + secondaryMipBias,
+            pbrMaxLod
+        );
+}
+
+// =====================================================
 // POM eligibility
 //
 // Water materialId = 1:

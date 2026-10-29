@@ -1862,7 +1862,21 @@ public class SectionCompilerMixin {
                             minZ + (int)Math.floor(centerZ + normalZ * inverseLength * probe)
                     );
 
-                    drop = isInteriorSharedGlassFace(region, candidateA, candidateB);
+                    // 2026-10-29 崩溃兜底（既有 bug，与 32B/索引化无关）：
+                    // vx/vy/vz 是把 28B 顶点缓冲的头三个 float 直接当"section 相对
+                    // 坐标"读的，合法值必在 [0,16]。若某个 quad 的数据不是相对坐标
+                    // （缓冲未写满、或调用方 vertexCount 与实际布局不符），center 会
+                    // 是 1e30 量级的垃圾 ⇒ floor() 得 Integer.MAX_VALUE ⇒ 加 minX 溢出
+                    // 成负数 ⇒ RenderSectionRegion.getSection 直接 AIOOBE。
+                    // 实测崩溃：Index -402653175 / length 27
+                    // （crash-2026-10-29_18.30.13，栈 SectionCompiler:2219←2365←1106）。
+                    // 这里只用坐标做守卫，不改写任何顶点数据 ⇒ 正常路径逐位不变；
+                    // 越界的 quad 一律 drop=false（保留几何），不会丢面。
+                    if (Math.abs(centerX) <= 32.0f
+                            && Math.abs(centerY) <= 32.0f
+                            && Math.abs(centerZ) <= 32.0f) {
+                        drop = isInteriorSharedGlassFace(region, candidateA, candidateB);
+                    }
                 }
             }
 

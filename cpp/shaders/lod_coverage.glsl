@@ -43,7 +43,10 @@ layout(std430, binding = 20, set = 0) readonly buffer LodCoverage {
 // 该实例的角色。越界（不该发生）当近场地形处理，最坏结果只是不去重。
 uint lodInstanceRole()
 {
-    const uint slot = uint(gl_InstanceCustomIndexEXT);
+    // 2026-10-29：角色表也按"资源槽位"取（实例基址 + 几何序号）。
+    // 一 geometry/实例时 gl_GeometryIndexEXT == 0 ⇒ 与改动前逐位相同。
+    const uint slot =
+        uint(gl_InstanceCustomIndexEXT) + uint(gl_GeometryIndexEXT);
 
     if(slot >= LOD_COVERAGE_SLOT_LIMIT)
     {

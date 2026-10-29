@@ -6,6 +6,10 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class PBRAtlasStorage {
+    // 2026-10-29：这两份 CPU 图集是**上传后即退役**的 —— TextureAtlasPBRMixin 在
+    // NativeVulkan.uploadPBRAtlases(...) 返回后立刻 close 并置 null（见那边的说明）。
+    // 唯一合法用法：在同一段构建代码里 new → 填充 → 取 getPointer() 上报 → 关闭。
+    // 任何"稍后再读 CPU 图集"的写法都会拿到 null，请改成延迟关闭而不是假设它有效。
     public static NativeImage globalNormalAtlas = null;
     public static NativeImage globalSpecularAtlas = null;
 

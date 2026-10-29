@@ -1336,8 +1336,10 @@ void main()
     // hitT 播种进 ray payload，否则 resolveHitMaterialGlass() 会拿陈旧身份索引
     // sectionVertexAddressBuffer（无边界检查）⇒ 垃圾指针 ⇒ GPU 挂死。
     payload.hitDistance = gl_HitTEXT;
+    // 2026-10-29 合并 BLAS 基座：normal.x = 资源槽位（实例基址 + 几何序号）。
+    // 一 geometry/实例时 gl_GeometryIndexEXT 恒为 0 ⇒ 逐位不变。
     payload.normal = vec3(
-        float(gl_InstanceCustomIndexEXT),
+        float(gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT),
         float(gl_PrimitiveID),
         attribs.x
     );

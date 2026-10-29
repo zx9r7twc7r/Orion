@@ -314,7 +314,7 @@ void main()
         return;
     }
 
-    const vec4 surface = imageLoad(alphaBlendGbuffer, pixel);
+    vec4 surface = imageLoad(alphaBlendGbuffer, pixel);
     const vec4 meta = imageLoad(alphaBlendMeta, pixel);
 
     // 原文 :110  if (surface.isValid())   —— isValid() == hitT > 0（:95-98）
@@ -372,6 +372,59 @@ void main()
     const vec3 paneNormal = glassAlphaBlendDecodeNormal(meta.zw);
     const vec3 cameraPosition = cam.viewInverse[3].xyz;
 
+    // =====================================================
+    // 2026-10-29：**albedo 的屏幕空间邻域平均**（只平均玻璃像素）
+    //
+    // 载体证据（实机）：dbg=12（表面项=常量 1）+ lane 11（behind 三项全杀）时，
+    // 玻璃像素的输出只剩
+    //     out = 0.028 + 0.3 * albedo
+    // 仍然有青绿细颗粒 ⇒ 唯一可变量就是 albedo 本身。
+    //
+    // 来源：染色玻璃的 albedo 走 `textureLod(blockAtlas, uv, 0.0)`（固定 mip 0）。
+    //   · 命中着色器里没有屏幕空间导数，不能用隐式 LOD；
+    //   · atlas 的 mip 会跨 tile 渗色，也不能直接降 mip。
+    //   ⇒ 掠射面上一个 texel 的屏幕投影小于 1 像素时，相邻像素采到不同 texel，
+    //     表现为**固定位置的细颗粒**（与最初 POM 块状噪点同族）。
+    //
+    // 期望值不变（纯降方差），代价是玻璃边框在掠射面会略微变软。
+    // A/B：-DVPT_GLASS_ALPHA_BLEND_ALBEDO_SMOOTH=0 回到单点取值。
+    // =====================================================
+#ifndef VPT_GLASS_ALPHA_BLEND_ALBEDO_SMOOTH
+#define VPT_GLASS_ALPHA_BLEND_ALBEDO_SMOOTH 1
+#endif
+#if VPT_GLASS_ALPHA_BLEND_ALBEDO_SMOOTH
+    {
+        vec4 albedoSum = vec4(0.0);
+        float albedoWeight = 0.0;
+
+        for(int dy = -2; dy <= 2; ++dy)
+        {
+            for(int dx = -2; dx <= 2; ++dx)
+            {
+                const ivec2 q = clamp(
+                    pixel + ivec2(dx, dy),
+                    ivec2(0),
+                    extent - ivec2(1));
+
+                if(imageLoad(alphaBlendMeta, q).y <= 0.0)
+                {
+                    continue;
+                }
+
+                const float w = 1.0 / (1.0 + float(dx * dx + dy * dy));
+
+                albedoSum += imageLoad(alphaBlendGbuffer, q) * w;
+                albedoWeight += w;
+            }
+        }
+
+        if(albedoWeight > 0.0)
+        {
+            surface = albedoSum / albedoWeight;
+        }
+    }
+#endif
+
     const vec2 uv = (vec2(pixel) + 0.5) / vec2(extent);
     const vec2 ndc = uv * 2.0 - 1.0;
     const vec3 worldDirection = glassAlphaBlendPixelWorldDirection(ndc);
@@ -413,12 +466,83 @@ void main()
 
         if(directVolume.a > 0.0)
         {
-            const vec3 directLight =
+            // =====================================================
+            // 2026-10-29：两个方差源合并处的**空间平均**
+            //
+            // 原式：
+            //   surfaceLight = directLight * (backgroundLuma / directLuma)
+            // 两个因子各自带噪：
+            //   · directLight    = 体素面直射缓存（每方块面一个常量 + 双线性）。
+            //     掠射面上一格方块面只占亚像素 ⇒ 屏幕上呈**固定细颗粒**，
+            //     与采样数无关（rgen:404-412 早有记载）。
+            //   · backgroundLuma = 本像素 sceneColor 的亮度，而 sceneColor 此刻还是
+            //     rgen 写的 behindRadiance（1spp 接收面全辐射）⇒ 时间/空间噪声。
+            //
+            // 两者相乘 ⇒ 颗粒被乘进表面项，且**染色玻璃的 tint 会给它上色**
+            // （实测：青绿玻璃上的颗粒就是青绿色）。
+            //
+            // 平均只在 meta.y > 0 的像素之间做（玻璃像素），地形不会混进来；
+            // 权重 1/(1+r²)，5×5。这是纯降方差，不改变期望值。
+            // A/B：-DVPT_GLASS_ALPHA_BLEND_SURFACE_LIGHT_SMOOTH=0 回到单点取值。
+            // =====================================================
+#ifndef VPT_GLASS_ALPHA_BLEND_SURFACE_LIGHT_SMOOTH
+#define VPT_GLASS_ALPHA_BLEND_SURFACE_LIGHT_SMOOTH 1
+#endif
+
+            vec3 directLight =
                 max(directVolume.rgb, vec3(0.0)) * (1.0 / 3.14159265359);
-            const vec3 backgroundRadiance =
-                max(imageLoad(sceneColor, pixel).rgb, vec3(0.0));
-            const float backgroundLuma =
-                dot(backgroundRadiance, GLASS_ALPHA_BLEND_LUMA);
+            float backgroundLuma =
+                dot(max(imageLoad(sceneColor, pixel).rgb, vec3(0.0)),
+                    GLASS_ALPHA_BLEND_LUMA);
+
+#if VPT_GLASS_ALPHA_BLEND_SURFACE_LIGHT_SMOOTH
+            {
+                vec3 volumeSum = vec3(0.0);
+                float volumeWeight = 0.0;
+                float backgroundSum = 0.0;
+                float backgroundWeight = 0.0;
+
+                for(int dy = -2; dy <= 2; ++dy)
+                {
+                    for(int dx = -2; dx <= 2; ++dx)
+                    {
+                        const ivec2 q = clamp(
+                            pixel + ivec2(dx, dy),
+                            ivec2(0),
+                            extent - ivec2(1));
+
+                        if(imageLoad(alphaBlendMeta, q).y <= 0.0)
+                        {
+                            continue;
+                        }
+
+                        const float w =
+                            1.0 / (1.0 + float(dx * dx + dy * dy));
+
+                        volumeSum +=
+                            max(imageLoad(alphaBlendVolume, q).rgb, vec3(0.0)) * w;
+                        volumeWeight += w;
+
+                        backgroundSum +=
+                            dot(max(imageLoad(sceneColor, q).rgb, vec3(0.0)),
+                                GLASS_ALPHA_BLEND_LUMA) * w;
+                        backgroundWeight += w;
+                    }
+                }
+
+                if(volumeWeight > 0.0)
+                {
+                    directLight =
+                        (volumeSum / volumeWeight) * (1.0 / 3.14159265359);
+                }
+
+                if(backgroundWeight > 0.0)
+                {
+                    backgroundLuma = backgroundSum / backgroundWeight;
+                }
+            }
+#endif
+
             const float directLuma =
                 dot(directLight, GLASS_ALPHA_BLEND_LUMA);
 
@@ -597,7 +721,12 @@ void main()
     // =====================================================
     if(pc.dbgMode == 10u)
     {
-        imageStore(alphaBlendRadiance, pixel, vec4(0.0));
+        // 2026-10-29：写**纯蓝**而不是 0 —— 用来一眼判断本分支是否真的被执行。
+        // 之前写 0 时无法区分"分支执行了但下游又叠了东西"与"分支根本没执行"，
+        // 这两种情况的修法完全相反。
+        // A/B 对照：与蓝面同亮度的红面。蓝面噪、红面干净 ⇒ 与色相/色度有关；
+        // 两面都噪 ⇒ 与玻璃像素的引导/位置有关，与颜色无关。
+        imageStore(alphaBlendRadiance, pixel, vec4(1.0, 0.0, 0.0, 1.0));
         return;
     }
     if(pc.dbgMode == 12u)

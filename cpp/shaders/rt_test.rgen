@@ -3857,7 +3857,7 @@ vec3 evaluateDynamicLightRISDirect(
     float selectedWeight = max(dot(selectedContribution,
         vec3(0.2126, 0.7152, 0.0722)), 1.0e-6);
     // 2026-10-07：这里不再乘 albedo / 0.92 —— 它们已经并进 dynamicLightBRDF
-    //（无材质路径的 0.92 就是同一个 LOCAL_LIGHT_L7_DIFFUSE_SCALE，所以逐位等价）。
+    //（无材质路径的 0.92 就是同一个 BSDF_LOCAL_DIFFUSE_SCALE，所以逐位等价）。
     return applyLocalGlassTint(
         selectedContribution * (weightSum /
             (float(proposals) * selectedWeight)),
@@ -9902,6 +9902,95 @@ vec3 evaluatePrimaryWaterSunLighting(
 // pair the camera path uses, so reflection and transmission of one pane
 // cannot drift between the two paths.
 // =====================================================
+// =============================================================================
+// BSDF 标定表（唯一来源，2026-10-29 合并）
+//
+// 为什么集中：这些数此前散落在一个太阳求值点、一个动态光源路径、两个本地光
+// 循环和两处 GI 吞吐里。改其中一处 BRDF 就要手工回来重标另外几处 —— 历史上
+// 已经发生过漏改（PBR-1B 把 Lambert 换成 Burley 时只保留旧的 1.2，注释里写着
+// "preserve that exact baseline"）。
+//
+// 现在**只在这里改**：任何求值点禁止再写裸数字。
+//
+// ⚠ 它们不是物理量，是美术标定基线。改数值等于改画面亮度，必须做 A/B。
+// =============================================================================
+const float BSDF_SUN_DIFFUSE_SCALE         = 1.2;   // 太阳直射漫反射（helper 路径）
+const float BSDF_LOCAL_DIFFUSE_SCALE       = 0.92;  // 本地光 / 动态光源漫反射
+const float BSDF_LOCAL_SPECULAR_SCALE      = 0.28;  // 本地光 / 动态光源镜面
+const float BSDF_LOCAL_DIFFUSE_SOFTEN      = 0.45;  // 保留历史值（当前无调用点）
+const float BSDF_LOCAL_MIN_SPEC_ROUGHNESS  = 0.35;  // 动态光源镜面波瓣展宽下限
+const float BSDF_GI_THROUGHPUT_SCALE       = 0.7;   // GI 每跳吞吐
+const float BSDF_GI_RESULT_SCALE           = 1.26;  // 间接光结果倍率
+
+struct BsdfTerms
+{
+    vec3 F;         // Fresnel(VdotH)
+    vec3 kD;        // (1 - F) * (1 - metallic)
+    vec3 specular;  // D * G * F / (4 * NdotV * NdotL)，可选多散射补偿
+};
+
+// =============================================================================
+// 唯一的 GGX 微表面求值点（2026-10-29 合并）
+//
+// 合并前这段 D/G/F 在 7 处逐字重复：太阳 helper、动态光源、本地光面采样、
+// 主命中太阳、远场 LOD、水面/玻璃镜面、GI 弹射。任何一处改了 G 的近似或
+// 分母下限，其余六处都会静默分叉。
+//
+// 返回**未乘**光源、未乘余弦、未乘美术标定的原始项。diffuse 模型由调用点决定：
+//   Lambert        : terms.kD * albedo * NdotL
+//   Burley         : terms.kD * albedo * evaluateBurleyDiffuseAngular(...)  （已含 NdotL）
+// 这三种模型并存是历史标定，统一它们等于改画面，不属于本次重构。
+// =============================================================================
+BsdfTerms evalBSDFTerms(
+    vec3 N,
+    vec3 V,
+    vec3 L,
+    vec3 f0,
+    float metallic,
+    float roughness,
+    float NdotV,
+    bool multiscatter
+)
+{
+    // NdotV 必须由调用点传入：合并前各处的下限不同（helper / 本地光 / 远场是
+    // 0.0，动态光与主命中太阳是 1.0e-4）。统一成任一个都会让掠射面整块变亮或
+    // 变暗，而相邻方块法线不同 ⇒ 方块之间出现分界线。
+    float NdotL =
+        max(dot(N, L), 0.0);
+
+    vec3 H =
+        normalize(V + L);
+
+    float VdotH =
+        max(dot(V, H), 0.0);
+
+    vec3 F =
+        fresnelSchlick(VdotH, f0);
+
+    float D =
+        distributionGGX(N, H, roughness);
+
+    float G =
+        geometrySmith(N, V, L, roughness);
+
+    vec3 specular =
+        (D * G * F) /
+        max(4.0 * NdotV * NdotL, 1.0e-4);
+
+    if(multiscatter)
+    {
+        specular *=
+            multiscatterEnergyCompensation(f0, roughness);
+    }
+
+    BsdfTerms terms;
+    terms.F = F;
+    terms.kD = (vec3(1.0) - F) * (1.0 - metallic);
+    terms.specular = specular;
+    return terms;
+}
+
+
 vec3 evaluateDirectSunLighting(
     vec3 hitPos,
     vec3 hitNormal,
@@ -9995,61 +10084,26 @@ vec3 evaluateDirectSunLighting(
         );
 
 
-    vec3 H =
-        normalize(
-            V + L
-        );
-
-    float VdotH =
-        max(
-            dot(V, H),
-            0.0
-        );
-
-
-    vec3 F =
-        fresnelSchlick(
-            VdotH,
-            F0
-        );
-
-    float D =
-        distributionGGX(
-            N,
-            H,
-            roughness
-        );
-
-    float G =
-        geometrySmith(
+    BsdfTerms bsdf =
+        evalBSDFTerms(
             N,
             V,
             L,
-            roughness
+            F0,
+            metallic,
+            roughness,
+            NdotV,
+            false
         );
-
-
-    vec3 specularBRDF =
-        (
-            D * G * F
-        ) /
-        max(
-            4.0 * NdotV * NdotL,
-            1.0e-4
-        );
-
-
-    vec3 kD =
-        (
-            vec3(1.0) - F
-        ) *
-        (1.0 - metallic);
 
 
     // PBR-1B:
-    // Keep this helper path's existing 1.2 diffuse scale.
+    // Keep this helper path's existing BSDF_SUN_DIFFUSE_SCALE.
     // Only replace Lambert NdotL with Burley angular response.
-    float burleyDiffuse =
+    vec3 diffuseTerm =
+        bsdf.kD *
+        hitAlbedo *
+        BSDF_SUN_DIFFUSE_SCALE *
         evaluateBurleyDiffuseAngular(
             N,
             V,
@@ -10058,14 +10112,8 @@ vec3 evaluateDirectSunLighting(
         );
 
 
-    vec3 diffuseTerm =
-        kD *
-        hitAlbedo *
-        1.2 *
-        burleyDiffuse;
-
     vec3 specularTerm =
-        specularBRDF *
+        bsdf.specular *
         NdotL;
 
 
@@ -10765,17 +10813,8 @@ const float LOCAL_LIGHT_L7_NEARFIELD_MIN_D2 =
 const float LOCAL_LIGHT_L7_RADIANCE_SCALE =
     LOCAL_LIGHT_ENERGY_SCALE;
 
-const float LOCAL_LIGHT_L7_DIFFUSE_SCALE =
-    0.92;
-
-const float LOCAL_LIGHT_L7_DIFFUSE_SOFTEN =
-    0.45;
-
-const float LOCAL_LIGHT_L7_SPECULAR_SCALE =
-    0.28;
-
-const float LOCAL_LIGHT_L7_MIN_SPECULAR_ROUGHNESS =
-    0.35;
+// 2026-10-29：原先这里的 0.92 / 0.45 / 0.28 / 0.35 四个 BSDF 标定已搬到文件
+// 前部的 BSDF 标定表（搜索 BSDF_LOCAL_）。这里只保留光源能量侧的两个常量。
 
 // =====================================================
 // 2026-10-07：移动光源（动态光源）的材质 BRDF
@@ -10785,10 +10824,10 @@ const float LOCAL_LIGHT_L7_MIN_SPECULAR_ROUGHNESS =
 // "方块射出的光"在同一材质上观感同源。原型在动态光源采样端那一段（约 2955 行）。
 //
 // f0.x < 0 ⇒ 调用方没有材质（GI 顶点、透明接收、时域缓存、旧 4 参重载）⇒ 走纯 Lambert
-// 分支，kD 恒 LOCAL_LIGHT_L7_DIFFUSE_SCALE(=0.92)，与改动前 `* hitAlbedo * 0.92`
+// 分支，kD 恒 BSDF_LOCAL_DIFFUSE_SCALE(=0.92)，与改动前 `* hitAlbedo * 0.92`
 // **逐位等价**。
 //
-// 粗糙度按 LOCAL_LIGHT_L7_MIN_SPECULAR_ROUGHNESS 抬高：动态光源是"几条点光源 + 均匀
+// 粗糙度按 BSDF_LOCAL_MIN_SPEC_ROUGHNESS 抬高：动态光源是"几条点光源 + 均匀
 // 提案"的估计器（见 evaluateDynamicLightRISDirect），窄镜面波瓣在这个提案分布下方差
 // 极大；抬高下限把波瓣展宽，把噪点换成可控的柔和高光。
 // =====================================================
@@ -10809,31 +10848,31 @@ vec3 dynamicLightBRDF(
     }
     if(f0.x < 0.0)
     {
-        // 无材质：与改动前逐位相同的 Lambert（0.92 就是 LOCAL_LIGHT_L7_DIFFUSE_SCALE）。
-        return albedo * (LOCAL_LIGHT_L7_DIFFUSE_SCALE * NdotL);
+        // 无材质：与改动前逐位相同的 Lambert（0.92 就是 BSDF_LOCAL_DIFFUSE_SCALE）。
+        return albedo * (BSDF_LOCAL_DIFFUSE_SCALE * NdotL);
     }
 
-    float NdotV = max(dot(N, V), 1.0e-4);
-    vec3 H = normalize(V + L);
-    float VdotH = max(dot(V, H), 0.0);
-
-    vec3 F = fresnelSchlick(VdotH, f0);
     float specularRoughness =
-        max(roughness, LOCAL_LIGHT_L7_MIN_SPECULAR_ROUGHNESS);
-    float D = distributionGGX(N, H, specularRoughness);
-    float G = geometrySmith(N, V, L, specularRoughness);
-    vec3 specularBRDF =
-        (D * G * F) / max(4.0 * NdotV * NdotL, 1.0e-4);
+        max(roughness, BSDF_LOCAL_MIN_SPEC_ROUGHNESS);
 
-    // 2026-10-16 多散射能量补偿：动态光源与太阳共用同一材质口径。
-    specularBRDF *=
-        multiscatterEnergyCompensation(f0, specularRoughness);
+    float NdotV = max(dot(N, V), 1.0e-4);
 
-    vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
+    BsdfTerms bsdf =
+        evalBSDFTerms(
+            N,
+            V,
+            L,
+            f0,
+            metallic,
+            specularRoughness,
+            NdotV,
+            true
+        );
+
     vec3 diffuseTerm =
-        kD * albedo * (NdotL * LOCAL_LIGHT_L7_DIFFUSE_SCALE);
+        bsdf.kD * albedo * (NdotL * BSDF_LOCAL_DIFFUSE_SCALE);
     vec3 specularTerm =
-        specularBRDF * (NdotL * LOCAL_LIGHT_L7_SPECULAR_SCALE);
+        bsdf.specular * (NdotL * BSDF_LOCAL_SPECULAR_SCALE);
     return diffuseTerm + specularTerm;
 }
 
@@ -13409,7 +13448,7 @@ for(
             float localSpecularRoughness =
                 max(
                     roughness,
-                    LOCAL_LIGHT_L7_MIN_SPECULAR_ROUGHNESS
+                    BSDF_LOCAL_MIN_SPEC_ROUGHNESS
                 );
 
 
@@ -13430,73 +13469,30 @@ for(
                 );
 
 
-            vec3 F =
-                fresnelSchlick(
-                    VdotH,
-                    F0
-                );
-
-
-            float D =
-                distributionGGX(
-                    N,
-                    H,
-                    localSpecularRoughness
-                );
-
-
-            float G =
-                geometrySmith(
+            BsdfTerms bsdf =
+                evalBSDFTerms(
                     N,
                     V,
                     sampleDirection,
-                    localSpecularRoughness
-                );
-
-
-            vec3 specularBRDF =
-                (
-                    D *
-                    G *
-                    F
-                ) /
-                max(
-                    4.0 *
-                    NdotV *
-                    geometricNdotL,
-                    1.0e-4
-                );
-
-            // 2026-10-16 多散射能量补偿（与 dynamicLightBRDF 同口径）。
-            specularBRDF *=
-                multiscatterEnergyCompensation(
                     F0,
-                    localSpecularRoughness
-                );
-
-
-            vec3 kD =
-                (
-                    vec3(1.0) -
-                    F
-                ) *
-                (
-                    1.0 -
-                    metallic
+                    metallic,
+                    localSpecularRoughness,
+                    NdotV,
+                    true
                 );
 
 
             vec3 diffuseTerm =
-                kD *
+                bsdf.kD *
                 hitAlbedo *
                 softDiffuseNdotL *
-                LOCAL_LIGHT_L7_DIFFUSE_SCALE;
+                BSDF_LOCAL_DIFFUSE_SCALE;
 
 
             vec3 specularTerm =
-                specularBRDF *
+                bsdf.specular *
                 geometricNdotL *
-                LOCAL_LIGHT_L7_SPECULAR_SCALE;
+                BSDF_LOCAL_SPECULAR_SCALE;
 
 
 float distanceAttenuation =
@@ -14268,7 +14264,7 @@ vec3 evaluateSecondaryDiffuseLocalLights(
             kD *
             hitAlbedo *
             softDiffuseNdotL *
-            LOCAL_LIGHT_L7_DIFFUSE_SCALE;
+            BSDF_LOCAL_DIFFUSE_SCALE;
 
 
         float emission01 =
@@ -14435,7 +14431,7 @@ vec3 traceTransparentLowCostGI(
     return
         hitAlbedo *
         incomingRadiance *
-        1.26;
+        BSDF_GI_RESULT_SCALE;
 }
 
 
@@ -14619,7 +14615,7 @@ void applyTransparentReceiverRRGuides(
 // exclusion, and the receiver's own noise still gets a little filtering.
 // =====================================================
 #ifndef GI_GLASS_RECEIVER_GUIDE_MODE
-#define GI_GLASS_RECEIVER_GUIDE_MODE 2
+#define GI_GLASS_RECEIVER_GUIDE_MODE 3
 #endif
 
 // Glass is a delta surface: near-zero roughness.  RR's roughness->radius
@@ -14654,7 +14650,7 @@ void applyTransparentReceiverRRGuides(
 // 就是 currentColor 里那份辐射的面）。开关留着做 A/B。
 // =====================================================
 #ifndef GI_GLASS_PANE_DEPTH_GUIDE
-#define GI_GLASS_PANE_DEPTH_GUIDE 0
+#define GI_GLASS_PANE_DEPTH_GUIDE 1
 #endif
 
 // Hard floor.  Below this RR classifies the surface as a mirror and stops
@@ -16975,10 +16971,25 @@ vec3 localEntityIrradiance =
 #define GLASS_ALPHA_BLEND_MAX_ALPHA 0.3
 #endif
     // 2026-10-27：与 rahit 同口径 —— 玻璃族用固定 alpha，不再取贴图 alpha。
+    //
+    // 2026-10-28 诊断：置 VPT_GLASS_ALPHA_BLEND_CONST_ALPHA=1 时把 a 直接钉成
+    // GLASS_FIXED_ALPHA，**完全不看 transmissionWeight**。
+    // 实机截图（glass_dbg=1 的 G 通道 = a）显示出射面上密布"绿点" = 局部 a 高于 0.3，
+    // 而 a 只可能由 profile 抬高 ⇒ 怀疑出射面的 payload.state 剖面位是残留值。
+    // 本档用来一刀判定：钉成常量后绿点消失 ⇒ 就是 profile/a 抖动。
+    // 2026-10-29 用户定档：保留"能透视"的半透明效果 ⇒ a 统一取 GLASS_FIXED_ALPHA。
+    // （曾经的抖动来自 profile 位在部分面上读成 0/1，导致同一块玻璃半透半实。）
+    #ifndef VPT_GLASS_ALPHA_BLEND_CONST_ALPHA
+    #define VPT_GLASS_ALPHA_BLEND_CONST_ALPHA 1
+    #endif
+#if VPT_GLASS_ALPHA_BLEND_CONST_ALPHA
+    const float blendAlpha0 = GLASS_FIXED_ALPHA;
+#else
     const float blendAlpha0 = clamp(
         max(GLASS_FIXED_ALPHA,
             1.0 - clamp(transmissionWeight, 0.0, 1.0)),
         0.0, 1.0);
+#endif
     const vec3 blendTint0 =
         clamp(glassTint, vec3(0.0), vec3(1.0));
 
@@ -17328,7 +17339,7 @@ vec3 tracePrimaryWaterReceiverIndirectReworked(
     vec3 currentDirection =
         sampleHemisphereCosine(normalize(receiverNormal), pathState);
     vec3 currentOrigin = receiverPos + currentDirection * 0.001;
-    vec3 throughput = receiverAlbedo * 0.7;
+    vec3 throughput = receiverAlbedo * BSDF_GI_THROUGHPUT_SCALE;
 #if GI_GLASS_RECEIVER_INDIRECT
     bool insideWater = startInsideWater;
 #else
@@ -17546,7 +17557,7 @@ vec3 tracePrimaryWaterReceiverIndirect(
     vec3 N = normalize(receiverNormal);
     vec3 currentDirection = sampleHemisphereCosine(N, pathState);
     vec3 currentOrigin = receiverPos + currentDirection * 0.001;
-    vec3 pathThroughput = receiverAlbedo * 0.7;
+    vec3 pathThroughput = receiverAlbedo * BSDF_GI_THROUGHPUT_SCALE;
     bool insideWater = true;
     int waterInterfaceSteps = 0;
 
@@ -19330,7 +19341,7 @@ if(hitMaterialId <= 0.5)
 
     throughput *=
         bounceWeight *
-        0.7;
+        BSDF_GI_THROUGHPUT_SCALE;
 
 
     currentOrigin =
@@ -22317,7 +22328,7 @@ else if(
 #endif
 #ifndef ORION_GLASS_RECEIVER_MV
 // 2026-10-25 阶段 A（修正版）：接收面运动矢量。置 0 = 沿用玻璃面的 MV（旧档）。
-#define ORION_GLASS_RECEIVER_MV 1
+#define ORION_GLASS_RECEIVER_MV 0
 #endif
 #if !GI_HALFRES && ORION_GLASS_RECEIVER_MV
                         // =====================================================
@@ -23607,48 +23618,16 @@ if(
         );
 
 
-    vec3 directF =
-        fresnelSchlick(
-            directVdotH,
-            directF0
-        );
-
-
-    float directD =
-        distributionGGX(
-            normal,
-            directH,
-            roughness
-        );
-
-
-    float directG =
-        geometrySmith(
+    BsdfTerms directBsdf =
+        evalBSDFTerms(
             normal,
             V,
             directL,
-            roughness
-        );
-
-
-    vec3 directSpecularBRDF =
-        (
-            directD *
-            directG *
-            directF
-        ) /
-        max(
-            4.0 *
-            NdotV *
-            NdotL,
-            1.0e-4
-        );
-
-    // 2026-10-16 多散射能量补偿：粗糙金属的太阳高光不再偏暗。
-    directSpecularBRDF *=
-        multiscatterEnergyCompensation(
             directF0,
-            roughness
+            metallic,
+            roughness,
+            NdotV,
+            true
         );
 
 
@@ -23663,34 +23642,19 @@ if(
     // specular only
     // -------------------------------------------------
 
-    vec3 directKD =
-        (
-            vec3(1.0) -
-            directF
-        ) *
-        (
-            1.0 -
-            metallic
-        );
-
-
     // PBR-1B:
     // The current Primary path did NOT contain the helper's 1.2 scale.
     // Preserve that exact Primary brightness baseline and only replace
     // Lambert NdotL with the Burley angular/roughness response.
-    float directBurleyDiffuse =
+    vec3 directDiffuse =
+        directBsdf.kD *
+        albedo *
         evaluateBurleyDiffuseAngular(
             normal,
             V,
             directL,
             roughness
         );
-
-
-    vec3 directDiffuse =
-        directKD *
-        albedo *
-        directBurleyDiffuse;
 
 #ifndef GI_OREN_NAYAR_RETRO
 // 2026-10-05 粗糙漫反射（#7）：在 Burley 之上叠加 Oren-Nayar 的逆反射瓣
@@ -23709,7 +23673,7 @@ if(
             vec3 onL = normalize(directL - normal * NdotL);
             float onRetro = clamp(dot(onV, onL), 0.0, 1.0);
             directDiffuse +=
-                directKD *
+                directBsdf.kD *
                 albedo *
                 (onB * onRetro * NdotL * 0.35);
         }
@@ -23718,7 +23682,7 @@ if(
 
 
     vec3 directSpecular =
-        directSpecularBRDF *
+        directBsdf.specular *
         NdotL;
 
 
@@ -26194,15 +26158,15 @@ else
 
 currentThroughput *=
     nextBounceWeight *
-    0.7;
+    BSDF_GI_THROUGHPUT_SCALE;
 
 #if SHARC_UPDATE
 // 参考 Pathtracer.hlsl:738-744：采样完新方向、乘完 BRDF 权重**之后**，把段权重交给
 // SharcSetThroughput（它会把该权重乘进所有已记录顶点的 sampleWeights —— 见
 // SharcCommon.h:716-722）。本工程不重置 currentThroughput，所以这里传"增量"
-// nextBounceWeight * 0.7，与参考等价（参考在 update pass 每 bounce 把 throughput
+// nextBounceWeight * BSDF_GI_THROUGHPUT_SCALE，与参考等价（参考在 update pass 每 bounce 把 throughput
 // 重置为 1：Pathtracer.hlsl:461-463）。
-SharcSetThroughput(sharcState, nextBounceWeight * 0.7);
+SharcSetThroughput(sharcState, nextBounceWeight * BSDF_GI_THROUGHPUT_SCALE);
 #endif
 
 // 参考 Pathtracer.hlsl:673-675：把**本顶点**的粗糙度累加进 materialRoughnessPrev，
@@ -27202,26 +27166,27 @@ if (cam.dhFarFieldParams.x > 0.5
 
                 // ---- 直射（结构照抄 16755-16863）------------------------------
                 vec3 dhFarF0 = vec3(0.04);
-                vec3 dhFarDirectH = normalize(dhFarViewDir + dhFarSunDir);
-                vec3 dhFarF = fresnelSchlick(
-                    max(dot(dhFarViewDir, dhFarDirectH), 0.0),
-                    dhFarF0
-                );
-                vec3 dhFarKD = vec3(1.0) - dhFarF;
-                float dhFarBurley = evaluateBurleyDiffuseAngular(
-                    dhFarNormal,
-                    dhFarViewDir,
-                    dhFarSunDir,
-                    1.0
-                );
-                vec3 dhFarDiffuse = dhFarKD * dhFarAlbedo * dhFarBurley;
-                vec3 dhFarSpecBRDF =
-                    (
-                        distributionGGX(dhFarNormal, dhFarDirectH, 1.0) *
-                        geometrySmith(dhFarNormal, dhFarViewDir, dhFarSunDir, 1.0) *
-                        dhFarF
-                    ) /
-                    max(4.0 * dhFarViewNdotL * dhFarNdotL, 1.0e-4);
+                BsdfTerms dhFarBsdf =
+                    evalBSDFTerms(
+                        dhFarNormal,
+                        dhFarViewDir,
+                        dhFarSunDir,
+                        dhFarF0,
+                        0.0,
+                        1.0,
+                        dhFarViewNdotL,
+                        false
+                    );
+                vec3 dhFarDiffuse =
+                    dhFarBsdf.kD *
+                    dhFarAlbedo *
+                    evaluateBurleyDiffuseAngular(
+                        dhFarNormal,
+                        dhFarViewDir,
+                        dhFarSunDir,
+                        1.0
+                    );
+                vec3 dhFarSpecBRDF = dhFarBsdf.specular;
 
                 // 阴影：**远场不投地形阴影**（09-25 第八次定案 —— 实测回来改的，别再打开）
                 //

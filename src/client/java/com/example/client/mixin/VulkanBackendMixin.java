@@ -35,9 +35,30 @@ import org.lwjgl.vulkan.VkPhysicalDeviceOpacityMicromapFeaturesEXT;
 import org.lwjgl.vulkan.EXTRayTracingInvocationReorder;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT;
 
+// 2026-10-29 OPT-EXT：可选能力（全部按设备实际 advertised 门控，见
+// rtx$injectOptionalCapabilities）。这些类来自 lwjgl-vulkan 3.4.1，已逐个用
+// javap 核对过 sType$Default() 与字段常量名，不是照名字猜的。
+import org.lwjgl.vulkan.VkPhysicalDeviceFaultFeaturesEXT;
+import org.lwjgl.vulkan.VkPhysicalDeviceMemoryPriorityFeaturesEXT;
+import org.lwjgl.vulkan.VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT;
+import org.lwjgl.vulkan.VkPhysicalDeviceShaderClockFeaturesKHR;
+import org.lwjgl.vulkan.VkPhysicalDeviceShaderSubgroupRotateFeaturesKHR;
+import org.lwjgl.vulkan.VkPhysicalDeviceShaderQuadControlFeaturesKHR;
+import org.lwjgl.vulkan.VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR;
+import org.lwjgl.vulkan.VkPhysicalDeviceShaderExpectAssumeFeaturesKHR;
+import org.lwjgl.vulkan.VkPhysicalDeviceShaderFloatControls2FeaturesKHR;
+import org.lwjgl.vulkan.VkPhysicalDeviceRawAccessChainsFeaturesNV;
+
+// 2026-10-29 T3-9 阶段 1：CLAS / partitioned AS（只探测能力与上限，不替换主路径）
+import org.lwjgl.vulkan.VkPhysicalDeviceClusterAccelerationStructureFeaturesNV;
+import org.lwjgl.vulkan.VkPhysicalDeviceClusterAccelerationStructurePropertiesNV;
+import org.lwjgl.vulkan.VkPhysicalDevicePartitionedAccelerationStructureFeaturesNV;
+import org.lwjgl.vulkan.VkPhysicalDevicePartitionedAccelerationStructurePropertiesNV;
+
 import java.nio.IntBuffer;
 
 import org.lwjgl.system.MemoryStack;
+import org.lwjgl.system.Struct;
 import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VK12;
 import org.lwjgl.vulkan.VkPhysicalDevice;
@@ -675,6 +696,14 @@ public class VulkanBackendMixin {
                 "[FG-2.8 VK13]"
                         + " synchronization2=BASE"
         );
+
+        // 2026-10-29 OPT-EXT：可选能力。必须在下面那份"真正交给 vkCreateDevice 的
+        // 清单"转储之前调用，否则日志与实际清单不一致（2026-10-14 那条诊断的初衷）。
+        rtx$injectOptionalCapabilities(
+                deviceExtensions,
+                physicalDevice,
+                vulkanFeatures
+        );
         // 2026-10-14 诊断：这一段以前是**硬编码打印**（等于陈旧文档 —— 它列了 4 个
         // 扩展却没有 VK_KHR_ray_query，而代码里明明有条件 add，谁也说不清清单里到底
         // 有没有）。改成把**真正交给 vkCreateDevice 的那份清单**转储出来。
@@ -1150,5 +1179,377 @@ public class VulkanBackendMixin {
 
 
         return result;
+    }
+
+    // ============================================================
+    // 2026-10-29 OPT-EXT
+    // 可选设备能力：按设备实际 advertised 门控启用
+    //
+    // 硬约束（来自 HANDOFF-2026-10-22 §7.4 的实测结论）：
+    //   1. 每个扩展先 physicalDevice.hasDeviceExtension(...) 门控，否则
+    //      vkCreateDevice 直接失败；
+    //   2. 带特征字段的扩展必须同时 vulkanFeatures.add(...)，否则是
+    //      "扩展启用但 feature=false"，管线创建时才报能力缺失；
+    //   3. 这里**只启用能力，不改任何现有调用路径** ⇒ 画面/性能不应变化。
+    //
+    // 明确不在此列的项与原因：
+    //   · VK_EXT_zero_initialize_device_memory：每次 vkAllocateMemory 变成写 0，
+    //     几百 MB 的 section/BLAS 分配要多一遍显存写；它只掩盖"读未初始化显存"
+    //     的 bug，先不开。
+    //   · VK_EXT_device_memory_report：要 VkDeviceDeviceMemoryReportCreateInfoEXT
+    //     回调（Java 侧没有 C 函数指针），只能 native 侧做。
+    //   · VK_KHR_present_id/_wait、swapchain_maintenance1：swapchain 归 Minecraft。
+    //   · VK_KHR_unified_image_layouts / internally_synchronized_queues：驱动 617
+    //     属新实现，且不改代码等于没效果，留作单独实验项。
+    // ============================================================
+
+    // 2026-10-29：这里刻意**不放** `static final VulkanPNextStruct` 字段。
+    // VulkanPNextStruct(Class) 的构造器靠反射校验 PNEXT/STYPE 偏移，一旦某个
+    // 结构不满足就抛 IllegalArgumentException —— 发生在类初始化阶段会变成
+    // ExceptionInInitializerError，绕开下面的 try/catch，客户端直接起不来。
+    // 所以结构体在 rtx$addFeatureExtension 内部延迟构造，失败只跳过该项。
+
+    /**
+     * 无特征结构体的扩展：只要设备 advertised 就直接加。
+     */
+    @Unique
+    private static void rtx$addPlainExtension(
+            Collection<String> deviceExtensions,
+            VulkanPhysicalDevice physicalDevice,
+            String extension
+    ) {
+        if (!physicalDevice.hasDeviceExtension(extension)) {
+            System.err.println("[OPT-EXT] " + extension + " supported=0 skipped");
+            return;
+        }
+
+        deviceExtensions.add(extension);
+        System.err.println("[OPT-EXT] " + extension + " enabled=1 (no feature struct)");
+    }
+
+    /**
+     * 带特征结构体的扩展：先查 advertised，再用 vkGetPhysicalDeviceFeatures2 查
+     * 字段实际值，只有 names[0]（主特征）为 true 才同时启用扩展与全部可用字段。
+     * 任何反射/查询异常都只降级，绝不让设备创建失败。
+     */
+    @Unique
+    private static void rtx$addFeatureExtension(
+            Collection<String> deviceExtensions,
+            Set<VulkanFeature> vulkanFeatures,
+            VulkanPhysicalDevice physicalDevice,
+            String extension,
+            Class<? extends Struct<?>> structClass,
+            String[] names,
+            long[] offsets
+    ) {
+        if (!physicalDevice.hasDeviceExtension(extension)) {
+            System.err.println("[OPT-EXT] " + extension + " supported=0 skipped");
+            return;
+        }
+
+        final VulkanPNextStruct struct;
+
+        try {
+            struct = new VulkanPNextStruct(structClass);
+        } catch (RuntimeException error) {
+            System.err.println("[OPT-EXT] " + extension + " struct failed: " + error);
+            return;
+        }
+
+        final boolean[] available = new boolean[names.length];
+
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkPhysicalDeviceFeatures2 probe =
+                    VkPhysicalDeviceFeatures2.calloc(stack).sType$Default();
+            struct.findOrCreateStructInPNextChain(probe, stack);
+            VK12.vkGetPhysicalDeviceFeatures2(physicalDevice.vkPhysicalDevice(), probe);
+
+            for (int i = 0; i < names.length; i++) {
+                available[i] = new VulkanFeature(struct, names[i], offsets[i]).get(probe);
+            }
+        } catch (RuntimeException error) {
+            System.err.println("[OPT-EXT] " + extension + " query failed: " + error);
+            return;
+        }
+
+        if (!available[0]) {
+            System.err.println("[OPT-EXT] " + extension + " feature=0 skipped");
+            return;
+        }
+
+        deviceExtensions.add(extension);
+
+        StringBuilder enabled = new StringBuilder();
+
+        for (int i = 0; i < names.length; i++) {
+            if (!available[i]) {
+                continue;
+            }
+
+            vulkanFeatures.add(new VulkanFeature(struct, names[i], offsets[i]));
+
+            if (enabled.length() > 0) {
+                enabled.append(',');
+            }
+
+            enabled.append(names[i]);
+        }
+
+        System.err.println("[OPT-EXT] " + extension + " enabled=1 features=" + enabled);
+    }
+
+    /**
+     * 六组扩展的入口。调用点在 [FG-2.8 VK13] 之后、清单转储之前。
+     * ① 挂死诊断 ② 显存 ③ shader 计时 ④ wave 级 shader 能力
+     * ⑤ buffer_reference 优化 ⑥ HDR 元数据
+     */
+    @Unique
+    private static void rtx$injectOptionalCapabilities(
+            Collection<String> deviceExtensions,
+            VulkanPhysicalDevice physicalDevice,
+            Set<VulkanFeature> vulkanFeatures
+    ) {
+        // 2026-10-29 A/B 闸门（排查掉帧用，默认全开 = 与上线时行为一致）：
+        //   ORION_EXT_OPTCAP=0   → 一次关掉下面全部 12 项（回到 24 扩展的旧设备）
+        //   ORION_EXT_PAGEABLE=0 → 只关 pageable_device_local_memory
+        // 两者都只在**设备创建时**读一次，改完必须重启客户端。
+        final String masterSwitch = System.getenv("ORION_EXT_OPTCAP");
+
+        if (masterSwitch != null
+                && (masterSwitch.startsWith("0") || masterSwitch.equalsIgnoreCase("false"))) {
+            System.err.println(
+                    "[OPT-EXT] all optional capabilities DISABLED by ORION_EXT_OPTCAP"
+            );
+            return;
+        }
+
+        final String pageableSwitch = System.getenv("ORION_EXT_PAGEABLE");
+        final boolean pageableAllowed = !(pageableSwitch != null
+                && (pageableSwitch.startsWith("0") || pageableSwitch.equalsIgnoreCase("false")));
+
+        // ① GPU 挂死可诊断：vkGetDeviceFaultInfoEXT + vkCmdSetCheckpointNV
+        rtx$addFeatureExtension(
+                deviceExtensions,
+                vulkanFeatures,
+                physicalDevice,
+                "VK_EXT_device_fault",
+                VkPhysicalDeviceFaultFeaturesEXT.class,
+                new String[]{"deviceFault"},
+                new long[]{VkPhysicalDeviceFaultFeaturesEXT.DEVICEFAULT}
+        );
+
+        // 只取 deviceFault，不取 deviceFaultVendorBinary：后者会让驱动把崩溃
+        // 转储落盘（每次 DEVICE_LOST 一个 dump），占用不可控。
+        rtx$addPlainExtension(
+                deviceExtensions,
+                physicalDevice,
+                "VK_NV_device_diagnostic_checkpoints"
+        );
+
+        // ② 显存
+        rtx$addFeatureExtension(
+                deviceExtensions,
+                vulkanFeatures,
+                physicalDevice,
+                "VK_EXT_memory_priority",
+                VkPhysicalDeviceMemoryPriorityFeaturesEXT.class,
+                new String[]{"memoryPriority"},
+                new long[]{VkPhysicalDeviceMemoryPriorityFeaturesEXT.MEMORYPRIORITY}
+        );
+
+        if (pageableAllowed) {
+            rtx$addFeatureExtension(
+                    deviceExtensions,
+                    vulkanFeatures,
+                    physicalDevice,
+                    "VK_EXT_pageable_device_local_memory",
+                    VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT.class,
+                    new String[]{"pageableDeviceLocalMemory"},
+                    new long[]{VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT.PAGEABLEDEVICELOCALMEMORY}
+            );
+        } else {
+            System.err.println(
+                    "[OPT-EXT] VK_EXT_pageable_device_local_memory DISABLED by ORION_EXT_PAGEABLE"
+            );
+        }
+
+        // ③ shader 内计时（补上"云段无子计时"的空白）
+        rtx$addFeatureExtension(
+                deviceExtensions,
+                vulkanFeatures,
+                physicalDevice,
+                "VK_KHR_shader_clock",
+                VkPhysicalDeviceShaderClockFeaturesKHR.class,
+                new String[]{"shaderSubgroupClock", "shaderDeviceClock"},
+                new long[]{
+                        VkPhysicalDeviceShaderClockFeaturesKHR.SHADERSUBGROUPCLOCK,
+                        VkPhysicalDeviceShaderClockFeaturesKHR.SHADERDEVICECLOCK
+                }
+        );
+
+        // ④ wave 级 shader 能力（现成 shader 就能吃：histogram / ReSTIR / moments）
+        rtx$addFeatureExtension(
+                deviceExtensions,
+                vulkanFeatures,
+                physicalDevice,
+                "VK_KHR_shader_subgroup_rotate",
+                VkPhysicalDeviceShaderSubgroupRotateFeaturesKHR.class,
+                new String[]{"shaderSubgroupRotate", "shaderSubgroupRotateClustered"},
+                new long[]{
+                        VkPhysicalDeviceShaderSubgroupRotateFeaturesKHR.SHADERSUBGROUPROTATE,
+                        VkPhysicalDeviceShaderSubgroupRotateFeaturesKHR.SHADERSUBGROUPROTATECLUSTERED
+                }
+        );
+
+        rtx$addFeatureExtension(
+                deviceExtensions,
+                vulkanFeatures,
+                physicalDevice,
+                "VK_KHR_shader_quad_control",
+                VkPhysicalDeviceShaderQuadControlFeaturesKHR.class,
+                new String[]{"shaderQuadControl"},
+                new long[]{VkPhysicalDeviceShaderQuadControlFeaturesKHR.SHADERQUADCONTROL}
+        );
+
+        rtx$addFeatureExtension(
+                deviceExtensions,
+                vulkanFeatures,
+                physicalDevice,
+                "VK_KHR_shader_maximal_reconvergence",
+                VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR.class,
+                new String[]{"shaderMaximalReconvergence"},
+                new long[]{VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR.SHADERMAXIMALRECONVERGENCE}
+        );
+
+        rtx$addFeatureExtension(
+                deviceExtensions,
+                vulkanFeatures,
+                physicalDevice,
+                "VK_KHR_shader_expect_assume",
+                VkPhysicalDeviceShaderExpectAssumeFeaturesKHR.class,
+                new String[]{"shaderExpectAssume"},
+                new long[]{VkPhysicalDeviceShaderExpectAssumeFeaturesKHR.SHADEREXPECTASSUME}
+        );
+
+        rtx$addFeatureExtension(
+                deviceExtensions,
+                vulkanFeatures,
+                physicalDevice,
+                "VK_KHR_shader_float_controls2",
+                VkPhysicalDeviceShaderFloatControls2FeaturesKHR.class,
+                new String[]{"shaderFloatControls2"},
+                new long[]{VkPhysicalDeviceShaderFloatControls2FeaturesKHR.SHADERFLOATCONTROLS2}
+        );
+
+        // ⑤ buffer_reference 链（material_resolve 的 sectionVertexAddress 路径）
+        rtx$addFeatureExtension(
+                deviceExtensions,
+                vulkanFeatures,
+                physicalDevice,
+                "VK_NV_raw_access_chains",
+                VkPhysicalDeviceRawAccessChainsFeaturesNV.class,
+                new String[]{"shaderRawAccessChains"},
+                new long[]{VkPhysicalDeviceRawAccessChainsFeaturesNV.SHADERRAWACCESSCHAINS}
+        );
+
+        // ⑥ HDR 元数据（无特征结构体；调用点 vkSetHdrMetadataEXT 在 native 侧）
+        rtx$addPlainExtension(
+                deviceExtensions,
+                physicalDevice,
+                "VK_EXT_hdr_metadata"
+        );
+
+        // ⑦ 2026-10-29 T3-9 阶段 1：CLAS / partitioned AS。
+        //
+        // 刻意只做到"启用 + 查上限"，**不碰任何现有构建路径** —— 现有 BLAS 仍是
+        // vkCmdBuildAccelerationStructuresKHR 直建，画面/性能不应有任何变化。
+        //
+        // 为什么必须先探测：SDK header 里 VK_BUILD_CLUSTER_ACCELERATION_STRUCTURE_MODE
+        // 是 0 命中 ⇒ Vulkan 侧 CLAS 只能走
+        // vkCmdBuildClusterAccelerationStructureIndirectNV（间接命令 + device buffer），
+        // 且必须配 VK_NV_partitioned_acceleration_structure 当容器。阶段 2 的实现
+        // 规模完全取决于 maxVerticesPerCluster / maxTrianglesPerCluster 这两个上限：
+        // 上限越小，一个 16³ Section 被切出的 cluster 越多。
+        rtx$addFeatureExtension(
+                deviceExtensions,
+                vulkanFeatures,
+                physicalDevice,
+                "VK_NV_cluster_acceleration_structure",
+                VkPhysicalDeviceClusterAccelerationStructureFeaturesNV.class,
+                new String[]{"clusterAccelerationStructure"},
+                new long[]{
+                        VkPhysicalDeviceClusterAccelerationStructureFeaturesNV
+                                .CLUSTERACCELERATIONSTRUCTURE
+                }
+        );
+
+        rtx$addFeatureExtension(
+                deviceExtensions,
+                vulkanFeatures,
+                physicalDevice,
+                "VK_NV_partitioned_acceleration_structure",
+                VkPhysicalDevicePartitionedAccelerationStructureFeaturesNV.class,
+                new String[]{"partitionedAccelerationStructure"},
+                new long[]{
+                        VkPhysicalDevicePartitionedAccelerationStructureFeaturesNV
+                                .PARTITIONEDACCELERATIONSTRUCTURE
+                }
+        );
+
+        rtx$logClusterAsLimits(physicalDevice);
+    }
+
+    /**
+     * 2026-10-29 T3-9：打印 CLAS / partitioned AS 的硬上限。
+     *
+     * 只读、异常只降级。这些数字决定阶段 2 的 cluster 切分方案：
+     *   · maxVerticesPerCluster / maxTrianglesPerCluster —— 每个 cluster 的容量
+     *   · maxClusterGeometryIndex                       —— cluster 内几何索引上限
+     *   · 各种 *ByteAlignment                            —— 缓冲/模板/scratch 的对齐
+     *   · maxPartitionCount                              —— partitioned AS 的分区数上限
+     */
+    @Unique
+    private static void rtx$logClusterAsLimits(VulkanPhysicalDevice physicalDevice) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkPhysicalDeviceClusterAccelerationStructurePropertiesNV cluster =
+                    VkPhysicalDeviceClusterAccelerationStructurePropertiesNV
+                            .calloc(stack)
+                            .sType$Default();
+
+            VkPhysicalDevicePartitionedAccelerationStructurePropertiesNV partitioned =
+                    VkPhysicalDevicePartitionedAccelerationStructurePropertiesNV
+                            .calloc(stack)
+                            .sType$Default();
+
+            cluster.pNext(partitioned.address());
+
+            org.lwjgl.vulkan.VkPhysicalDeviceProperties2 properties2 =
+                    org.lwjgl.vulkan.VkPhysicalDeviceProperties2
+                            .calloc(stack)
+                            .sType$Default();
+
+            properties2.pNext(cluster.address());
+
+            org.lwjgl.vulkan.VK11.vkGetPhysicalDeviceProperties2(
+                    physicalDevice.vkPhysicalDevice(),
+                    properties2
+            );
+
+            System.err.println(
+                    "[CLAS-LIMITS]"
+                            + " maxVerticesPerCluster=" + cluster.maxVerticesPerCluster()
+                            + " maxTrianglesPerCluster=" + cluster.maxTrianglesPerCluster()
+                            + " maxClusterGeometryIndex=" + cluster.maxClusterGeometryIndex()
+                            + " clusterByteAlignment=" + cluster.clusterByteAlignment()
+                            + " templateByteAlignment=" + cluster.clusterTemplateByteAlignment()
+                            + " scratchByteAlignment=" + cluster.clusterScratchByteAlignment()
+                            + " bottomLevelByteAlignment=" + cluster.clusterBottomLevelByteAlignment()
+                            + " templateBoundsByteAlignment="
+                            + cluster.clusterTemplateBoundsByteAlignment()
+                            + " maxPartitionCount=" + partitioned.maxPartitionCount()
+            );
+        } catch (RuntimeException error) {
+            System.err.println("[CLAS-LIMITS] query failed: " + error);
+        }
     }
 }

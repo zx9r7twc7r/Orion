@@ -53,7 +53,25 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
      */
     public static native void updateWaterBoats(float[] data, int count);
 
-    public static native void uploadPBRAtlases(long normalPointer, long specularPointer, int width, int height);
+    /**
+     * 2026-10-29：多带一份 **sprite 矩形表**。
+     *
+     * <p>{@code spriteRects} 是每 4 个 int 一组 {@code (x, y, w, h)}，描述每个 sprite 在
+     * 图集里的像素矩形；{@code spriteRectCount} 是组数。</p>
+     *
+     * <p>用途：native 侧生成 mip 时**按 sprite 矩形独立降采样**，而不是对整张图集做
+     * box。整图 box 会让双线性足迹在方块边界处跨进邻居 sprite，mip 越深渗色越宽
+     * （mip4 时约 16 个原 texel ≈ 1/8 个方格），表现就是"方块与方块之间的分界线"。
+     * 传空数组 / 0 组时 native 退回原来的整图 blit 行为（逐位同旧档）。</p>
+     */
+    public static native void uploadPBRAtlases(
+            long normalPointer,
+            long specularPointer,
+            int width,
+            int height,
+            int[] spriteRects,
+            int spriteRectCount
+    );
 
     public static native void beginEntityFrame();
 

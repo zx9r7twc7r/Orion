@@ -14,6 +14,10 @@ include_directories(
         ${Vulkan_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/streamline/include
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/NRD/Include
+        # 2026-10-29：BC7 编码器（bc7enc_rdo，MIT / public domain，
+        # 见 external/bc7enc/LICENSE-bc7enc.txt）。只用于运行时把 PBR 图集压成
+        # VK_FORMAT_BC7_UNORM_BLOCK，与 RTX Remix 的"消费 BC7"口径一致。
+        ${CMAKE_CURRENT_SOURCE_DIR}/external/bc7enc
 )
 
 # NRD (NVIDIA Real-Time Denoisers) v4.18.0, built as a static library with
@@ -39,6 +43,8 @@ endif()
 # 源文件
 set(SOURCES
         VulkanCore.cpp
+        # 2026-10-29：BC7 编码器（独立 TU；VulkanCore.cpp 只 include 它的头）。
+        external/bc7enc/bc7enc.cpp
 )
 
 # 生成动态链接库

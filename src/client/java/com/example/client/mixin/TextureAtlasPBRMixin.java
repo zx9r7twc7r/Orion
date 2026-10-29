@@ -83,6 +83,38 @@ public class TextureAtlasPBRMixin {
             POM_STRONG_RELIEF_ALPHA_SPAN = 52.0f;
 
 
+    // =====================================================
+    // 2026-10-29：PBR 图集（_n / _s）降采样倍率。
+    //
+    // 为什么可以缩：着色器用的是**归一化 UV**（MC 的 sprite UV），图集变小后
+    // 同一个 UV 仍然落在同一个 sprite 里，所以 sprite 的 atlas 矩形由
+    // `sprite.getU0() * atlasWidth` 推出时会自动同比缩小 —— **不需要改 shader、
+    // 不需要改 UV、不需要新描述符**。
+    //
+    // 收益（GPU 显存，两张 RGBA8 + 完整 mip 链 ≈ 10.67 B/像素）：
+    //   8192²  682 MiB -> 171 MiB
+    //   16384² 2.67 GiB -> 682 MiB
+    //
+    // 代价：POM 高度场（normal.a）的 texel 变大 2×，视差轮廓的台阶变粗；
+    // 法线/粗糙度的微表面细节减半。这类损失是**空间均匀**的，不引入 BC7 那种
+    // 块边界与跨 mip 不相关的量化误差。
+    //
+    // 与 shader 的关系：material_resolve.glsl 的 pbrLod 用
+    // `pbrTexelWorld = 1 / (spriteSpan.x * textureSize(blockAtlas))`（albedo 口径）
+    // 算，图集减半后该口径比实际偏小 ⇒ lod 偏大（更偏 mip）⇒ 远处略微更糊。
+    // 这是**良性**方向（降采样本来就要牺牲细节），所以故意不改 shader。
+    //
+    // 回退：改回 1 即可（必须同时确认 PBR_ATLAS_DOWNSCALE 与
+    // `#define PBR_ATLAS_DOWNSCALE` 无关 —— shader 侧没有这个宏）。
+    // =====================================================
+    private static final int PBR_ATLAS_DOWNSCALE = 1;
+
+    // 2026-10-29 决定：先退回 1（图集保持原尺寸），改走 BC7 压缩路线。
+    // 设 1 时下面所有降采样分支都不触发（图集尺寸不变、copyResampledRgba 走原
+    // nearest、copyNormalWithAutoPomHeight 走原循环、[PBR ATLAS] 日志不打印）
+    // ⇒ 与加这段代码之前逐位相同。box 滤波函数保留：BC7 的 mip 链生成同样需要它。
+
+
     private static int percentileFromHistogram(
             int[] histogram,
             int sampleCount,
@@ -192,6 +224,12 @@ public class TextureAtlasPBRMixin {
             int targetWidth,
             int targetHeight
     ) {
+        // 2026-10-29：降采样时每个 sprite 都会与目标尺寸不同，逐条打印会刷几百行；
+        // 那种情况由 onUploadPBR 打一行 [PBR ATLAS] 汇总代替。
+        if (PBR_ATLAS_DOWNSCALE > 1) {
+            return;
+        }
+
         if (
                 source.getWidth() != targetWidth ||
                         source.getHeight() != targetHeight
@@ -215,6 +253,138 @@ public class TextureAtlasPBRMixin {
     }
 
 
+    // =====================================================
+    // 2026-10-29：区域平均（box filter）重采样 —— 只在 PBR_ATLAS_DOWNSCALE > 1 时走。
+    //
+    // 为什么不能用 nearest：整张图集缩到 1/2 时，nearest 等于"每 2×2 只留一个
+    // texel、其余全丢"，法线/粗糙度会出现点状缺失（比降采样本身更难看，高光更碎）。
+    // 区域平均对连续场（法线 RG、粗糙度 R、高度 A）是正确做法。
+    //
+    // 源范围用整数比例切分：x0 = px*srcW/dstW, x1 = (px+1)*srcW/dstW（至少 1 像素），
+    // 于是每个源 texel 恰好被覆盖一次、不重不漏。
+    // =====================================================
+    private static void copyBoxFilteredRgba(
+            NativeImage source,
+            NativeImage destination,
+            int dstX,
+            int dstY,
+            int width,
+            int height,
+            int srcWidth,
+            int srcHeight
+    ) {
+        for (int py = 0; py < height; ++py) {
+            final int y0 = py * srcHeight / height;
+            final int y1 = Math.max(y0 + 1, (py + 1) * srcHeight / height);
+
+            for (int px = 0; px < width; ++px) {
+                final int x0 = px * srcWidth / width;
+                final int x1 = Math.max(x0 + 1, (px + 1) * srcWidth / width);
+
+                long sumR = 0L;
+                long sumG = 0L;
+                long sumB = 0L;
+                long sumA = 0L;
+                int count = 0;
+
+                for (int sy = y0; sy < y1; ++sy) {
+                    for (int sx = x0; sx < x1; ++sx) {
+                        final long pixel = pixelAddress(source, sx, sy);
+                        sumR += MemoryUtil.memGetByte(pixel) & 0xFF;
+                        sumG += MemoryUtil.memGetByte(pixel + 1L) & 0xFF;
+                        sumB += MemoryUtil.memGetByte(pixel + 2L) & 0xFF;
+                        sumA += MemoryUtil.memGetByte(pixel + 3L) & 0xFF;
+                        ++count;
+                    }
+                }
+
+                if (count <= 0) {
+                    continue;
+                }
+
+                final long destinationPixel =
+                        pixelAddress(destination, dstX + px, dstY + py);
+
+                MemoryUtil.memPutByte(destinationPixel, (byte) ((sumR + count / 2L) / count));
+                MemoryUtil.memPutByte(destinationPixel + 1L, (byte) ((sumG + count / 2L) / count));
+                MemoryUtil.memPutByte(destinationPixel + 2L, (byte) ((sumB + count / 2L) / count));
+                MemoryUtil.memPutByte(destinationPixel + 3L, (byte) ((sumA + count / 2L) / count));
+            }
+        }
+    }
+
+
+    // 2026-10-29：法线图集的降采样版本 —— RGB 取区域平均（法线 XY + 材质 AO 都是
+    // 连续场），A 取区域平均后走与 nearest 路径**同一套** percentile 重映射
+    // （alphaP99 -> 深度 0，alphaP01 -> 深度 1，再乘 reliefStrength）。
+    private static void copyBoxFilteredNormalWithHeight(
+            NativeImage source,
+            NativeImage destination,
+            int dstX,
+            int dstY,
+            int width,
+            int height,
+            int srcWidth,
+            int srcHeight,
+            int alphaP99,
+            int robustSpan,
+            float reliefStrength
+    ) {
+        for (int py = 0; py < height; ++py) {
+            final int y0 = py * srcHeight / height;
+            final int y1 = Math.max(y0 + 1, (py + 1) * srcHeight / height);
+
+            for (int px = 0; px < width; ++px) {
+                final int x0 = px * srcWidth / width;
+                final int x1 = Math.max(x0 + 1, (px + 1) * srcWidth / width);
+
+                long sumR = 0L;
+                long sumG = 0L;
+                long sumB = 0L;
+                long sumA = 0L;
+                int count = 0;
+
+                for (int sy = y0; sy < y1; ++sy) {
+                    for (int sx = x0; sx < x1; ++sx) {
+                        final long pixel = pixelAddress(source, sx, sy);
+                        sumR += MemoryUtil.memGetByte(pixel) & 0xFF;
+                        sumG += MemoryUtil.memGetByte(pixel + 1L) & 0xFF;
+                        sumB += MemoryUtil.memGetByte(pixel + 2L) & 0xFF;
+                        sumA += MemoryUtil.memGetByte(pixel + 3L) & 0xFF;
+                        ++count;
+                    }
+                }
+
+                if (count <= 0 || robustSpan <= 0) {
+                    continue;
+                }
+
+                final int averageAlpha =
+                        (int) ((sumA + count / 2L) / count);
+
+                float normalizedDepth =
+                        (alphaP99 - averageAlpha) / (float) robustSpan;
+
+                normalizedDepth = clamp01(normalizedDepth);
+
+                final float finalDepth =
+                        normalizedDepth * reliefStrength;
+
+                final int remappedAlpha =
+                        Math.round((1.0f - finalDepth) * 255.0f);
+
+                final long destinationPixel =
+                        pixelAddress(destination, dstX + px, dstY + py);
+
+                MemoryUtil.memPutByte(destinationPixel, (byte) ((sumR + count / 2L) / count));
+                MemoryUtil.memPutByte(destinationPixel + 1L, (byte) ((sumG + count / 2L) / count));
+                MemoryUtil.memPutByte(destinationPixel + 2L, (byte) ((sumB + count / 2L) / count));
+                MemoryUtil.memPutByte(destinationPixel + 3L, (byte) remappedAlpha);
+            }
+        }
+    }
+
+
     private static void copyResampledRgba(
             NativeImage source,
             NativeImage destination,
@@ -225,6 +395,23 @@ public class TextureAtlasPBRMixin {
             String spriteName,
             String textureKind
     ) {
+        // 2026-10-29：降采样时走区域平均。PBR_ATLAS_DOWNSCALE == 1 时逐位保持原来
+        // 的 nearest 行为（包括"源比目标大"的 sprite —— 那条路径不变）。
+        if (PBR_ATLAS_DOWNSCALE > 1) {
+            copyBoxFilteredRgba(
+                    source,
+                    destination,
+                    dstX,
+                    dstY,
+                    width,
+                    height,
+                    source.getWidth(),
+                    sourceFrameHeight(source)
+            );
+
+            return;
+        }
+
         logResampledPbrTexture(
                 spriteName,
                 textureKind,
@@ -418,6 +605,25 @@ public class TextureAtlasPBRMixin {
                 );
 
 
+        if (PBR_ATLAS_DOWNSCALE > 1) {
+            // 2026-10-29：降采样路径 —— 先对源区域做区域平均，再把平均高度走同一套
+            // percentile 重映射。nearest 在 1/2 下会丢掉一半高度样本（POM 轮廓出现
+            // 1 texel 的断点），区域平均得到的是连续高度场，代价是台阶整体变粗。
+            copyBoxFilteredNormalWithHeight(
+                    source,
+                    destination,
+                    dstX,
+                    dstY,
+                    width,
+                    height,
+                    source.getWidth(),
+                    sampledSourceHeight,
+                    alphaP99,
+                    robustSpan,
+                    reliefStrength
+            );
+        } else {
+
         for (int py = 0; py < height; ++py) {
             int sourceY =
                     nearestSourceCoordinate(
@@ -506,6 +712,8 @@ public class TextureAtlasPBRMixin {
             }
         }
 
+        }
+
 
         System.out.println(
                 "[POM AUTO HEIGHT] sprite=" +
@@ -575,8 +783,23 @@ public class TextureAtlasPBRMixin {
             PBRAtlasStorage.globalVptAlbedoAtlas.close();
         }
 
-        int atlasWidth = preparations.width();
-        int atlasHeight = preparations.height();
+        // 2026-10-29：PBR 图集按 1/PBR_ATLAS_DOWNSCALE 构建（GPU 显存 4×）。
+        // UV 是归一化的（MC 的 sprite UV），所以下面所有 sprite 矩形
+        // （由 sprite.getU0() * atlasWidth 推出）会自动同比缩小 —— 不需要改
+        // shader、不需要改 UV、不需要新描述符。详见 PBR_ATLAS_DOWNSCALE 处的说明。
+        final int sourceAtlasWidth = preparations.width();
+        final int sourceAtlasHeight = preparations.height();
+
+        int atlasWidth = Math.max(1, sourceAtlasWidth / PBR_ATLAS_DOWNSCALE);
+        int atlasHeight = Math.max(1, sourceAtlasHeight / PBR_ATLAS_DOWNSCALE);
+
+        if (PBR_ATLAS_DOWNSCALE > 1) {
+            System.out.println(
+                    "[PBR ATLAS] downscale=" + PBR_ATLAS_DOWNSCALE +
+                            " size=" + atlasWidth + "x" + atlasHeight +
+                            " (source " + sourceAtlasWidth + "x" + sourceAtlasHeight + ")"
+            );
+        }
 
         PBRAtlasStorage.globalNormalAtlas =
                 new NativeImage(
@@ -611,6 +834,14 @@ public class TextureAtlasPBRMixin {
                 atlasHeight
         );
 
+
+        // 2026-10-29：把每个 sprite 在图集里的矩形（每 4 个 int 一组 x,y,w,h）一次性交给
+        // native，供"按 sprite 生成 mip"使用 —— 整图 box 会让双线性足迹在方块边界处跨进
+        // 邻居 sprite，mip 越深渗色越宽（mip4 ≈ 16 原 texel ≈ 1/8 方格），表现为方块间的
+        // 分界线。下面填的就是循环里已经算好的 atlasSpriteX/Y/W/H，不重算，避免两者漂移。
+        final int[] spriteRects =
+                new int[preparations.regions().size() * 4];
+        int spriteRectCount = 0;
 
         final List<PBRAtlasStorage.OmmSpriteRegion> ommSpriteRegions =
                 new ArrayList<>(preparations.regions().size());
@@ -681,6 +912,15 @@ public class TextureAtlasPBRMixin {
                                     )
                             )
                     );
+
+            // 同一份矩形既用于填充图集，也用于 native 侧的 mip 生成（见上面 spriteRects）。
+            if (spriteRectCount * 4 + 4 <= spriteRects.length) {
+                spriteRects[spriteRectCount * 4] = atlasSpriteX;
+                spriteRects[spriteRectCount * 4 + 1] = atlasSpriteY;
+                spriteRects[spriteRectCount * 4 + 2] = atlasSpriteWidth;
+                spriteRects[spriteRectCount * 4 + 3] = atlasSpriteHeight;
+                ++spriteRectCount;
+            }
 
             // The OMM classifier reads this exact source alpha and only
             // emits a known state when all three UV corners belong to this
@@ -763,7 +1003,9 @@ public class TextureAtlasPBRMixin {
                 normalPtr,
                 specularPtr,
                 atlasWidth,
-                atlasHeight
+                atlasHeight,
+                spriteRects,
+                spriteRectCount
         );
 
 
@@ -774,5 +1016,33 @@ public class TextureAtlasPBRMixin {
                         ", SpecularPtr: " +
                         specularPtr
         );
+
+        // =====================================================================
+        // 2026-10-29：上传完成即**退役 CPU 副本**（显存/内存账）。
+        //
+        // 依据（全仓引用扫描）：globalNormalAtlas / globalSpecularAtlas 一共 17 处
+        // 引用，全部在本文件内 —— 创建（上面 new NativeImage）、逐 sprite 填充、
+        // 取 getPointer() 交给 JNI、以及下次重载时 close。**上传之后没有任何读取点**：
+        //   · SectionCompiler 读的是 globalVptAlbedoAtlas（那份必须留着）；
+        //   · OMM 分类用的是 OmmSpriteRegion 里的 diffuseImg（原始 sprite），不是图集。
+        //
+        // 为什么可以立刻关：NativeVulkan.uploadPBRAtlases 是同步 JNI，
+        // cpp/VulkanCore.cpp 的 uploadTextureToVRAM 在返回前已完成
+        // std::memcpy(stagingMapped, pixels, imageSize)（:11922）；specular 那次进入时
+        // 还会先等 normal 的 fence。所以本行之后 Java 侧这块堆外内存已无人引用。
+        //
+        // 收益：2 × W×H×4 的堆外内存 —— 4096²=128MiB / 8192²=512MiB / 16384²=2GiB。
+        // 注意这是**进程私有内存**，不是 GPU 显存；它缓解的是 WDDM 下的提交流量/
+        // 换页（见 VulkanCore.cpp:19396 那段实测），对"显存爆掉"只有间接帮助。
+        //
+        // ⚠ 契约变更：这两个字段从此是"上传后即退役"（可能为 null）。将来若有人要
+        //   在 CPU 侧读图集（例如 OMM 改读 atlas alpha），必须改成延迟关闭，不能假设
+        //   它一直有效。
+        // =====================================================================
+        PBRAtlasStorage.globalNormalAtlas.close();
+        PBRAtlasStorage.globalNormalAtlas = null;
+
+        PBRAtlasStorage.globalSpecularAtlas.close();
+        PBRAtlasStorage.globalSpecularAtlas = null;
     }
 }
