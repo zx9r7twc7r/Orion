@@ -30915,7 +30915,7 @@ static void recordSharcUpdate(VkCommandBuffer cmd, uint32_t width, uint32_t heig
     // 比 Remix Ultra 的 82,944 多 56%，且分辨率越高越贵。成本 ∝ 1/BLOCK² ⇒ 5 约为 4 的 64%。
     // ⚠ 必须与 shader 同步：dispatch 发 ceil(w/BLOCK) 个块坐标，shader 用
     //   sharcBlock * BLOCK + sharcUpdateBlockOffset(block) 还原像素，两边不一致就覆盖不到全屏。
-    const uint32_t sharcUpdateBlock = 3u;
+    const uint32_t sharcUpdateBlock = 5u;
     const uint32_t sharcUpdateWidth =
         std::max(1u, (width + sharcUpdateBlock - 1u) / sharcUpdateBlock);
     const uint32_t sharcUpdateHeight =

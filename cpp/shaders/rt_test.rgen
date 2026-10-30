@@ -591,7 +591,7 @@ void sharcProbeWriteBack()
 // 1080p 下 129,600 条 update 路径/帧，比 Remix Ultra 的 82,944 多付 56%，且分辨率越高越贵。
 // 覆盖率下降的代价由 update 侧关轮盘 + firefly clamp 100× 补（先把方差压下来）。
 // 必须与 VulkanCore.cpp 的 sharcUpdateBlock 一致（dispatch 尺寸由宿主按同一个块算）。
-#define SHARC_UPDATE_BLOCK 3
+#define SHARC_UPDATE_BLOCK 5
 
 // 2026-10-25（对齐 RTX Remix 的 SHaRC 口径）：update pass 改为**块级 dispatch**。
 //
