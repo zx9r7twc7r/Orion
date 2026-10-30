@@ -1280,6 +1280,18 @@ if(
         );
 }
 
+// 2026-10-29 消融档 27「secMipBias2」：次级命中强制 mip+2。
+// 走的就是上面 ORION_SECONDARY_MIP_BIAS 那条路径（上限仍是 pbrMaxLod，
+// 不跨 sprite、不串色），只是把它变成同局可切换的消融臂。
+if(cam.perfAblationStage.x == 27u)
+{
+    pbrLod =
+        min(
+            pbrLod + 2.0,
+            pbrMaxLod
+        );
+}
+
 // =====================================================
 // POM eligibility
 //
@@ -1466,19 +1478,23 @@ if(useExactAlbedo)
         )
     );
 
+    // 2026-10-29 消融档 23「noAlbedoFetch」：albedo 采样的价格（texelFetch 分支）。
     albedoColor =
-        texelFetch(blockAtlas, albedoTexel, 0) *
-        interpColor;
+        (cam.perfAblationStage.x == 23u)
+            ? vec4(0.5, 0.5, 0.5, 1.0) * interpColor
+            : texelFetch(blockAtlas, albedoTexel, 0) * interpColor;
 }
 else
 {
     albedoColor =
-        textureLod(
-            blockAtlas,
-            materialSampleUV,
-            0.0
-        ) *
-        interpColor;
+        (cam.perfAblationStage.x == 23u)
+            ? vec4(0.5, 0.5, 0.5, 1.0) * interpColor
+            : textureLod(
+                blockAtlas,
+                materialSampleUV,
+                0.0
+            ) *
+            interpColor;
 }
 
 #ifdef RT_DEBUG_ALBEDO
@@ -1521,14 +1537,22 @@ if(!isWaterMaterial)
     //
     // 判据只写 !isPOMSurface、不写 parallaxHit.valid：POM 面走"无效"分支时
     // texCoord 已经被 parallaxHit.uv 覆写过，而 base 那次用的是覆写**前**的 texCoord。
-    normalSample =
-        isPOMSurface
-            ? textureLod(
-                normalAtlas,
-                pbrTexCoord,
-                pbrLod
-            )
-            : baseNormalSample;
+    // 2026-10-29 消融档 22「noNormalResample」：POM 面上那次重采样的价格。
+    if(cam.perfAblationStage.x == 22u)
+    {
+        normalSample = baseNormalSample;
+    }
+    else
+    {
+        normalSample =
+            isPOMSurface
+                ? textureLod(
+                    normalAtlas,
+                    pbrTexCoord,
+                    pbrLod
+                )
+                : baseNormalSample;
+    }
 }
 bool hasNormalData = hasPBRNormalData;
 
@@ -1664,12 +1688,21 @@ vec4 specularSample =
 
 if(!isWaterMaterial)
 {
-    specularSample =
-        textureLod(
-            specularAtlas,
-            pbrTexCoord,
-            pbrLod
-        );
+    // 2026-10-29 消融档 20「noSpecular」：第 4 次图集读取的价格。
+    // 常量取"半光滑、无金属、无孔隙"，让下游仍按普通材质走。
+    if(cam.perfAblationStage.x == 20u)
+    {
+        specularSample = vec4(0.5, 0.0, 0.0, 1.0);
+    }
+    else
+    {
+        specularSample =
+            textureLod(
+                specularAtlas,
+                pbrTexCoord,
+                pbrLod
+            );
+    }
 }
 // =====================================================
 // LabPBR emissive mask
@@ -1720,12 +1753,36 @@ float emissiveAlpha =
 
 if(!isWaterMaterial)
 {
-    emissiveAlpha =
-        texelFetch(
-            specularAtlas,
-            emissiveTexel,
-            0
-        ).a;
+    // 2026-10-29 消融档 21「noEmissive」：第 5 次图集读取的价格。
+    // 它和档 20 读的是同一张 specularAtlas，但一个要线性过滤、一个要精确纹素
+    // （_s.a 的 255 = 非自发光，过滤会造出假发光）⇒ 两者无法合并，必须分开量。
+    if(cam.perfAblationStage.x == 21u)
+    {
+        emissiveAlpha = 1.0;
+    }
+    else if(cam.perfAblationStage.x != 33u &&
+            specularSample.a >= 1.0)
+    {
+        // 2026-10-30：无损跳过那次 texelFetch。
+        //
+        // specularSample 是 textureLod(specularAtlas, pbrTexCoord, pbrLod) 的双线性结果。
+        // 权重和为 1、每项 <= 1 ⇒ 若结果精确等于 1.0，则参与加权的 4 个纹素**必然全是 1.0**
+        // ⇒ emissiveTexel（就在这个 UV 上）那一个也必然是 255 = 非自发光 ⇒ emissive = 1.0。
+        //
+        // 非发光方块占绝大多数，所以多数命中都会走这一支；观感逐位不变。
+        // 米字：mip（含默认的次级 mip+2）下采样对全 255 区域仍是精确 1.0，判据依然成立。
+        // 回退：消融档 33（emissiveFetch）强制走下面的 texelFetch。
+        emissiveAlpha = 1.0;
+    }
+    else
+    {
+        emissiveAlpha =
+            texelFetch(
+                specularAtlas,
+                emissiveTexel,
+                0
+            ).a;
+    }
 }
 // R : perceptual smoothness -> linear roughness
 float perceptualSmoothness =
@@ -1736,12 +1793,16 @@ float perceptualSmoothness =
     );
 
 
+// 2026-10-29 消融档 24「noLabPbrMath」：roughness 的 pow 与后续 F0 解码的
+// 数学价格（对照组：如果它很小，说明钱全在采样而不是算力）。
 float roughness =
-    pow(
-        1.0 -
-        perceptualSmoothness,
-        2.0
-    );
+    (cam.perfAblationStage.x == 24u)
+        ? 0.5
+        : pow(
+            1.0 -
+            perceptualSmoothness,
+            2.0
+        );
 
 
 // G : preserve exact LabPBR F0 / metal encoding.

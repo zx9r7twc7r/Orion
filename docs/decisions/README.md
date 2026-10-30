@@ -23,6 +23,8 @@
 | [`object-accounting.md`](object-accounting.md) | 对象创建总账（诊断）：为什么在 vkAllocMB 之外还要逐个 `vkCreate*` 记账，2026-10-15 两局读数 |
 | [`russian-roulette.md`](russian-roulette.md) | RR 生存率曲线与参考实现的定量对比；地板是方差取舍不是偏倚；η² 在薄壁玻璃下恒为 1；"照抄参考 RR"为何被否决 |
 | [`sharc-default-off.md`](sharc-default-off.md) | SHaRC 默认关闭的现状；为什么管线门控写在 `ensureSharcUpdatePipeline()` 内部（114 秒教训）；关闭后的 GI 成本结构与构建侧死重 |
+| [`cloud-lightstep-perf.md`](cloud-lightstep-perf.md) | 体积云光步降档：光步占云 pass 6~8 成采样量、参考的 mip 机制在本仓空转、两个开关的实测加速（1.33×）与外观代价；地球遮挡为何被否决 |
+| [`cloud-coverage-size-split.md`](cloud-coverage-size-split.md) | 云量与云大小解耦（presence 遮罩 + 常数阈值、按 R 分布标定 presCut、大小滑条方向修正）、天气图 1024²→512² 与少一档倍频、3D 噪声 mip 链（本机收益为 0 的实测） |
 
 其它文档：
 

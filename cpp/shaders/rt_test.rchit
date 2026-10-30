@@ -2146,7 +2146,13 @@ void main()
     //
     // 生产档（stage 0）走 else 分支，零成本。观感在本档下明显变灰，仅供计数。
     // =====================================================================
-    if(cam.perfAblationStage.x == 17u)
+    // 2026-10-30：28/29/30 是「无材质 + 关掉某类次级射线」的组合臂，
+    // 材质求值同样跳过（档号见 VulkanCore.cpp 的档位表）。
+    // ⚠ 必须写成闭区间 [28,30]：原来只写 `>= 28u` 时，档 31（OMM 4 态对照）
+    //   也被吞进来，量到的是「无材质 + 关 GI」，而不是 4 态 OMM。
+    if(cam.perfAblationStage.x == 17u ||
+       (cam.perfAblationStage.x >= 28u &&
+        cam.perfAblationStage.x <= 30u))
     {
         payload.albedo = vec3(0.18);
         payload.normal = -normalize(gl_WorldRayDirectionEXT);

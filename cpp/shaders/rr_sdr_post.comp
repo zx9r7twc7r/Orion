@@ -1115,6 +1115,23 @@ void main()
 
     vec4 color = imageLoad(rrOutputImage, p);
 
+    // 2026-10-30：NaN / Inf 清洗 —— 与 rr_hdr_encode.comp:104-110 对齐。
+    //
+    // 实测：RT 帧里确实存在 NaN（HDR 链早就在入口 scrub，注释原文
+    // "Denormals, inf and NaN all reach here from the path-traced frame and
+    //  would survive the pow() chain as NaN once written to the target"）。
+    // SDR 链此前只对 stableRadiance 做过 isnan（且那个分支编译期关闭），
+    // 入口的 color.rgb 完全没防护 ⇒ NaN 穿过 tonemap → pow() → 写进目标，
+    // 屏幕表现为画面中心一块椭圆区域"透出下层"。
+    // 切到 HDR 后该症状消失，正是因为 HDR 链在这里已经清洗过。
+    //
+    // 注意：这是**止血**，不是根治 —— NaN 的真正来源（某个材质/光照计算
+    // 产生 0/0 或 log(负数)）仍需单独排查。
+    // bvec3 不能用 ||，逐分量 mix 两次（写法与 rr_hdr_encode.comp 一致）。
+    color.rgb = mix(color.rgb, vec3(0.0), isnan(color.rgb));
+    color.rgb = mix(color.rgb, vec3(0.0), isinf(color.rgb));
+    color.rgb = max(color.rgb, vec3(0.0));
+
 #if RR_STABLE_GLASS_RADIANCE
 #ifndef POST_SKIP_STABLE
 #define POST_SKIP_STABLE 0

@@ -1944,7 +1944,7 @@ static uint32_t perfL10AblationRequestedStage()
             return PERF_L10_ABLATION_OFF;
         }
         const std::string text(raw);
-        // 级表长度 **20**（PERF_L10_ABLATION_STAGE_COUNT 在本函数之后才定义，所以
+        // 级表长度 **34**（PERF_L10_ABLATION_STAGE_COUNT 在本函数之后才定义，所以
         // 这里只能写字面量；两处 % 15 都是"静默取模"，改动级数时必须同步改，
         // 否则 ORION_PERF_ABLATION=16 会被折成 1 = noRtao —— 完全错误的臂）。
         const std::size_t alt = text.find("alt:");
@@ -1963,7 +1963,7 @@ static uint32_t perfL10AblationRequestedStage()
                 if(value >= 0)
                 {
                     g_perfL10AblationAltStages.push_back(
-                        static_cast<uint32_t>(value % 20));
+                        static_cast<uint32_t>(value % 34));
                 }
                 if(comma == std::string::npos)
                 {
@@ -1983,7 +1983,7 @@ static uint32_t perfL10AblationRequestedStage()
         {
             return PERF_L10_ABLATION_SWEEP;
         }
-        return static_cast<uint32_t>(value % 20);
+        return static_cast<uint32_t>(value % 34);
     }();
     return request;
 }
@@ -2018,7 +2018,12 @@ constexpr uint64_t PERF_L10_ABLATION_FRAMES_PER_STAGE = 120u;
 // 毫秒里没有任何一项能归因到体素遍历 —— 它是"优化 DDA 这一大块"的前置口径。
 // 2026-10-29 追加 "noMatEval"（stage 17）：命中后跳过材质解析（上界口径）。
 // 2026-10-29 再追加 18 "noPom" / 19 "noPomSelfShadow"（拆材质求值内部）。
-constexpr uint32_t PERF_L10_ABLATION_STAGE_COUNT = 20u;
+// 2026-10-29 再追加 20-24（拆材质求值内部的图集采样/数学）。
+// 2026-10-29 再追加 25/26（反射 tMax）/ 27（次级 mip+2）。
+// 2026-10-30 再追加 28/29/30（组合臂，拆「非材质」那 ~8 ms）。
+// 2026-10-30 再追加 31（secOmm4State：次级射线回到 4 态 OMM，作 2 态的对照）。
+// 2026-10-30 再追加 32（反射距离预算关）/ 33（emissive 强制 texelFetch）。
+constexpr uint32_t PERF_L10_ABLATION_STAGE_COUNT = 34u;
 
 // Must stay in the same order as the stage table in shaders/rt_test.rgen.
 static const char* const PERF_L10_ABLATION_STAGE_NAMES
@@ -2043,7 +2048,21 @@ static const char* const PERF_L10_ABLATION_STAGE_NAMES
     "noVoxelDda",    // 2026-10-13：关掉体素 DDA 遍历（棱缝门 + 本地光二级弹射）
     "noMatEval",     // 2026-10-29：命中后跳过材质解析（量"材质求值"的价格上界）
     "noPom",         // 2026-10-29：getPOMDepthScale()=0 ⇒ POM 主 march + 自阴影全走早退
-    "noPomSelfShadow"// 2026-10-29：只关 POM 自阴影（24 采样），主 march 照跑
+    "noPomSelfShadow",// 2026-10-29：只关 POM 自阴影（24 采样），主 march 照跑
+    "noSpecular",      // 2026-10-29：specularAtlas textureLod 返回常量
+    "noEmissive",      // 2026-10-29：specularAtlas texelFetch(_s.a) 返回常量
+    "noNormalResample",// 2026-10-29：POM 面第二次 normalAtlas 采样复用 base
+    "noAlbedoFetch",   // 2026-10-29：blockAtlas 的 albedo 采样返回常量
+    "noLabPbrMath",    // 2026-10-29：roughness 的 pow 换成常量
+    "glossyTMax48",    // 2026-10-29：反射射线 tMax 截到 48 格
+    "glossyTMax96",    // 2026-10-29：反射射线 tMax 截到 96 格
+    "secMipBias2",     // 2026-10-29：次级命中强制 mip+2
+    "noMatMainOnly",   // 2026-10-30：无材质 + 只主射线（=stage4 禁用集）
+    "noMatNoGlossy",   // 2026-10-30：无材质 + 关光泽
+    "noMatNoGi",       // 2026-10-30：无材质 + 关 GI
+    "secOmm4State",    // 2026-10-30：次级辐射射线回到 4 态 OMM（2 态的对照组）
+    "glossyBudgetOff", // 2026-10-30：反射射线 tMax 回到 10000（距离预算的对照组）
+    "emissiveFetch"    // 2026-10-30：emissive 强制 texelFetch（无损跳过的对照组）
 };
 
 static uint32_t g_perfL10AblationStage = 0u;
@@ -17705,6 +17724,138 @@ static constexpr uint64_t SPATIAL_SECTION_KEY_MASK =
     (1ull << 60ull) - 1ull;
 
 // =====================================================
+// 2026-10-29 合并 BLAS：桶键 + 分布统计（本期只统计，不参与构建）
+//
+// 目标：把"一段一份 BLAS"改成"一个桶一份 BLAS"。桶 = 同一 geometry class 下、
+// 同一个 8x8x8 Section 区域（= 128x128x128 格）内的全部 Section。
+//
+// 为什么桶键必须带 class 位：TLAS 实例的 mask 与 SBT record offset 都是 per-class
+// 的单值（opaque 0xff / alpha 0xfb / 本地玩家 0x02 / 粒子 0xf7；SBT 0/1/2/3/4，
+// 见 rebuildWorldGeometry 里 instance.mask 与 instanceShaderBindingTableRecordOffset
+// 的赋值），而一个桶只产生一个实例 —— 跨 class 合并会让 mask/SBT 语义直接错位。
+//
+// 位布局取自 packSectionKey（引数与掩码必须与它逐位一致）：
+//   bits  0..21 = sectionX（22 位，有符号）
+//   bits 22..43 = sectionZ（22 位，有符号）
+//   bits 44..59 = sectionY（16 位，有符号）
+//   bits 60..63 = layerId —— 本工程里它就是 geometry class
+// =====================================================
+// 2026-10-29 实测（849 个 class 条目）：region=8 chunk 时
+//   [MERGE] buckets=25 avgMembers=33 maxMembers=183 over24=10
+// 单个桶 183 段 ⇒ refit 成本约 20 万三角形，改一个方块就要重刷整桶，不可接受。
+// 体积比是立方 ⇒ 收到 4 chunk（64 格）后 avg≈4 / max≈23，正好落在成员上限内。
+constexpr uint32_t SECTION_BUCKET_REGION_CHUNKS_LOG2 =
+    2u;                                   // 4 个 chunk（64 格）成一桶
+constexpr uint32_t SECTION_BUCKET_MAX_MEMBERS =
+    24u;                                  // 单桶成员上限（超出即分桶，待实测调）
+
+static int32_t rtSignExtendBits(uint64_t raw, uint32_t bits)
+{
+    const uint64_t mask = (1ull << bits) - 1ull;
+    const uint64_t signBit = 1ull << (bits - 1u);
+    const uint64_t value = raw & mask;
+
+    if((value & signBit) == 0ull)
+    {
+        return static_cast<int32_t>(value);
+    }
+
+    // 取低 32 位的补码表示即为所求（bits <= 22，一定落在 int32 范围内）。
+    return static_cast<int32_t>(
+        static_cast<uint32_t>(value | ~mask));
+}
+
+static int32_t rtFloorDivPow2(int32_t value, uint32_t shift)
+{
+    return value >= 0
+        ? (value >> shift)
+        : ~((~value) >> shift);
+}
+
+static uint64_t rtSectionBucketKeyOf(uint64_t classKey)
+{
+    const uint64_t spatialKey = classKey & SPATIAL_SECTION_KEY_MASK;
+
+    const uint32_t geometryClass =
+        static_cast<uint32_t>((classKey >> 60u) & 0xFull);
+
+    const int32_t regionX = rtFloorDivPow2(
+        rtSignExtendBits(spatialKey & 0x3FFFFFull, 22u),
+        SECTION_BUCKET_REGION_CHUNKS_LOG2);
+
+    const int32_t regionZ = rtFloorDivPow2(
+        rtSignExtendBits((spatialKey >> 22u) & 0x3FFFFFull, 22u),
+        SECTION_BUCKET_REGION_CHUNKS_LOG2);
+
+    const int32_t regionY = rtFloorDivPow2(
+        rtSignExtendBits((spatialKey >> 44u) & 0xFFFFull, 16u),
+        SECTION_BUCKET_REGION_CHUNKS_LOG2);
+
+    // regionX/regionZ 落在 [-2^18, 2^18)，+2^20 后必为正且占 22 位；
+    // regionY 落在 [-4096, 4095]，+4096 后占 13 位。
+    uint64_t bucketKey = static_cast<uint64_t>(geometryClass & 0x7u);
+
+    bucketKey |= static_cast<uint64_t>(
+        static_cast<uint32_t>(regionX + 0x100000)) << 3u;
+    bucketKey |= static_cast<uint64_t>(
+        static_cast<uint32_t>(regionZ + 0x100000)) << 25u;
+    bucketKey |= static_cast<uint64_t>(
+        static_cast<uint32_t>(regionY + 0x1000)) << 47u;
+
+    return bucketKey;
+}
+
+static void rtLogSectionBucketStats()
+{
+    if(g_sectionBLAS.empty())
+    {
+        return;
+    }
+
+    std::unordered_map<uint64_t, uint32_t> bucketMembers;
+    bucketMembers.reserve(g_sectionBLAS.size());
+
+    for(const auto& entry : g_sectionBLAS)
+    {
+        ++bucketMembers[rtSectionBucketKeyOf(entry.first)];
+    }
+
+    size_t maxMembers = 0u;
+    size_t overLimit = 0u;
+    size_t memberSum = 0u;
+
+    for(const auto& bucket : bucketMembers)
+    {
+        const size_t members = static_cast<size_t>(bucket.second);
+
+        memberSum += members;
+
+        if(members > maxMembers)
+        {
+            maxMembers = members;
+        }
+
+        if(members > SECTION_BUCKET_MAX_MEMBERS)
+        {
+            ++overLimit;
+        }
+    }
+
+    std::ostringstream line;
+    line
+        << "[MERGE] sections=" << g_sectionBLAS.size()
+        << " buckets=" << bucketMembers.size()
+        << " avgMembers="
+        << (memberSum / std::max<size_t>(bucketMembers.size(), 1u))
+        << " maxMembers=" << maxMembers
+        << " over" << SECTION_BUCKET_MAX_MEMBERS << "=" << overLimit
+        << " (region=" << (1u << SECTION_BUCKET_REGION_CHUNKS_LOG2)
+        << " chunks)";
+
+    RTLog(line.str());
+}
+
+// =====================================================
 // 2026-10-24 TLAS 主射线掩码剔除（项 1：原版可见性图）
 //
 // 数据源：Java 侧每帧把 LevelRenderer.visibleSections()（26.3 源码 :1289）
@@ -30764,7 +30915,7 @@ static void recordSharcUpdate(VkCommandBuffer cmd, uint32_t width, uint32_t heig
     // 比 Remix Ultra 的 82,944 多 56%，且分辨率越高越贵。成本 ∝ 1/BLOCK² ⇒ 5 约为 4 的 64%。
     // ⚠ 必须与 shader 同步：dispatch 发 ceil(w/BLOCK) 个块坐标，shader 用
     //   sharcBlock * BLOCK + sharcUpdateBlockOffset(block) 还原像素，两边不一致就覆盖不到全屏。
-    const uint32_t sharcUpdateBlock = 5u;
+    const uint32_t sharcUpdateBlock = 3u;
     const uint32_t sharcUpdateWidth =
         std::max(1u, (width + sharcUpdateBlock - 1u) / sharcUpdateBlock);
     const uint32_t sharcUpdateHeight =
@@ -68607,6 +68758,16 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
             {
                 const char* raw = std::getenv("ORION_SECONDARY_MIP_BIAS");
 
+                // 2026-10-30：默认值**保持 0**（曾试过 2.0，已撤回）。
+                //
+                // 收益是真的：同局 A/B（alt:0,27，143 窗口）base 21.31 -> 19.88，
+                // Δ = 1.43 ms（6.7%），15 对相邻窗口全在 1.2~1.8 ms。
+                // 但实机副作用不可接受：次级命中（GI / 反射）的材质被抬两级 mip，
+                // mip 是下采样平均 ⇒ 方块贴图的平均色亮于其暗部像素 ⇒
+                // **室内 / 无光环境整体被抬亮**（法线同样被平均，光照响应也变）。
+                //
+                // 因此改为 opt-in：需要这 1.43 ms 时设 ORION_SECONDARY_MIP_BIAS=1~3。
+                // 默认 0.0f ⇒ 与改动前逐位相同。
                 if(raw == nullptr || raw[0] == '\0')
                 {
                     return 0.0f;
@@ -75582,6 +75743,10 @@ static void logNativeMemoryReport()
         << " | churnTop:" << vkChurn;
 
     RTLog(report.str());
+
+    // 2026-10-29 合并 BLAS：桶分布，与 [RT MEM] 同节奏（约每 10s 一条）。
+    // 只读 g_sectionBLAS，不写任何 GPU 资源；改完必须重编 DLL。
+    rtLogSectionBucketStats();
 }
 
 

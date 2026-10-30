@@ -61,7 +61,13 @@ Java 约 150 行。风险集中在单个 2.6MB TU，**必须用 `.tmp/patch_*.py
 
 1. 在 `FirstPersonHandsAndItemsRenderer.submitHandsWithItems` 上开窗（该类存在，
    等价于 `beginHandPhase/endHandPhase`），并**去掉那段贴图替换的诊断代码**；
-2. 手部几何改用"相机相对 + view→world 旋转"（`EntityRtCapture.java:1382-1402` 已有）；
+2. ~~手部几何改用"相机相对 + view→world 旋转"（`EntityRtCapture.java:1382-1402` 已有）~~ ——
+   **2026-10-25 更正：这一步不需要，而且现有实现有害。** MC 26.3 的
+   `GameRenderer.renderItemInHand`（`GameRenderer.java:382-396`）在提交前已经
+   `poseStack.mulPose(viewRotationMatrix.invert())`，交出来的顶点就是"世界朝向 + 相机相对"，
+   与实体层约定一致。因此 `handRotation` / `handTransformMode` 那套旋转与三选一启发式
+   建立在错误前提上，正确处理是删除（详见根目录
+   `HANDOFF-2026-10-25-FIRST-PERSON-HANDS.md` §2.1）；
 3. **抑制原版光栅手**（否则双重手影），这要改 `renderItemInHand` 的注入语义 ——
    正是当年"手看不见"那个 bug 的修复点，回归风险最高；
 4. 透视校正：视空间 XY 统一缩放 `k = tan(fovMain/2) / tan(fovViewModel/2)`（针孔相机下

@@ -5,6 +5,9 @@
 #extension GL_GOOGLE_include_directive : require
 
 #extension GL_EXT_ray_tracing : require
+// 2026-10-30 方案 A：次级辐射射线要用 gl_RayFlagsForceOpacityMicromap2StateEXT，
+// glslang 要求显式请求该扩展（否则报 "required extension not requested"）。
+#extension GL_EXT_opacity_micromap : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #ifdef RT_ENABLE_SER
 #extension GL_EXT_shader_invocation_reorder : require
@@ -588,7 +591,7 @@ void sharcProbeWriteBack()
 // 1080p 下 129,600 条 update 路径/帧，比 Remix Ultra 的 82,944 多付 56%，且分辨率越高越贵。
 // 覆盖率下降的代价由 update 侧关轮盘 + firefly clamp 100× 补（先把方差压下来）。
 // 必须与 VulkanCore.cpp 的 sharcUpdateBlock 一致（dispatch 尺寸由宿主按同一个块算）。
-#define SHARC_UPDATE_BLOCK 5
+#define SHARC_UPDATE_BLOCK 3
 
 // 2026-10-25（对齐 RTX Remix 的 SHaRC 口径）：update pass 改为**块级 dispatch**。
 //
@@ -728,25 +731,33 @@ uint perfL10Stage()
     // 上限 16：14 = "强制关 GI 轮盘"（2026-10-07 轮盘改成默认开后补的级）；
     //          15 = "间接/反射命中免 POM"（2026-10-12 补，rchit 侧读取同一个档位）；
     //          16 = "关掉体素 DDA 遍历"（2026-10-13 补，见 perfL10DisableVoxelDda）。
-    return clamp(cam.perfAblationStage.x, 0u, 16u);
+    // 2026-10-30：上限从 16 放宽到 31。28/29/30 是「无材质 + 关掉某类次级射线」
+    // 的组合臂；31 是 OMM 4 态对照组。**加档必须同步这里**，否则新档会被静默折成
+    // 上限值（本坑今天已经踩过一次：31 被折成 30 = noMatNoGi，量出来的是错的臂）。
+    return clamp(cam.perfAblationStage.x, 0u, 33u);
 }
 
 bool perfL10DisableRtao()
 {
     return perfL10Stage() == 1u ||
-           perfL10Stage() == 4u;
+           perfL10Stage() == 4u ||
+           perfL10Stage() == 28u;
 }
 
 bool perfL10DisableGlossy()
 {
     return perfL10Stage() == 2u ||
-           perfL10Stage() == 4u;
+           perfL10Stage() == 4u ||
+           perfL10Stage() == 28u ||
+           perfL10Stage() == 29u;
 }
 
 bool perfL10DisableDiffuseGi()
 {
     return perfL10Stage() == 3u ||
-           perfL10Stage() == 4u;
+           perfL10Stage() == 4u ||
+           perfL10Stage() == 28u ||
+           perfL10Stage() == 30u;
 }
 
 bool perfL10DisableG2bLocalGuide()
@@ -994,9 +1005,38 @@ float perfGiTraceMaxDistance(float baseMax)
 //   · 可见性射线必须保持双面：太阳方向的可见性取正反两份的并集，用来填补
 //     草丛底部影子的漏光缝隙（宿主侧 instance.flags 那段说明）。
 // =====================================================
-const uint SECONDARY_TRAVERSE_FLAGS =
+// 2026-10-30 方案 A：辐射类次级射线强制 OMM 2 态近似。
+//
+// 依据 NVIDIA《Path Tracing Optimizations in Indiana Jones》(2025-05-15)：
+// 间接光射线用 gl_RayFlagsForceOpacityMicromap2StateEXT，让 RTCore 直接按
+// 2 态（不透明 / 透明）回答，**完全避免 shader 内 alpha 测试**；阴影射线必须
+// 保持 4 态保守，否则漏光 —— 本常量不用于可见性射线，所以那条约束自动满足。
+//
+// 现状：OMM 已建（[RT MEM] omm=322 ommMB=76.3），但 4 态的 unknown 态仍会调
+// rt_test.rahit 的 alpha 测试，而 anyhit 会打断硬件求交搜索（NVIDIA
+// 《Creating Optimal Meshes for Ray Tracing》：成本 ∝ 光线穿过的 alpha 层数）。
+//
+// 回退：删掉第三项即回到 4 态。
+const uint SECONDARY_TRAVERSE_FLAGS_4STATE =
     gl_RayFlagsNoneEXT |
     gl_RayFlagsCullBackFacingTrianglesEXT;
+
+const uint SECONDARY_TRAVERSE_FLAGS_2STATE =
+    SECONDARY_TRAVERSE_FLAGS_4STATE |
+    gl_RayFlagsForceOpacityMicromap2StateEXT;
+
+// 2026-10-30 方案 A/B：**默认 4 态**（= 改动前行为）。
+//
+// 曾经默认 2 态（NVIDIA Indiana Jones 间接光做法），但同局 A/B 实测收益 **0.00**
+// （base 15.09 vs 4 态 15.09，56 窗口），而它对次级射线的 alpha 判定有实际影响：
+// 把 2 态与次级 mip 一起关掉后室内明显变暗，说明它会改变 GI/反射的透光量。
+// 零收益 + 有副作用 ⇒ 默认回退到 4 态。
+//
+// 保留两个常量与函数壳，因为档 31 仍是“强制 4 态”的对照臂，将来换硬件/驱动可复测。
+uint secondaryTraverseFlags()
+{
+    return SECONDARY_TRAVERSE_FLAGS_4STATE;
+}
 
 // Binding 34 (the old 256x256 wavefront-area caustic map) is deliberately no
 // longer declared here.  Water caustics are analytic now; see
@@ -7739,7 +7779,7 @@ void traceDiffuseSer(vec3 origin, vec3 direction, uint bouncePhase)
         0.001,
         direction,
         perfGiTraceMaxDistance(10000.0),
-        SECONDARY_TRAVERSE_FLAGS,
+        secondaryTraverseFlags(),
         0xff,
         bouncePhase
     );
@@ -8934,7 +8974,7 @@ const float WATER_EXTINCTION_DISTANCE =
                 0.02,
                 currentDir,
                 10000.0,
-                SECONDARY_TRAVERSE_FLAGS,
+                secondaryTraverseFlags(),
                 0xff,
                 step
             );
@@ -8944,7 +8984,7 @@ const float WATER_EXTINCTION_DISTANCE =
         {
             traceRayEXT(
                 topLevelAS,
-                SECONDARY_TRAVERSE_FLAGS,
+                secondaryTraverseFlags(),
                 0xff,
                 0,
                 0,
@@ -13582,7 +13622,7 @@ vec3 traceGlassSceneReflectionOneRay(
             0.02,
             reflectionDirection,
             10000.0,
-            SECONDARY_TRAVERSE_FLAGS,
+            secondaryTraverseFlags(),
             0xff,
             0u
         );
@@ -13592,7 +13632,7 @@ vec3 traceGlassSceneReflectionOneRay(
     {
         traceRayEXT(
             topLevelAS,
-            SECONDARY_TRAVERSE_FLAGS,
+            secondaryTraverseFlags(),
             0xff,
             0,
             0,
@@ -14357,7 +14397,7 @@ vec3 traceTransparentLowCostGI(
             0.02,
             giDirection,
             10000.0,
-            SECONDARY_TRAVERSE_FLAGS,
+            secondaryTraverseFlags(),
             0xff,
             0u
         );
@@ -14367,7 +14407,7 @@ vec3 traceTransparentLowCostGI(
     {
         traceRayEXT(
             topLevelAS,
-            SECONDARY_TRAVERSE_FLAGS,
+            secondaryTraverseFlags(),
             0xff,
             0,
             0,
@@ -15592,7 +15632,7 @@ vec3 tracePrimarySimpleGlassRadiance(
             0.01,
             straightDirection,
             10000.0,
-            SECONDARY_TRAVERSE_FLAGS,
+            secondaryTraverseFlags(),
             0xff,
             0u
         );
@@ -15602,7 +15642,7 @@ vec3 tracePrimarySimpleGlassRadiance(
     {
         traceRayEXT(
             topLevelAS,
-            SECONDARY_TRAVERSE_FLAGS,
+            secondaryTraverseFlags(),
             0xff,
             0,
             0,
@@ -16051,7 +16091,7 @@ vec3 tracePrimaryGenericTransparentRadiance(
             0.01,
             straightDirection,
             10000.0,
-            SECONDARY_TRAVERSE_FLAGS,
+            secondaryTraverseFlags(),
             0xff,
             0u
         );
@@ -16061,7 +16101,7 @@ vec3 tracePrimaryGenericTransparentRadiance(
     {
         traceRayEXT(
             topLevelAS,
-            SECONDARY_TRAVERSE_FLAGS,
+            secondaryTraverseFlags(),
             0xff,
             0,
             0,
@@ -17374,7 +17414,7 @@ const float WATER_EXTINCTION_DISTANCE =
                 0.001,
                 currentDirection,
                 10000.0,
-                SECONDARY_TRAVERSE_FLAGS,
+                secondaryTraverseFlags(),
                 0xff,
                 pathStep
             );
@@ -17383,7 +17423,7 @@ const float WATER_EXTINCTION_DISTANCE =
 #endif
         {
             traceRayEXT(
-                topLevelAS, SECONDARY_TRAVERSE_FLAGS, 0xff, 0, 0, 0,
+                topLevelAS, secondaryTraverseFlags(), 0xff, 0, 0, 0,
                 currentOrigin, 0.001, currentDirection, 10000.0, 0
             );
         }
@@ -17582,7 +17622,7 @@ vec3 tracePrimaryWaterReceiverIndirect(
                 0.001,
                 currentDirection,
                 10000.0,
-                SECONDARY_TRAVERSE_FLAGS,
+                secondaryTraverseFlags(),
                 0xff,
                 pathStep
             );
@@ -17592,7 +17632,7 @@ vec3 tracePrimaryWaterReceiverIndirect(
         {
             traceRayEXT(
                 topLevelAS,
-                SECONDARY_TRAVERSE_FLAGS,
+                secondaryTraverseFlags(),
                 0xff,
                 0,
                 0,
@@ -17950,7 +17990,7 @@ const vec3 WATER_SCATTER_COLOR = waterScatterColor();
                 0.01,
                 currentDirection,
                 10000.0,
-                SECONDARY_TRAVERSE_FLAGS,
+                secondaryTraverseFlags(),
                 0xff,
                 step
             );
@@ -17960,7 +18000,7 @@ const vec3 WATER_SCATTER_COLOR = waterScatterColor();
         {
             traceRayEXT(
                 topLevelAS,
-                SECONDARY_TRAVERSE_FLAGS,
+                secondaryTraverseFlags(),
                 0xff,
                 0,
                 0,
@@ -18003,7 +18043,7 @@ if(payload.hitDistance < 0.0)
                 0.01,
                 waterEntryDirection,
                 10000.0,
-                SECONDARY_TRAVERSE_FLAGS,
+                secondaryTraverseFlags(),
                 0xff,
                 step
             );
@@ -18013,7 +18053,7 @@ if(payload.hitDistance < 0.0)
         {
             traceRayEXT(
                 topLevelAS,
-                SECONDARY_TRAVERSE_FLAGS,
+                secondaryTraverseFlags(),
                 0xff,
                 0,
                 0,
@@ -18697,6 +18737,39 @@ vec3 tracePrimaryGlossyReflectionRadiance(
 {
     firstSpecularHitDistance =
         65504.0;
+
+    // 2026-10-29 消融档 25/26：反射射线的距离上限。
+    // 动机见档 24（noLabPbrMath）的同局实测：只把 roughness 换成常量 0.5，
+    // trace 就从 16.30 掉到 9.91 ⇒ 钱在"反射射线打到哪里"，不在射线数。
+    // 这里只截 tMax，材质 / 方向 / 采样数一概不动；超距按 miss 处理（rmiss 给天空色），
+    // 所以观感是"远处反射变空"，属探针专用。
+    // 2026-10-30 默认：反射射线距离预算 96 格（原来是 10000 = 不限）。
+    //
+    // 依据同局 A/B（alt:0,25/26）：tMax=96 -> 1.85 ms，tMax=48 -> 1.95 ms，
+    // 两者几乎相同 ⇒ 省下的钱来自「打空的射线不必走完整个 BVH」，
+    // 而不是「打到远处几何」。96 格以内的反射完全正确。
+    //
+    // 回退：消融档 32（glossyBudgetOff）回到 10000；
+    //       或把下面的 kGlossyRayBudget 改回 10000.0f。
+    // 2026-10-30 回退：96 -> 10000。tMax 截断会让"本该打到远处几何"的反射
+    // 回落到天空色，天空明显更亮 ⇒ 室内被整体抬亮（用户实机反馈）。
+    // 这条副作用当初评估不足；收益 1.85 ms 先放弃，探针档 25/26/32 保留以便复测。
+    const float kGlossyRayBudget = 10000.0;
+
+    float glossyRayMaxDistance =
+        (cam.perfAblationStage.x == 32u)
+            ? 10000.0
+            : kGlossyRayBudget;
+
+    if(cam.perfAblationStage.x == 25u)
+    {
+        glossyRayMaxDistance = 48.0;
+    }
+    else if(cam.perfAblationStage.x == 26u)
+    {
+        glossyRayMaxDistance = 96.0;
+    }
+
     const float WATER_IOR =
         1.33;
 
@@ -18792,8 +18865,8 @@ for(
                 currentOrigin,
                 0.001,
                 currentDirection,
-                10000.0,
-                SECONDARY_TRAVERSE_FLAGS,
+                glossyRayMaxDistance,
+                secondaryTraverseFlags(),
                 0xff,
                 pathStep
             );
@@ -18803,7 +18876,7 @@ for(
         {
             traceRayEXT(
                 topLevelAS,
-                SECONDARY_TRAVERSE_FLAGS,
+                secondaryTraverseFlags(),
                 0xff,
                 0,
                 0,
@@ -18811,7 +18884,7 @@ for(
                 currentOrigin,
                 0.001,
                 currentDirection,
-                10000.0,
+                glossyRayMaxDistance,
                 0
             );
         }
@@ -19605,7 +19678,7 @@ float traceWaterReflectedSun(
             0.02,
             toWaterDir,
             10000.0,
-            SECONDARY_TRAVERSE_FLAGS,
+            secondaryTraverseFlags(),
             0xff,
             0u
         );
@@ -19615,7 +19688,7 @@ float traceWaterReflectedSun(
     {
         traceRayEXT(
             topLevelAS,
-            SECONDARY_TRAVERSE_FLAGS,
+            secondaryTraverseFlags(),
             0xff,
             0,
             0,
@@ -21552,7 +21625,7 @@ if (matId > 0.5 && matId < 2.5) {
                             0.01,
                             rrWaterReflectionDir,
                             10000.0,
-                            SECONDARY_TRAVERSE_FLAGS,
+                            secondaryTraverseFlags(),
                             0xff,
                             s
                         );
@@ -21562,7 +21635,7 @@ if (matId > 0.5 && matId < 2.5) {
                     {
                         traceRayEXT(
                             topLevelAS,
-                            SECONDARY_TRAVERSE_FLAGS,
+                            secondaryTraverseFlags(),
                             0xff,
                             0,
                             0,
@@ -24787,10 +24860,10 @@ while(
                     }
                     else
                     {
-                        traceRayEXT(topLevelAS, SECONDARY_TRAVERSE_FLAGS, 0xff, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
+                        traceRayEXT(topLevelAS, secondaryTraverseFlags(), 0xff, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
                     }
 #else
-                    traceRayEXT(topLevelAS, SECONDARY_TRAVERSE_FLAGS, 0xff, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
+                    traceRayEXT(topLevelAS, secondaryTraverseFlags(), 0xff, 0, 0, 0, currentOrigin, 0.001, currentDir, perfGiTraceMaxDistance(10000.0), 0);
 #endif
 
 if (payload.hitDistance < 0.0) {
@@ -27244,7 +27317,7 @@ if (cam.dhFarFieldParams.x > 0.5
 
                     traceRayEXT(
                         topLevelAS,
-                        SECONDARY_TRAVERSE_FLAGS,
+                        secondaryTraverseFlags(),
                         0xff,
                         0,
                         0,
