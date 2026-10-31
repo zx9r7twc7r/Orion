@@ -18,10 +18,6 @@
 // 着色器侧只做还原，不做任何算术决定（容量必须与 C++ 真正分配的元素数逐位一致）。
 // ============================================================================
 
-// 2026-10-11 5b-4：update pass 的粗糙度阈值（参考默认 0.4：PathtracerUi.h:160，
-// 用法是 Pathtracer.hlsl:544-546 的 `material.roughness = max(sharcRoughnessThreshold,
-// material.roughness)`，只在 SHARC_UPDATE 变体里生效）—— 缓存只用"足够漫反射"的
-// 表面来建，查询侧不受影响。
 #define SHARC_ROUGHNESS_THRESHOLD 0.4
 
 // 缓存四块缓冲的 64 位设备地址。分量顺序与 C++ 侧逐位一致：
@@ -44,14 +40,10 @@ uint64_t sharcCacheAddress(uint sharcSlot)
 //       3 → 4 的差就是 query 的贡献，4 → 0 的差就是缓存维护的代价。
 uint sharcMode()
 {
-    // 逐项检查而不是只看某一个分量：将来若只部分创建成功、或 C++ 侧在缓存清零完成
-    // 之前只下发了一半，也必须整体拒绝 —— 绝不能把空地址或未清零的缓存交给
-    // buffer_reference（那会直接读到别的显存或数据垃圾）。
-    if(cam.sharcCacheParams.x == 0u) // sceneScale；0 = 宿主未启用
+    if(cam.sharcCacheParams.x == 0u)
     {
         return 0u;
     }
-
     for(uint sharcSlot = 0u; sharcSlot < 4u; ++sharcSlot)
     {
         if(cam.sharcBuffersLo[sharcSlot] == 0u &&
@@ -83,22 +75,16 @@ SharcParameters sharcBuildParameters()
 {
     SharcParameters sharcParameters;
 
-    // 哈希网格参数。cameraPosition 取本帧相机世界位置（体素层级按到相机的距离选，
-    // 与 viewInverse 的约定一致）；logarithmBase / levelBias 用 SDK 默认值
-    // （SharcCommon.h 的 SHARC_GRID_LOGARITHM_BASE / SHARC_GRID_LEVEL_BIAS）。
     sharcParameters.hashGridParameters.cameraPosition = cam.viewInverse[3].xyz;
     sharcParameters.hashGridParameters.logarithmBase = SHARC_GRID_LOGARITHM_BASE;
     sharcParameters.hashGridParameters.sceneScale =
         uintBitsToFloat(cam.sharcCacheParams.x);
     sharcParameters.hashGridParameters.levelBias = float(SHARC_GRID_LEVEL_BIAS);
 
-    // 哈希网格数据：capacity 必须与 C++ 真正分配的元素数（g_sharcEntryCountResolved）
-    // 逐位一致 —— 它是哈希取模的上界，也是 Resolve 的有效索引上界。
     sharcParameters.hashGridData.capacity = cam.sharcCacheParams.y;
     sharcParameters.hashGridData.hashEntriesBuffer =
         RWStructuredBuffer_uint64_t(sharcCacheAddress(0u));
 
-    // 累积量化系数（SDK 建议起步 1e3f；太大在大光比处会整型溢出）。
     sharcParameters.radianceScale = uintBitsToFloat(cam.sharcCacheParams.z);
     sharcParameters.accumulationBuffer =
         RWStructuredBuffer_SharcAccumulationData(sharcCacheAddress(1u));
@@ -121,11 +107,6 @@ SharcParameters sharcBuildParameters()
 SharcResolveParameters sharcBuildResolveParameters()
 {
     SharcResolveParameters resolveParameters;
-    // 2026-10-26（对齐 RTX Remix，重新应用；上次被误回滚）：
-    //   accumulationFrameNum = 10  —— rtx_spatially_hashed_radiance_cache.cpp:120
-    //   staleFrameNumMax     = 64  —— 同上 :121（SDK 头的 1024 只是 clamp 上界）
-    //   responsiveFrameNum   = 与 accumulation 相同 => 关闭 responsive lighting
-    //     （参考 sharc.slangh:38 明确关闭；SDK 用它做响应式缩短累积）
     resolveParameters.cameraPositionPrev = cam.prevViewInverse[3].xyz;
     resolveParameters.accumulationFrameNum = 10u;
     resolveParameters.responsiveFrameNum = 10u;

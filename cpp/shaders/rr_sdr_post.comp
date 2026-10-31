@@ -1,80 +1,44 @@
 #version 460
 
-// RR-6.5 SDR display transform: RR-7 auto-exposure scale, then a tone curve.
-//
-// In-place compute pass over the RR linear-HDR output, 8x8 groups, one rgba16f
-// storage image.  rr_hdr_encode.comp shares this descriptor set layout, so the
-// bindings and the group size here and there have to stay identical; only the
-// transfer function may differ.
-//
-// 2026-10-03 **色彩映射可切换**（用户要求）：push constant 选模式 + 4 个参数
-//（曝光参与度 / 对比 / 饱和 / gamma）。所有曲线统一输出**线性**值，最后统一做
-// gamma 与饱和度 ⇒ 出厂观感（Uchimura/GT + 2.2）与旧实现逐位一致。
-//   mode 0 = Uchimura 2017（= GT tonemap，Polyphony 出厂口径，对比可调）
-//   mode 1 = AgX（minimal，Blender 4.0 起的默认 display transform）
-//   mode 2 = Khronos PBR Neutral（three.js/model-viewer 移植，MIT）
-//   mode 3 = ACES（Hill RRT+ODT fit，three.js/MIT 移植）
-//   mode 4 = Uncharted 2 / Hable filmic
-//   mode 5 = Reinhard-Jodie（基准）
-//   mode 6 = ACES 2.0（2026-10-23：官方 aces-core CTL 逐函数移植，SDR Rec.709/D65
-//            预设；360 项色域/色度表由 tools/aces2/port.py 离线烘焙，见下方
-//            ACES2 区块）。★ 官方标定是"18% 灰 = 10 nits"，即 ACES 1.0 只映射到
-//
-// 2026-10-23 调色调（用户要求，所有模式共用）：push constant 末尾 3 个 lane
-// 是线性光的 R/G/B 通道增益（1,1,1 = 逐位恒等），作用点在**色调映射之前**，
-// 即等效相机白平衡；色温/色调都可以靠它手调。
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-// 2026-10-03 后处理参数（宿主每帧随 dispatch 推送）。
-//
-// 2026-10-26：**扩到 32 lane = 128 字节**（Vulkan 对 push constant 的保底上限就是
-// 128），后 24 lane 是新的「色彩分级」组（设置页「色彩映射与调色」）。全部恒等时
-// main() 里整块跳过 ⇒ 老存档的画面逐位不变。宿主侧
-// cpp/VulkanCore.cpp 的 PostProcessingPush 必须与之逐 lane 对齐。
 layout(push_constant) uniform PostPush
 {
-    int tonemapMode;         // 见文件头 mode 表
-    float exposureStrength;  // 自动曝光参与度（出厂 0.6）
-    float contrast;          // Uchimura 的 a（出厂口径 1.35，原版 1.0）
-    float saturation;        // 饱和度（出厂 1.08）
-    float gamma;             // 显示 gamma（出厂 2.2）
-    // 2026-10-23 调色调：线性光通道增益（1,1,1 = 逐位恒等）
+    int tonemapMode;
+    float exposureStrength;
+    float contrast;
+    float saturation;
+    float gamma;
     float gainR;
     float gainG;
     float gainB;
 
-    // ===== 2026-10-26 色彩分级 24 lane（1 / 0 之类的"中性值"见每条注释）=====
-    float manualEV;          // 手动曝光（档，0 = 恒等；±4 约 ±4 档）
-    float blackPoint;        // 黑点（0 = 恒等）
-    float whitePoint;        // 白点（1 = 恒等；<1 提前削白=更平）
-    float gradeContrast;     // 显示域对比（1 = 恒等）
-    float gradePivot;        // 对比支点（0.18 线性灰）
-    float liftR;             // ASC-CDL offset（0 = 恒等）
+    float manualEV;
+    float blackPoint;
+    float whitePoint;
+    float gradeContrast;
+    float gradePivot;
+    float liftR;
     float liftG;
     float liftB;
-    float gradeGammaR;       // ASC-CDL 1/power（1 = 恒等）
+    float gradeGammaR;
     float gradeGammaG;
     float gradeGammaB;
-    float gradeGainR;        // ASC-CDL slope（1 = 恒等）
+    float gradeGainR;
     float gradeGainG;
     float gradeGainB;
-    float shadowHue;         // 阴影分离色调色相（度）
-    float shadowStrength;    // 0 = 关
-    float highlightHue;      // 高光分离色调色相（度）
-    float highlightStrength; // 0 = 关
-    float vibrance;          // 自然饱和度（0 = 恒等；负 = 收彩）
-    float fade;              // 褪色/发灰（0 = 恒等；抬黑 + 压白）
-    float vignette;          // 暗角强度（0 = 关）
-    float vignetteRadius;    // 暗角起始半径（0.6 起暗）
-    float hueRotate;         // 全色相旋转（度，0 = 恒等；绕灰轴，保中性色）
-    float tintGreen;         // 绿/品红微调（0 = 恒等；>0 偏青绿，<0 偏品红）
+    float shadowHue;
+    float shadowStrength;
+    float highlightHue;
+    float highlightStrength;
+    float vibrance;
+    float fade;
+    float vignette;
+    float vignetteRadius;
+    float hueRotate;
+    float tintGreen;
 } postPush;
-
-// Analytic pane radiance that the raygen withheld from DLSS RR, added back
-// here.  See RR_STABLE_GLASS_RADIANCE in rt_test.rgen for why it is split at
-// all.  Defined before the descriptor declarations below because the
-// preprocessor has to know the value by then.
 #ifndef RR_STABLE_GLASS_RADIANCE
 #define RR_STABLE_GLASS_RADIANCE 0
 #endif
@@ -217,13 +181,12 @@ vec3 acesFilmic(vec3 color)
         vec3(-0.53108,  1.10813, -0.07276),
         vec3(-0.07367, -0.00605,  1.07602));
 
-    color *= 1.0 / 0.6;   // three.js 的亮环境补偿（保持其观感口径）
+    color *= 1.0 / 0.6;
     color = acesInputMat * color;
     color = rrtAndOdtFit(color);
     color = acesOutputMat * color;
     return clamp(color, vec3(0.0), vec3(1.0));
 }
-
 // ---------------------------------------------------------------------------
 // mode 4: Uncharted 2 / Hable filmic。输入输出线性。
 // ---------------------------------------------------------------------------
@@ -256,40 +219,7 @@ vec3 reinhardJodie(vec3 v)
     return mix(v / (1.0 + luma), tc, tc);
 }
 
-// ===========================================================================
-// mode 6: ACES 2.0 SDR 输出变换
-//
-// 逐函数移植自官方 aces-core（Apache-2.0，ACES Project / ASWF）：
-//   lib/Lib.Academy.OutputTransform.ctl   （init_ODTParams / JMh / tonescale /
-//                                          chroma compression / gamut compression）
-//   lib/Lib.Academy.Tonescale.ctl         （MM tonescale）
-//   lib/Lib.Academy.DisplayEncoding.ctl   （白点缩放、显示编码）
-// 预设（原样照抄参数）：
-//   d65/srgb/Output.Academy.Rec709-D65_100nit_in_Rec709-D65_Gamma2pt2.ctl
-//     limitingPri = Rec.709 / D65, peakLuminance = 100,
-//     scale_white = false, eotf = gamma 2.2
-//   ⇒ 本函数只输出到**显示线性**（EOTF 由本文件末尾统一的 gamma 阶段做，
-//     所以 display_encoding() 里的 eotf_inv 不在这里重复）。
-//
-// 离线烘焙：360 项 TABLE_reach_M / TABLE_gamut_cusps / TABLE_hues /
-// TABLE_upper_hull_gamma 由 .tmp/aces2/port.py 按官方 init 逻辑算好后写成
-// 下方常量数组（着色器里不做 init）。
-//
-// ★ mat3 的构造口径：把 CTL 矩阵的**行**当成 GLSL mat3 的**列**（mat3(r0,r1,r2)），
-//   于是只有 **`M * v`** 等于 CTL 的 mult_f3_f33(v, M)（out[j] = Σ_i v[i]*M[i][j]）。
-//   `v * M` 是行向量×矩阵（= vᵀM），语义与 CTL 转置。
-//   2026-10-23 正是把它写成了 `v * M`：实机 ACES 2.0 满屏纯红（GPU 把
-//   sRGB→AP0 算成了行点积，J 直接飙到 6.7e4，最后 clamp 成 (1,0,0)）。
-// ===========================================================================
 
-//@@ACES2_BAKED_BEGIN@@
-// ===== ACES 2.0 SDR 输出变换（由 tools/aces2/port.py 从官方 CTL 烘焙）=====
-// 参考：aces-core Lib.Academy.OutputTransform.ctl / Tonescale.ctl / DisplayEncoding.ctl
-// 预设：Output.Academy.Rec709-D65_100nit_in_Rec709-D65_Gamma2pt2.ctl
-//   limitingPri = Rec.709 primaries / D65 white, peakLuminance = 100, scale_white = false
-// GLSL 的 mat3 用「CTL 的行作为 GLSL 的列」构造 ⇒ 只有 `M * v` 等价于
-// CTL 的 mult_f3_f33(v, M)；写成 `v * M` 是行向量×矩阵（vᵀM），语义转置。
-// 2026-10-23 事故：写成 v * M ⇒ 实机 ACES 2.0 满屏纯红。
 
 const float ACES2_REF_LUMINANCE = 100.0;
 const float ACES2_CONE_OFFSET = 2.713000000e+01f;
@@ -308,7 +238,6 @@ const float ACES2_SAT_THR = 5.000000000e-03f;
 const float ACES2_COMPR = 2.400000000e+00f;
 const float ACES2_CHROMA_COMPRESS_SCALE = 1.000053063e+00f;
 const float ACES2_WHITE_SCALE = 1.000000000e+00f;
-// Tonescale 参数（Tonescale.ctl init_TSParams）
 const float ACES2_TS_N_R = 1.000000000e+02f;
 const float ACES2_TS_G = 1.150000000e+00f;
 const float ACES2_TS_T1 = 4.000000000e-02f;
@@ -316,7 +245,6 @@ const float ACES2_TS_S2 = 9.198582542e-01f;
 const float ACES2_TS_M2 = 1.047103762e+00f;
 const float ACES2_TS_FORWARD_LIMIT = 1.024000000e+03f;
 
-// input params（AP0）
 const mat3 ACES2_IN_RGB_TO_CAM16C = mat3(vec3(4.451810084e-01f, 1.237341065e-01f, 1.170072553e-02f), vec3(3.496492545e-01f, 6.136436165e-01f, 2.806079158e-02f), vec3(-1.129735296e-03f, 5.632280451e-02f, 7.539390104e-01f));
 const mat3 ACES2_IN_CAM16C_TO_RGB = mat3(vec3(2.667054454e+00f, -5.358118761e-01f, -2.144890573e-02f), vec3(-1.525058944e+00f, 1.941581083e+00f, -4.859545068e-02f), vec3(1.179255365e-01f, -1.458481599e-01f, 1.329965404e+00f));
 const mat3 ACES2_IN_CONE_TO_AAB = mat3(vec3(2.025881034e+01f, 1.548000000e+04f, 1.720000000e+03f), vec3(1.012940517e+01f, -1.688727273e+04f, 1.720000000e+03f), vec3(5.064702585e-01f, 1.407272727e+03f, -3.440000000e+03f));
@@ -327,19 +255,16 @@ const float ACES2_INV_CZ = 8.794641436e-01f;
 const float ACES2_AW_J = 3.236802625e-02f;
 const float ACES2_INV_AW_J = 3.089468577e+01f;
 
-// limit params（Rec.709 / D60）
 const mat3 ACES2_LIM_RGB_TO_CAM16C = mat3(vec3(2.234057960e-01f, 1.081934406e-01f, 2.046919760e-02f), vec3(4.513326926e-01f, 5.474739197e-01f, 1.081809701e-01f), vec3(1.189620390e-01f, 1.380331672e-01f, 6.650503599e-01f));
 const mat3 ACES2_LIM_CAM16C_TO_RGB = mat3(vec3(7.450485164e+00f, -1.475067089e+00f, 1.062887270e-02f), vec3(-6.130183289e+00f, 3.118357198e+00f, -3.185728276e-01f), vec3(-6.038082804e-02f, -3.833690610e-01f, 1.567865002e+00f));
 const mat3 ACES2_LIM_CONE_TO_AAB = mat3(vec3(2.025881034e+01f, 1.548000000e+04f, 1.720000000e+03f), vec3(1.012940517e+01f, -1.688727273e+04f, 1.720000000e+03f), vec3(5.064702585e-01f, 1.407272727e+03f, -3.440000000e+03f));
 const mat3 ACES2_LIM_AAB_TO_CONE = mat3(vec3(3.236802625e-02f, 3.236802625e-02f, 3.236802625e-02f), vec3(2.076576402e-05f, -4.102504600e-05f, -1.012964099e-05f), vec3(1.326062093e-05f, -1.201743772e-05f, -2.900760828e-04f));
 
-// 线性 sRGB(D65) → ACES2065-1 (AP0) 与 limiting → display 矩阵
 const mat3 ACES2_SRGB_TO_AP0 = mat3(vec3(4.329305201e-01f, 8.941313710e-02f, 1.916171307e-02f), vec3(3.753843595e-01f, 8.165330211e-01f, 1.181520660e-01f), vec3(1.893780579e-01f, 1.030219928e-01f, 9.422169143e-01f));
 const mat3 ACES2_AP0_TO_AP1 = mat3(vec3(1.451439316e+00f, -7.655377340e-02f, 8.316148426e-03f), vec3(-2.365107469e-01f, 1.176229700e+00f, -6.032449791e-03f), vec3(-2.149285693e-01f, -9.967592644e-02f, 9.977163014e-01f));
 const mat3 ACES2_AP1_TO_AP0 = mat3(vec3(6.954522414e-01f, 4.479456337e-02f, -5.525882558e-03f), vec3(1.406786965e-01f, 8.596711185e-01f, 4.025210306e-03f), vec3(1.638690622e-01f, 9.553431817e-02f, 1.001500672e+00f));
 const mat3 ACES2_LIMIT_TO_DISPLAY = mat3(vec3(1.000000000e+00f, 2.602085214e-18f, 3.469446952e-18f), vec3(5.551115123e-17f, 1.000000000e+00f, 0.000000000e+00f), vec3(0.000000000e+00f, 6.938893904e-18f, 1.000000000e+00f));
 
-// 表：index 0 与 361 是环回哨兵（同参考 baseIndex=1）
 const float ACES2_TABLE_REACH_M[362] = float[362](
     1.650756836e+02f, 1.667907715e+02f, 1.684814453e+02f, 1.701354980e+02f, 1.717590332e+02f, 1.733459473e+02f,
     1.748840332e+02f, 1.763732910e+02f, 1.778076172e+02f, 1.791870117e+02f, 1.805114746e+02f, 1.817687988e+02f,
@@ -622,7 +547,6 @@ const float ACES2_TABLE_HUES[362] = float[362](
     3.528698727e+02f, 3.538884623e+02f, 3.549070519e+02f, 3.559256415e+02f, 3.569442312e+02f, 3.579628208e+02f,
     3.589814104e+02f, 3.600000000e+02f
 );
-//@@ACES2_BAKED_END@@
 
 float a2Copysign(float x, float y)
 {
@@ -1013,13 +937,11 @@ vec3 aces2DisplayLinear(vec3 linearSrgb)
 
     vec3 jmh = a2AabToJmh(a2RgbToAab(aces, ACES2_IN_RGB_TO_CAM16C, ACES2_IN_CONE_TO_AAB));
 
-    // tonemap_and_compress_fwd
     float linear = a2JToY(jmh.x) / ACES2_REF_LUMINANCE;
     float tonemappedY = a2TonescaleFwd(linear);
     float jTs = a2YToJ(tonemappedY);
     jmh = a2ChromaCompressFwd(jmh, jTs);
 
-    // gamut_compress_fwd
     jmh = a2GamutCompressFwd(jmh);
 
     vec3 rgb = a2AabToRgb(a2JmhToAab(jmh), ACES2_LIM_AAB_TO_CONE, ACES2_LIM_CAM16C_TO_RGB);
@@ -1069,11 +991,6 @@ vec3 aces2Debug(vec3 linearSrgb, int stage)
     return rgb * 0.25;
 }
 
-// ===========================================================================
-// 2026-10-26 色彩分级的小件（设置页「色彩映射与调色」）
-// 全部作用在**显示域**（已 tonemap + 已做 gamma 的 [0,1] 值）—— 与 Resolve 的
-// 一级调色同一口径：Lift/Gamma/Gain、黑白场、支点对比、分离色调、暗角。
-// ===========================================================================
 
 const vec3 GRADE_LUMA = vec3(0.2126, 0.7152, 0.0722);
 
@@ -1115,19 +1032,6 @@ void main()
 
     vec4 color = imageLoad(rrOutputImage, p);
 
-    // 2026-10-30：NaN / Inf 清洗 —— 与 rr_hdr_encode.comp:104-110 对齐。
-    //
-    // 实测：RT 帧里确实存在 NaN（HDR 链早就在入口 scrub，注释原文
-    // "Denormals, inf and NaN all reach here from the path-traced frame and
-    //  would survive the pow() chain as NaN once written to the target"）。
-    // SDR 链此前只对 stableRadiance 做过 isnan（且那个分支编译期关闭），
-    // 入口的 color.rgb 完全没防护 ⇒ NaN 穿过 tonemap → pow() → 写进目标，
-    // 屏幕表现为画面中心一块椭圆区域"透出下层"。
-    // 切到 HDR 后该症状消失，正是因为 HDR 链在这里已经清洗过。
-    //
-    // 注意：这是**止血**，不是根治 —— NaN 的真正来源（某个材质/光照计算
-    // 产生 0/0 或 log(负数)）仍需单独排查。
-    // bvec3 不能用 ||，逐分量 mix 两次（写法与 rr_hdr_encode.comp 一致）。
     color.rgb = mix(color.rgb, vec3(0.0), isnan(color.rgb));
     color.rgb = mix(color.rgb, vec3(0.0), isinf(color.rgb));
     color.rgb = max(color.rgb, vec3(0.0));
@@ -1157,21 +1061,16 @@ void main()
 #endif
 #endif
 
-    // 自动曝光（参与度现在是可调参数；出厂 0.6）
     vec3 exposed =
         max(
             color.rgb * exp2(currentEV * postPush.exposureStrength),
             vec3(0.0)
         );
 
-    // 2026-10-23 调色调：线性光通道增益（1,1,1 = 逐位恒等）。放在色调映射之前
-    // ⇒ 等效相机白平衡；三通道独立，可以当色温/色调/自定义染色用。
     exposed *= vec3(postPush.gainR, postPush.gainG, postPush.gainB);
 
-    // 2026-10-26 手动曝光（档）。exp2(0) 严格等于 1 ⇒ 默认逐位不变。
     exposed *= exp2(postPush.manualEV);
 
-    // 色彩映射（各模式输出**线性**值）
     vec3 displayLinear;
     if(postPush.tonemapMode == 1)
     {
@@ -1206,21 +1105,10 @@ void main()
         displayLinear = uchimura(exposed);
     }
 
-    // 统一 gamma（出厂 2.2，可调）与饱和度（出厂 1.08）
     vec3 displayColor = pow(max(displayLinear, vec3(0.0)), vec3(1.0 / postPush.gamma));
     const float luma = dot(displayColor, vec3(0.2126, 0.7152, 0.0722));
     displayColor = mix(vec3(luma), displayColor, postPush.saturation);
 
-    // =======================================================================
-    // 2026-10-26 色彩分级（设置页「色彩映射与调色」，24 lane）
-    //
-    // 作用点：显示域 [0,1]（tonemap + gamma + 饱和度之后）。这一段是新加的，
-    // **全部参数取中性值时整块跳过** ⇒ 老存档 / 没调过的人画面逐位不变。
-    //
-    // 顺序（与 Resolve 一级调色一致，改顺序会改变观感，别随手挪）：
-    //   黑白场 → 支点对比 → 逐通道 Lift/Gamma/Gain → 色相旋转 →
-    //   分离色调（阴影/高光）→ 自然饱和度 → 褪色 → 绿/品红 → 暗角
-    // =======================================================================
     bool cgActive =
         postPush.blackPoint != 0.0 ||
         postPush.whitePoint != 1.0 ||
@@ -1240,19 +1128,14 @@ void main()
 
     if(cgActive)
     {
-        // ① 黑白场（levels）：把 [blackPoint, whitePoint] 拉回 [0,1]。
         const float cgSpan = max(postPush.whitePoint - postPush.blackPoint, 1.0e-3);
         displayColor =
             max((displayColor - vec3(postPush.blackPoint)) / cgSpan, vec3(0.0));
 
-        // ② 支点对比：以 gradePivot 为轴拉伸/压缩。
         displayColor =
             max((displayColor - vec3(postPush.gradePivot)) * postPush.gradeContrast
                 + vec3(postPush.gradePivot), vec3(0.0));
 
-        // ③ ASC-CDL：out = (in * slope + offset) ^ (1/power)。
-        //    这里 slope = gradeGain、offset = lift、power = gradeGamma。
-        //    逐通道 ⇒ 可以把阴影压青、高光留暖（或反过来），是三通道旋钮做不到的。
         const vec3 cdGain =
             vec3(postPush.gradeGainR, postPush.gradeGainG, postPush.gradeGainB);
         const vec3 cdLift =
@@ -1266,13 +1149,11 @@ void main()
                 pow(max(displayColor * cdGain + cdLift, vec3(0.0)), 1.0 / cdGamma);
         }
 
-        // ④ 全色相旋转（绕灰轴，中性色不动）。
         if(postPush.hueRotate != 0.0)
         {
             displayColor = gradeHueRotate(displayColor, postPush.hueRotate);
         }
 
-        // ⑤ 分离色调：暗部推冷、亮部留中性 —— "孤独感"主要靠这一步 + 色温。
         if(postPush.shadowStrength != 0.0 || postPush.highlightStrength != 0.0)
         {
             const float tl = dot(displayColor, GRADE_LUMA);
@@ -1291,7 +1172,6 @@ void main()
             }
         }
 
-        // ⑥ 自然饱和度：彩色越多的地方越少动（与 ⑤ 相反，收彩时保住高彩细节）。
         if(postPush.vibrance != 0.0)
         {
             const float vl = dot(displayColor, GRADE_LUMA);
@@ -1303,14 +1183,12 @@ void main()
                 mix(vec3(vl), displayColor, clamp(1.0 + amount, 0.0, 2.0));
         }
 
-        // ⑦ 褪色（fade）：抬黑 + 压白 = 胶片那种"发灰的远"。
         if(postPush.fade != 0.0)
         {
             displayColor = displayColor * (1.0 - 0.30 * postPush.fade)
                          + vec3(0.11 * postPush.fade);
         }
 
-        // ⑧ 绿/品红微调（一次性整体偏色，比三通道增益更容易压出"青绿感"）。
         if(postPush.tintGreen != 0.0)
         {
             displayColor *=
@@ -1319,7 +1197,6 @@ void main()
                      1.0 - 0.05 * postPush.tintGreen);
         }
 
-        // ⑨ 暗角：按"到中心的归一化距离"压边角。radius 越大起始越靠外。
         if(postPush.vignette != 0.0)
         {
             const vec2 halfSize = vec2(size) * 0.5;

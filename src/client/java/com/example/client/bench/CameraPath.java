@@ -43,14 +43,10 @@ import java.util.Set;
  */
 public final class CameraPath {
 
-    /** 文件头标识。改结构必须同时改版本号，不回退兼容。 */
     public static final String KIND = "orion-camera-path";
-    /** 当前版本。1 = 首个版本。 */
     public static final int VERSION = 1;
 
-    /** 单步时间上限（秒）：长卡顿（编译 SPV、区块爆量）不应该把路径拉长。 */
     public static final double MAX_STEP_SECONDS = 0.25;
-    /** 相邻采样点的最小间隔（秒），低于它丢弃：避免高帧率下航点表爆掉。 */
     public static final double MIN_STEP_SECONDS = 1.0 / 1000.0;
 
     private static final Set<String> ROOT_KEYS = Set.of(
@@ -179,7 +175,6 @@ public final class CameraPath {
         }
         final double u = Math.max(0.0, Math.min(1.0, (t - p0.t()) / span));
 
-        // 切向：内部点取相邻差分，端点取单侧斜率。
         final Waypoint prev = index > 0 ? this.waypoints.get(index - 1) : null;
         final Waypoint next = index + 2 < this.waypoints.size()
                 ? this.waypoints.get(index + 2) : null;
@@ -236,9 +231,6 @@ public final class CameraPath {
                 (b.pose().pitch() - a.pose().pitch()) / span};
     }
 
-    // ------------------------------------------------------------------
-    // 编解码（严格）
-    // ------------------------------------------------------------------
 
     public String toJson() {
         final JsonObject root = new JsonObject();
@@ -332,7 +324,6 @@ public final class CameraPath {
                             (float) requireDouble(item, "yaw", "waypoint[" + i + "]"),
                             (float) requireDouble(item, "pitch", "waypoint[" + i + "]"))));
         }
-        // of() 会再校验时间严格递增并展开 yaw。
         return of(name, fixedStepHz, createdAt, read);
     }
 

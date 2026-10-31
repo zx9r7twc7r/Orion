@@ -1,21 +1,5 @@
 #version 460
 
-// RR-7 auto exposure: histogram -> adapted exposure.
-//
-// Single invocation.  It consumes the histogram the previous frame produced,
-// derives a trimmed log-average luminance, converts that into a target
-// exposure in log2 space, and blends it into the running value with
-// asymmetric rates so the eye-adaptation feel is preserved: darkening after a
-// bright flash is fast, brightening out of a dark room is slow.
-//
-// Keeping the running value in log2 space is what makes the blend perceptually
-// linear; blending the linear exposure instead would crawl at the bottom of
-// its range and snap at the top.
-//
-// The pass also clears the histogram, which is why no fill/clear pass is
-// needed anywhere else in the frame.
-//
-// The bin layout is shared with rr_ae_histogram.comp.
 
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
@@ -28,25 +12,14 @@ buffer AeHistogram
 layout(binding = 1, set = 0)
 buffer AeState
 {
-    // Running exposure in log2.  The display transform applies exp2(this).
     float currentEV;
 
-    // Last frame's measured target, kept for diagnostics.
     float targetEV;
 
-    // Last frame's trimmed average luminance in log2, for diagnostics.
     float avgLogLuma;
 
-    // Pixels that survived the trim, for diagnostics.
     uint sampleCount;
 
-    // Linear radiance that lands exactly on display white after the exposure
-    // multiply, i.e. exp2(-currentEV) scaled by the output path's white level.
-    // volumetric_cloud_composite.comp rolls the cloud layer off against this so
-    // the deck keeps its detail at any exposure instead of clipping to a flat
-    // white sheet.  It is a separate lane rather than something the composite
-    // could derive itself because the scale depends on which display path is
-    // live, which only the host knows.
     float cloudWhite;
 };
 
@@ -54,28 +27,19 @@ layout(push_constant) uniform AeParams
 {
     float dtSec;
 
-    // log2 of the average luminance the frame should expose to.
     float keyEV;
 
     float minEV;
     float maxEV;
 
-    // Per-second adaptation rates.  adaptDownRate handles a scene that just
-    // got brighter, adaptUpRate a scene that just got darker.
     float adaptUpRate;
     float adaptDownRate;
 
-    // Fraction of the sample mass discarded at each end before averaging, so
-    // a few specular pixels or a small black sky do not drag the average.
     float trimLow;
     float trimHigh;
 
-    // 0 = auto exposure switched off in the settings screen.
     int enabled;
 
-    // Linear value the output path renders as its brightest white: 1.0 on the
-    // SDR path, where the frame is clipped to that, and a multiple of reference
-    // white on the HDR10 path, whose PQ container goes far above it.
     float displayWhiteScale;
 };
 
@@ -93,11 +57,6 @@ void publishCloudWhite()
 
 void main()
 {
-    // Switched off: drive the exposure straight back to neutral instead of
-    // leaving it frozen wherever it happened to be, so the disabled look is
-    // bit-identical to the pre-auto-exposure build.  The histogram is cleared
-    // on the way out so a later re-enable starts from a clean accumulator.
-    // The histogram pass itself is skipped by the host in this state.
     if(enabled == 0)
     {
         for(uint i = 0u; i < AE_BIN_COUNT; ++i)
@@ -122,8 +81,6 @@ void main()
         total += bins[i];
     }
 
-    // Nothing measured yet (first frame, or a frame that reduced to nothing).
-    // Hold the running exposure and hand back a clean accumulator.
     if(total == 0u)
     {
         for(uint i = 0u; i < AE_BIN_COUNT; ++i)
@@ -154,12 +111,8 @@ void main()
 
         cum += c;
 
-        // Keep only the bins whose counts fall inside the trimmed window.
         if(cum > lowCut && prevCum < highCut)
         {
-            // Weights are normalised by `total` up front so the accumulator
-            // stays near the EV range instead of the raw sample count; that
-            // keeps float precision independent of resolution.
             float binCenter =
                 AE_LOG2_MIN +
                 (float(i) + 0.5) *
@@ -183,12 +136,8 @@ void main()
         return;
     }
 
-    // weighted holds sum(binCenter * c) / total, so scaling it by total/used
-    // turns it into the average over the surviving samples only.
     float avgLogLum = weighted * (float(total) / float(used));
 
-    // keyEV - avgLogLum is the log2 distance between where the frame's average
-    // sits and where it should sit, i.e. exactly the exposure to apply.
     float target = clamp(keyEV - avgLogLum, minEV, maxEV);
 
     float rate =

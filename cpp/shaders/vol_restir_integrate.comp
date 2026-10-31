@@ -2,67 +2,6 @@
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_ray_query : require
 
-// ===========================================================================
-// vol_restir_integrate.comp —— 体积光 ReSTIR（S4：froxel 入散射）
-//
-// 5 个 dispatch 的第 4 个（最后一个是屏幕积分，见 vol_restir_composite.comp）：
-//
-//   initial(RIS) → temporal → spatial → integrate → screen composite
-//                                        ^^^^^^^^ 本文件
-//
-// 职责：对**每个 froxel**（88×47×64，不是 restir 的 22×12）把最终 reservoir
-// 里那盏灯换算成该点的入散射辐亮度，写进 radiance 3D 图，供屏幕积分沿视线采样。
-//
-// 为什么在这里做（而不是在 initial 里做）：
-//   1) initial 的 reservoir 只是"本帧 32 个样本"，temporal/spatial 之后才是最终
-//      样本 —— 用最终样本算辐亮度才有降噪意义；
-//   2) 分辨率不同：reservoir 在 restir 网格（froxel÷4），radiance 在 froxel 网格。
-//      initial 阶段按 restir 坐标写 radiance 等于只填了左下角 1/16（S2 的遗留），
-//      S4 起由本 pass 负责整张图。
-//
-// 口径（全部照抄，不在此另立标定）：
-//   · 灯表/衰减/范围：local_light_grid_common.glsl（与 rgen、体积雾同一份）
-//   · 相位：volumetric_fog.glsl:213-222 的 fogLightPhase
-//     （FLOOR 0.02 + SCALE 0.62 * HG(g=0.40)；HG 本体见 volumetric_clouds_v3.comp:60）
-//   · froxel 世界位置：vol_restir_common.glsl（Remix froxel.slangh 口径）
-//
-// binding（set 0）
-//   0  CameraProperties
-//   1  reservoir（restir 网格，只读）
-//   12 本地光表 / 13 空间网格（查表用，需与 initial 一致）
-//   15 radiance 输出（froxel 网格，只写）
-//   22 场景 TLAS（每 froxel 的 NEE 可见性射线，见 volRestirNeeVisible）
-//
-// ---------------------------------------------------------------------------
-// 2026-10-27（第七轮）：**radiance volume 的 SH 辐照度缓存**
-//
-// 照搬 _ref/dxvk-remix/submodules/rtxdi/rtxdi-sdk/include/volumetrics/rtx/
-//      algorithm/volume_integrator.slangh:96-269
-//
-// 原文在同一个 per-froxel pass 里同时产出两样东西：
-//   ① 体积散射的入散射辐亮度（我们的 binding 15 早就在做）
-//   ② **亮度 SH + 标量色度** 的时间累积辐照度（AccumulatedRadianceY/CoCg/Age）
-// ②就是 `evalVolumetricNEE` 的输入，也是半透明 alpha blend 邻居搜索失败时的兜底
-// （composite_alpha_blend.comp.slang:259-267）。
-//
-// 累积公式逐行对应（行号为 volume_integrator.slangh）：
-//   :99   previousFroxelUVW = calculateJitteredFroxelUvw(prev, 0.05)
-//   :103  reprojectionValid = all(prevUVW > 0 && prevUVW < 1)
-//   :125  oldRadianceSH = loadFiltered3D(PrevY, PrevCoCg, physicalPrev)   // 三线性
-//   :126  oldHistoryAge = PrevAge.SampleLevel(prev) * maxAccumulationFrames
-//   :129  newHistoryAge = min(oldHistoryAge + 1, maxAccumulationFrames)
-//   :142  if (newHistoryAge > 1) historyAgeWeight = 1 / (newHistoryAge + 5)
-//   :202-205 radianceSH.addRadiance(fireflyFiltering(radiance, thr), lightDir)
-//   :262  newSH = mix(oldRadianceSH, radianceSH, historyAgeWeight)
-//   :266  store3D(newSH, AccumY, AccumCoCg, froxelIndex)
-//   :268  AccumAge[froxelIndex] = newHistoryAge / maxAccumulationFrames
-//
-// 与原文的两处已知差异（都在下面就地标注）：
-//   1) 重投影只投 xy（z 用当前层）——与 vol_restir_temporal.comp:98 的既有口径一致；
-//      Remix 对 z 也做深度切片反解（froxelCoordinateToPrev）。
-//   2) loadFiltered3D 的三线性在这里手写 8 tap（不用 sampler3D），因为 SH 图走
-//      storage image（无 sampler 资源）；数值定义与三线性完全相同。
-// ===========================================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -78,8 +17,6 @@ layout(set = 0, binding = 0) uniform CameraProperties
 layout(rgba32ui, set = 0, binding = 1) uniform readonly uimage3D volReservoirIn;
 layout(rgba16f, set = 0, binding = 15) uniform writeonly image3D volRadianceOut;
 
-// --- 2026-10-27：SH 辐照度缓存（Remix AccumulatedRadiance Y / CoCg / Age）---
-// 三张都是 froxel 网格；host 端 [0] = 本帧输出、[1] = 上一帧（pass 结束后 copy）。
 layout(rgba16f, set = 0, binding = 16) uniform readonly image3D volShYPrev;
 layout(rgba16f, set = 0, binding = 17) uniform readonly image3D volShCoCgPrev;
 layout(r8,      set = 0, binding = 18) uniform readonly image3D volShAgePrev;
@@ -87,24 +24,18 @@ layout(rgba16f, set = 0, binding = 19) uniform writeonly image3D volShYOut;
 layout(rgba16f, set = 0, binding = 20) uniform writeonly image3D volShCoCgOut;
 layout(r8,      set = 0, binding = 21) uniform writeonly image3D volShAgeOut;
 
-// 2026-10-28：场景 TLAS。与 vol_restir_visibility.comp 的 binding 2 是同一棵
-// （宿主写同一个 g_tlas），所以"块的可见性"与"froxel 的可见性"口径一致。
 layout(set = 0, binding = 22) uniform accelerationStructureEXT sceneTlas;
 
 layout(push_constant) uniform VolRestirIntegratePush
 {
-    // x = froxel 宽, y = froxel 高, z = 层数, w = restir 下采样比
     ivec4 froxelSize;
-    // x = 最远距离, y = 深度指数, z = 保留, w = 帧种子
     vec4 volumeParams;
 } pc;
 
 const float VOL_RESTIR_PI = 3.141592653589793;
 
-// 原文 rtx_global_volumetrics.h:108 / :102 的默认值。
 const float VOL_SH_MAX_ACCUMULATION_FRAMES = 128.0;
 const float VOL_SH_FIREFLY_LUMINANCE_THRESHOLD = 1000.0;
-// 原文 :140 的常数（"slightly more time to accumulate a new contribution"）。
 const float VOL_SH_HISTORY_AGE_OFFSET = 5.0;
 
 // 与 volumetric_clouds_v3.comp:60 逐行一致。
@@ -116,7 +47,6 @@ float hgPhase(float cosine, float g)
     return (1.0 - g2) / (4.0 * VOL_RESTIR_PI * denominator * sqrt(denominator));
 }
 
-// 与 volumetric_fog.glsl:213-222 逐行一致（同一套灯、同一套介质 ⇒ 相位必须同源）。
 const float FOG_LIGHT_PHASE_SCALE = 0.62;
 const float FOG_LIGHT_PHASE_FLOOR = 0.02;
 const float FOG_LIGHT_PHASE_G = 0.40;
@@ -155,12 +85,10 @@ float volRestirLightPhase(vec3 toLight, vec3 viewDirection)
 // ---------------------------------------------------------------------------
 bool volRestirNeeVisible(vec3 froxelCenter, vec3 lightPosition, float distanceToLight)
 {
-    // 起点偏移：避免自相交（0.05 格，与 vol_restir_visibility.comp 同值）。
     const float originBias = 0.05;
     const float tMin = originBias;
     const float tMax = distanceToLight - originBias;
 
-    // 距离小于两倍偏移：没有可被遮挡的区间，按可见处理。
     if(tMax <= tMin)
     {
         return true;
@@ -248,15 +176,12 @@ void main()
     ivec3 restirSize = ivec3(imageSize(volReservoirIn));
     int restirDownscale = max(pc.froxelSize.w, 1);
 
-    // restir 网格每个 texel 覆盖 restirDownscale² 个 froxel，直接整除取所属块。
     ivec3 restirCoord = clamp(
         ivec3(froxelCoord.xy / restirDownscale, froxelCoord.z),
         ivec3(0), restirSize - ivec3(1));
 
     VolReservoir reservoir = volRestirUnpack(imageLoad(volReservoirIn, restirCoord));
 
-    // froxel 自己的世界位置（不是 restir 块的中心 —— 这一层分辨率就是给积分用的）。
-    // ⚠ 2026-10-27：SH 的历史重投影也要用它，所以**无条件**先算（旧版只在有灯时算）。
     vec3 froxelCenter = volRestirFroxelCenter(
         froxelCoord, froxelSize, vec2(pc.froxelSize.xy), 1,
         pc.volumeParams.x, pc.volumeParams.y);
@@ -264,12 +189,6 @@ void main()
     vec3 cameraPosition = cam.viewInverse[3].xyz;
     vec3 viewDirection = normalize(froxelCenter - cameraPosition);
 
-    // ---------------------------------------------------------------
-    // ① 体积散射辐亮度（原有逻辑，唯一改动是把三处早退改成"radiance = 0 继续"）
-    //    原版早退时直接 return，那会让 SH 的 history 永远不再推进 ——
-    //    Remix 在 lightSampleValid == false 时 radianceSH 仍为 0，
-    //    照样走 mix(old, 0, w) 让历史衰减（volume_integrator.slangh:186-208）。
-    // ---------------------------------------------------------------
     vec3 radiance = vec3(0.0);
     vec3 lightDir = vec3(0.0);
     bool hasLight = false;
@@ -292,10 +211,6 @@ void main()
                 float attenuation = vptLocalLightDistanceAttenuation(distanceToLight);
                 float rangeFade = vptLocalLightRangeFade(distanceToLight, emissionLevel);
 
-                // ---- 2026-10-28：本 froxel 自己的 NEE 可见性 ----
-                // rangeFade == 0（出灯范围）时辐亮度恒为 0，那条射线没必要打 ——
-                // 这一条早退把"每 froxel 一条射线"的实际数量压到"灯真正照到的格子"，
-                // 与 Remix 的 `if(lightSampleValid)` 同构（空 reservoir 同样早退）。
                 if(rangeFade > 0.0 &&
                    volRestirNeeVisible(froxelCenter, light.worldPosEmission.xyz,
                        distanceToLight))
@@ -314,11 +229,6 @@ void main()
 
     imageStore(volRadianceOut, froxelCoord, vec4(radiance, hasLight ? 1.0 : 0.0));
 
-    // ---------------------------------------------------------------
-    // ② SH 辐照度缓存（新）
-    //    历史：把本 froxel 的中心世界位置投到上一帧屏幕坐标，取那一层同一 z 的
-    //    froxel。z 不重投影 —— 与 vol_restir_temporal.comp:98 的既有口径一致。
-    // ---------------------------------------------------------------
     SphericalHarmonic oldRadianceSH = shCreate();
     float newHistoryAge = 0.0;
     float historyAgeWeight = 1.0;

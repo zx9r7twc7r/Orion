@@ -43,11 +43,8 @@ import java.util.Locale;
  */
 public final class BenchmarkSession {
 
-    /** 退化帧下限（毫秒）：低于它的帧通常意味着"这一帧几乎没渲染"。 */
     public static final double DEGENERATE_FRAME_FLOOR_MS = 3.5;
-    /** 超长帧阀值（毫秒）：超过它的帧单独计数，并让整次运行打上标记。 */
     public static final double VERY_LONG_FRAME_MS = 5000.0;
-    /** 退化帧占比超过它 ⇒ 这次运行不可用于结论（参考实现的 1% 口径）。 */
     public static final double DEGENERATE_RATIO_LIMIT = 0.01;
 
     private static final boolean ENABLED = Boolean.parseBoolean(
@@ -244,7 +241,6 @@ public final class BenchmarkSession {
             Files.move(temp, statusFile, StandardCopyOption.REPLACE_EXISTING,
                     StandardCopyOption.ATOMIC_MOVE);
         } catch (final IOException failure) {
-            // 心跳失败不致命；下一帧会重试。
         }
     }
 

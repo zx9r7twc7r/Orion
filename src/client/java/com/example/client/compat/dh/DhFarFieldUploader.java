@@ -72,10 +72,8 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class DhFarFieldUploader {
     private static final String TAG = "[DH-LODMESH]";
 
-    /** 上一次上传的 quad 数（< 0 = 场上没有网格）。同时是 FarFieldGate 的判据。 */
     private static volatile int uploadedQuads = -1;
 
-    /** 已上传的节：{@code section.pos → version}。渲染线程读、工作线程写（单飞 ⇒ 有序）。 */
     private static final Map<Long, Long> UPLOADED = new ConcurrentHashMap<>();
 
     private static long lastSyncFrame = Long.MIN_VALUE;
@@ -90,15 +88,12 @@ public final class DhFarFieldUploader {
     private static volatile long uploadedSections;
     private static volatile long removedSections;
 
-    /** 转换/JNI 都在这一条工作线程上跑（见类注释"线程"）。 */
     private static final ExecutorService WORKER = Executors.newSingleThreadExecutor(runnable -> {
         final Thread thread = new Thread(runnable, "DhLodFarField");
         thread.setDaemon(true);
         return thread;
     });
-    /** 同一时刻只允许一单在飞。 */
     private static final AtomicBoolean JOB_IN_FLIGHT = new AtomicBoolean();
-    /** 世界代际：换世界/撤下时 +1，在飞的那一单据此自行作废。 */
     private static final AtomicLong GENERATION = new AtomicLong();
 
     private DhFarFieldUploader() {
@@ -109,9 +104,6 @@ public final class DhFarFieldUploader {
         try {
             tickInner();
         } finally {
-            // DH 与 voxy 走同一个接管闸门。判据复用 uploadedQuads
-            //（>= 0 = 卡片真的供着非空网格），不新造状态；放在 finally 里保证
-            // 所有提前 return（撤下/空/失去世界）都被如实上报。
             FarFieldGate.onLodObservation("dh", uploadedQuads >= 0);
         }
     }
@@ -135,8 +127,6 @@ public final class DhFarFieldUploader {
         final int playerBlockX = (int) Math.floor(x);
         final int playerBlockZ = (int) Math.floor(z);
 
-        // 内洞 = 近场 seam（唯一真源，见 FarFieldWindow 的类注释：两处各自推导会重新长出真空带）。
-        // FarFieldWindow 自己读原版视距（读失败时它内部兜底），所以这里不再另读一次选项。
         final int innerBlocks = FarFieldWindow.seamSections() * 16;
 
         if (innerBlocks != lastInnerBlocks) {
@@ -147,27 +137,17 @@ public final class DhFarFieldUploader {
                     + " ⇒ 内洞=" + innerBlocks + " 格；覆盖范围由 DH 自己的启用清单决定");
         }
 
-        // ---- 每帧发布视图：淘汰要用中心，内洞要用半径 ----
         DhLodMeshSink.setView(playerBlockX, playerBlockZ, innerBlocks);
 
-        // ---- 增量同步节流（三条触发条件取「或」，别改成「且」）----
-        // 周期触发（due）不能省：DH 的 LOD 是<b>渐进到达</b>的——刚进世界时它手里只有粗层，
-        // 细层（d6~d10）是随后几秒里一节一节建出来的。若只在「移动过 / 还没有网格」时才同步，
-        // 玩家站着不动就会永久停在刚进世界那一刻的粗层画面（实机回归：只剩 d11~d13 巨型平板）。
         final boolean first = lastSyncFrame == Long.MIN_VALUE;
         final boolean due = first || frame - lastSyncFrame >= DhFlags.LOD_REFRESH_FRAMES;
         final boolean movedEnough = Double.isNaN(lastSyncX)
                 || Math.max(Math.abs(x - lastSyncX), Math.abs(z - lastSyncZ))
                 >= DhFlags.LOD_MOVE_THRESHOLD;
-        // 场上还没有网格时不受节流约束：首帧 / DH 尚未生成数据 / 刚换世界时，
-        // 站着不动也必须继续重试，否则会永久停在"没有远场"的状态。
         final boolean needData = uploadedQuads < 0;
         if (!(due || movedEnough || needData)) return;
-        // 上一单还在转换/上传：本帧不重算（重算只是白跑一遍差集）。
         if (JOB_IN_FLIGHT.get()) return;
 
-        // DH 还没 tick 过（或它的启用清单正好为空）：不要据此撤下已上传的网格，
-        // 否则每次换世界开头都会闪一下"远场整个消失再回来"。
         if (DhLodMeshSink.enabledCount() == 0) {
             DhLodMeshSink.prune();
             return;
@@ -180,16 +160,11 @@ public final class DhFarFieldUploader {
         sync();
     }
 
-    //=====================================================================//
-    // 差集：DH 启用清单 vs 已上传集合                                        //
-    //=====================================================================//
 
     private static void sync() {
         DhLodMeshSink.prune();
         final List<DhLodMeshSink.Section> desired = DhLodMeshSink.renderCut();
 
-        // 纹理开关进 version：图集就绪后（或反过来）本帧必须重转一次顶点，
-        // 否则 tileId 永远停在旧值上。
         final boolean textured = DhFlags.PUBLISH_TEXTURES && DhTextureHandles.isPublished();
         final long textureBit = textured ? 1L : 0L;
 
@@ -238,7 +213,6 @@ public final class DhFarFieldUploader {
                     if (generation != GENERATION.get()) return;
                     final byte[] converted = convert(section, textured);
                     if (converted.length == 0) {
-                        // 全部越界丢弃：当作空节提交，C++ 会擦掉该节的桶。
                         NativeVulkan.uploadDhLodSection(section.pos, wanted.get(section.pos),
                                 section.minBlockX, section.minHeight, section.minBlockZ,
                                 section.blockWidth, EMPTY_BYTES);
@@ -263,7 +237,6 @@ public final class DhFarFieldUploader {
                 syncDone(uploaded, removed, sections.size(), quads, bytes,
                         (System.nanoTime() - start) / 1_000_000L);
             } catch (Throwable failure) {
-                // 工作线程上的异常绝不能冒泡（会让 executor 静默丢任务）。
                 log("转换/上传失败：" + failure);
             } finally {
                 JOB_IN_FLIGHT.set(false);
@@ -274,7 +247,6 @@ public final class DhFarFieldUploader {
     private static void syncDone(int uploaded, int removed, int sectionCount, int quads, long bytes,
                                  long millis) {
         syncs++;
-        // 由本店供着的节数换算"场上有网格"（>= 0）与 quad 数（日志/HUD 用）。
         uploadedQuads = quads;
         log("增量：上传 " + uploaded + " 节 / 撤下 " + removed + " 节"
                 + "（本轮应画 " + sectionCount + " 节 quad=" + quads + " 转换字节=" + bytes
@@ -311,7 +283,6 @@ public final class DhFarFieldUploader {
         final byte[] src = section.quads;
         final int limit = section.blockWidth + 1;
 
-        // 先数一遍有效 quad（越界的整块丢），再一次性分配。
         int validQuads = 0;
         for (int q = 0; q + 64 <= src.length; q += 64) {
             boolean valid = true;
@@ -345,30 +316,20 @@ public final class DhFarFieldUploader {
                 writeU16(out, d, readU16(src, s));
                 writeU16(out, d + 2, readU16(src, s + 2));
                 writeU16(out, d + 4, readU16(src, s + 4));
-                // 字节 6-9：(tileId, normalIndex)。tileId == 0 = 无纹理（C++ 侧
-                // pad2 = -1 ⇒ 着色器回退到顶点色 + DH 同款假纹理噪声）。
                 final int tileId = textureEnabled ? readU16(src, s + 14) : 0;
                 writeU16(out, d + 6, tileId);
-                writeU16(out, d + 8, src[s + 13] & 0x0F);   // DH normalIndex 0..5
-                out[d + 10] = src[s + 8];      // R
-                out[d + 11] = src[s + 9];      // G
-                out[d + 12] = src[s + 10];     // B
-                // light 字节原样拷贝：DH 的编码就是 (skyLight << 4) | blockLight，与我方
-                // byte 13 逐位相同（DH 的 terrain/blaze/vert.vsh：
-                // skyLight = lights/16u、blockLight = mod(lights,16)）。
-                // ⚠ 这里曾按"DH 低 4 位是 sky"的**错误**前提把 nibble 对调过，
-                // 于是 rchit 的 dhBakedBlockLight 读到的其实是 skyLight ——
-                // 夜间开阔地 sky 恒 15 ⇒ 整片远场均匀发一层灰、灯位毫无对比，
-                // 用户报"远景方块光源不亮"就是这一条。
+                writeU16(out, d + 8, src[s + 13] & 0x0F);
+                out[d + 10] = src[s + 8];
+                out[d + 11] = src[s + 9];
+                out[d + 12] = src[s + 10];
                 out[d + 13] = src[s + 6];
-                out[d + 14] = src[s + 12];     // EDhApiBlockMaterial
+                out[d + 14] = src[s + 12];
                 out[d + 15] = 0;
             }
             at += 64;
         }
         return out;
     }
-
     /** 无符号小端 u16：{@code textureTileId} 值域可以到 65535，读成有符号会变负。 */
     private static int readU16(byte[] src, int index) {
         return (src[index] & 0xFF) | ((src[index + 1] & 0xFF) << 8);
@@ -379,9 +340,6 @@ public final class DhFarFieldUploader {
         dst[index + 1] = (byte) ((value >> 8) & 0xFF);
     }
 
-    //=====================================================================//
-    // 生命周期 / 统计                                                      //
-    //=====================================================================//
 
     /** 关开关 / 换世界 / 离开世界时撤下远场网格与暂存区。 */
     public static void reset() {
@@ -404,7 +362,6 @@ public final class DhFarFieldUploader {
         if (released) return;
         released = true;
         DhLodMeshSink.clear();
-        // 让在飞的那一单作废：它落地时会把已撤下的网格又装回去。
         GENERATION.incrementAndGet();
         if (!UPLOADED.isEmpty()) {
             UPLOADED.clear();

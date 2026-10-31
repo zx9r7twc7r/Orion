@@ -2,33 +2,11 @@
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_ray_query : require
 
-// ===============================================================
-// 2026-10-14 射线自检（**临时诊断**，一条线程，确认后整块删除）
-// ===============================================================
-// 目的：把"硬件射线到底有没有命中"从"看颜色"变成**日志里的数字**。
-//
-// 背景：光柱里的逐样本 ray query、以及引擎自产的近场太阳影图（rt_sun_shadow.comp
-// 用同样的 rayQuery 生产）都表现成"永远可见"（洞里也照到太阳）。而已经排除掉的：
-//   · 设备扩展清单 24 条里**有** VK_KHR_ray_query（真转储确认）
-//   · SPIR-V 里有 OpCapability RayQueryKHR / OpTypeAccelerationStructureKHR
-//   · set layout 有 binding 9、描述符有写入日志、TLAS 有 300+ 实例
-//   · 建造 → compute 读的执行依赖我已补上（无改变）
-// ⇒ 只剩"命中判定"这一层，所以这里做**差分**：同一原点、同一方向，
-//   遍历 {cull mask} × {ray flags} 六个组合。
-//
-// 读法（C++ 侧打 [RAYTEST] 行）：
-//   · 任一组 > 0 ⇒ 硬件射线是通的，问题在掩码或 flags（按命中的那组改）
-//   · 全 0       ⇒ 硬件射线在这台机器上不产生命中 ⇒ 改走体素 DDA（不依赖 rayQuery）
-//
-// 射线一律**竖直向下**从相机出发：洞穴里几格内必然打到地面，是最不容易误判的方向。
 
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT sceneTlas;
 
-// [0..2] = 掩码 0x04 下的三种 flags；[3..5] = 掩码 0xFF 下的三种 flags（1 = 命中）
-// [6]     = 组合 [0] 的命中距离（-1 = 未命中）
-// [7]     = 相机 Y（证明 UBO 读通了）
 layout(set = 0, binding = 1, std430) writeonly buffer RayTestResult
 {
     float values[8];

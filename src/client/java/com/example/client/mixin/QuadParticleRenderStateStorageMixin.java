@@ -64,8 +64,6 @@ public abstract class QuadParticleRenderStateStorageMixin {
             int color,
             int lightCoords) {
         int marker = this.rtx$emissionMarkers[this.rtx$renderCursor++];
-        // Weather rain is rendered only by the RT dynamic-geometry chain.
-        // Do not also submit its vanilla raster copy over the RT output.
         if (!ParticleRtCapture.isRtRainMarker(marker)) {
             consumer.consume(x, y, z, xRot, yRot, zRot, wRot, scale, u0, u1, v0, v1, color, lightCoords);
         }

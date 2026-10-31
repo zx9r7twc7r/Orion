@@ -20,10 +20,6 @@ public class ModelFeatureRendererMixin {
 
     @Inject(method = "prepareModel", at = @At("HEAD"), cancellable = true)
     private <S> void rtx$beginModelCapture(ModelFeatureRenderer.Submit<S> submit, CallbackInfo ci) {
-        // 2026-10-20 实体遮挡剔除的消费点（生产路径唯一的模型几何入口）。
-        // 判定见 EntityVisibilityCuller，标记由 EntityRenderDispatcherMixin 写进状态。
-        // 只是不捕获几何：原版的状态提取、名牌、其它 feature 都不受影响；
-        // EntityRtCapture.endModel() 对空批次是安全的（RETURN 注入仍会走到）。
         if (submit.state() instanceof CullableRenderState culledState && culledState.orion$isCulled()) {
             ci.cancel();
             return;
@@ -38,8 +34,6 @@ public class ModelFeatureRendererMixin {
             }
         }
         if (proxy) {
-            // 合成代理:复刻原版 prepareModel 的 pose 起始点后直接捕获,
-            // 不进普通实体层,避免主光线看到自己的脸。
             this.poseStack.last().set(submit.pose());
             EntityRtCapture.captureLocalPlayerProxy(submit, this.poseStack);
             ci.cancel();

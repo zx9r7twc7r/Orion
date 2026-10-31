@@ -76,14 +76,12 @@ public final class CameraPathDriver {
     private static Path file;
     private static CameraPath path;
 
-    // 录制状态
     private static final List<CameraPath.Waypoint> recorded = new ArrayList<>();
     private static long lastRecordNanos;
     private static double recordedSeconds;
     private static int recordLimitFrames;
     private static boolean recordSaved;
 
-    // 回放状态
     private static boolean loop;
     private static int fixedStepHz = 60;
     private static long playFrame;
@@ -217,7 +215,6 @@ public final class CameraPathDriver {
             deltaSeconds = CameraPath.MAX_STEP_SECONDS;
         }
         recordedSeconds += deltaSeconds;
-        // 存原始角度；CameraPath.of() 统一展开，避免这里和读取端两套逻辑。
         recorded.add(new CameraPath.Waypoint(recordedSeconds,
                 new CameraPath.Pose(cameraPos.x, cameraPos.y, cameraPos.z,
                         cameraYRot, cameraXRot)));
@@ -239,7 +236,6 @@ public final class CameraPathDriver {
         playFrame++;
         if (seconds >= path.duration()) {
             if (loop) {
-                // 回到起点：帧号重置，保持"第 N 帧"与位姿的固定关系。
                 playFrame = startDelayFrames;
                 if (DIAGNOSTIC) {
                     System.out.println("[ORION CAMPATH] loop restart");
@@ -254,7 +250,6 @@ public final class CameraPathDriver {
                         Minecraft.getInstance(), file);
                 System.out.println("[ORION CAMPATH] playback finished: " + where
                         + " frames=" + (playFrame - startDelayFrames));
-                // 结束后继续用真实相机（不回弹），这样最后一帧的画面不会被破坏。
             }
             return null;
         }

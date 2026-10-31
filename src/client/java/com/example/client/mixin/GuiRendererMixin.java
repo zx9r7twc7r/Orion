@@ -40,9 +40,6 @@ public class GuiRendererMixin {
             GpuTexture loggedTexture =
                     mainRenderTarget.getColorTexture();
 
-            // HDR-2.4: whether the ST2084 encode survives the composite depends
-            // entirely on this format - PQ values quantised to 8 bits are the
-            // difference between real HDR10 and a banded approximation.
             System.out.println(
                     "[HDR-2.4 MAIN TARGET]"
                             + " format="
@@ -72,7 +69,6 @@ public class GuiRendererMixin {
         }
 
 
-        // vkCmdBlitImage 作为目标必须支持 COPY_DST。
         if ((colorTexture.usage() & GpuTexture.USAGE_COPY_DST) == 0) {
 
             System.err.println(

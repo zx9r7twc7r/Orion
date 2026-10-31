@@ -1,34 +1,7 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
-// 2026-10-14 体积光重构（第二刀）：太阳可见性从阴影图改为**逐样本 ray query**。
-// 逐样本遮挡只能靠硬件射线，故加此扩展；约定与生产端 rt_sun_shadow /
-// rt_terrain_height 逐字一致（同一 TLAS、同一 cull mask、同一 origin bias）。
 #extension GL_EXT_ray_query : require
 
-// Volumetric light (god rays). Runs after volumetric_cloud_composite.comp.
-//
-// 当前默认（2026-10-19 定案）：**空气体积光退役**，VL_AIR_GODRAYS = 0。
-//   · 空气散射只由体积雾的 rayColor 提供（只有一份
-//     VolumetricFog()）；本 pass 的空气分支默认不编译。
-//   · 水下分支仍由本 pass 负责：雾不覆盖水下介质，水下方向性光束由
-//     marchUnderwaterGodRays() 单独积分。
-//   · 默认输出中性（rgb = 0，a = 1），合成 pass 的 `scene * a + rgb`
-//     因此逐位不改变画面。
-//
-// A/B（VL_AIR_GODRAYS = 1）保留的旧空气路径：
-//   · 默认（VL_EXP_STEPS = 1）介质用 fog_density_common.glsl 的 FogDensity /
-//     VFOG_* 标定，与雾同源；VL_EXP_STEPS = 0 回退到本文件旧档薄霾；
-//   · 云影来自 cloudSunTransmittance()，地形影来自逐样本 ray query；
-//   · 视 march 为指数前密，太阳方向再做一段密度 march（雾内自吸收）。
-//
-// 历史（介质几度改动、空气分支为何退役）见 docs/decisions/god-rays.md
-// 云影与地形影（A/B 空气路径与水下路径共用）：
-//   1) 云影：cloudSunTransmittance() 对同一 tyndallDensity 云场做短 march，
-//      由 GUI 的“体积光云影采样”控制步数。
-//   2) 地形影：逐样本 ray query（隔 VL_SHADOW_RAY_STEP_STRIDE 步重算），
-//      不再使用 256² 太阳阴影图，避免薄墙/远墙/墙角漏光。
-//   3) 成本：每像素样本数 × 隔步重算的射线，是 A/B 空气路径的主要开销；
-//      默认路径的空气分支不执行。
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform CameraProperties
@@ -36,191 +9,45 @@ layout(set = 0, binding = 0) uniform CameraProperties
     #include "camera_ubo.glsl"
 } cam;
 
-// 水下波闪的波场来源。**2026-10-15 改为引用 water_wave_field.glsl**：
-// · 2026-10-17 后可见水面主后端已是 FFT 涌浪、ROUTE C 整体 `#if 0`
-//     屏蔽；本 pass 无描述符、拿不到 binding 59 ⇒ waterNaturalWaveGradientCapped()
-//     走无描述符回退分支 waterSundialWaveSlopeCapped()（解析细波层）。
-//   · 因此"同源"现在的准确含义是：同一个函数入口 + 同一只时钟
-//     （cam.padding → waveTime × 波速）+ 同一套振幅/波速滑杆；波面本身是 FFT，
-//     光柱用解析回退层，并非逐字同一个场。
-//   · 旧档（Seascape）已随旧后端一起退役，不再使用。
-//   · `WATER_WAVE_FIELD_NO_DESCRIPTORS` 让该头文件跳过 binding 33/59 的声明 ——
-//     本 pass 只要纯计算，不引入任何新 descriptor（binding 0..3 不变）。
-//     无描述符回退只读 cam.*（UBO），故不触碰被跳过的采样器。
 #define WATER_WAVE_FIELD_NO_DESCRIPTORS
 #include "water_wave_field.glsl"
 
-// 2026-10-19：A/B 空气路径复用体积雾的**同一份**介质（单一的
-// FogDensity）。常量值与 fogDensityAt() 都在这个共享头里，光柱与雾逐项同源；
-// 默认 VL_AIR_GODRAYS = 0 时只有水下分支运行，不读这份介质。
 #include "fog_density_common.glsl"
 
-// =====================================================
-// 2026-10-19 用户定案：**空气体积光退役**。
-//
-// 体积雾只有一份 VolumetricFog()，它的 rayColor 就是光柱；本工程额外再跑一套
-// 空气 march 只会：
-//   · 把同一层空气积分两遍（过亮）；
-//   · 在开阔天空下整片加亮 —— 用户原话"不是缝隙的话整个空旷场景都有体积光，
-//     挺假的"。光柱的"缝隙感"必须来自遮挡（雾侧的 sunShadowVisibility），
-//     不是靠再叠一层全局散射。
-//
-// 置 1 可恢复旧行为（仅用于 A/B 与回退；恢复时请同时把体积雾的 sunStrength
-// 调低，否则仍是两份）。
-// 水下分支不受影响：参考的 UnderwaterVolumetricFog 是独立函数，雾不覆盖
-// 水下介质，所以那一支继续由本 pass 负责。
-// =====================================================
 #define VL_AIR_GODRAYS 0
 
 layout(set = 0, binding = 1) uniform sampler3D cloudShapeNoise;
 layout(set = 0, binding = 2) uniform sampler3D cloudCurlNoise;
-// Reverse-Z scene depth, same resolution as this dispatch, so texelFetch is
-// exact.  Used to clip the march so the beams stop at solid geometry instead of
-// being drawn in front of it.
 layout(set = 0, binding = 3) uniform sampler2D sceneDepth;
-// 2026-10-14：这里原本还留着 binding 5 = sunShadowMap（早先那版"影图 vs 射线"
-// 的诊断块要用它）。诊断结束、连同诊断块一起删除：本 pass 的太阳可见性完全由
-// binding 9 的 ray query 给出，一个影图读取都不剩。
-// ⚠ 影图的**生产者**（rt_sun_shadow.comp）仍在每帧跑 —— 它现在只服务云与体积雾。
-// 输出口径（2026-10-04 引入，2026-10-06 起恢复全分辨率）：
-//   rgb = 沿视线累积的入散射辐亮度
-//   a   = 该段介质的透射率
-// 然后由 god_ray_composite.comp 做
-//   scene = scene * a + rgb
-// 深度感知上采样/合成。于是光柱会**正确遮挡背景**，而不是过去那种"在场景上叠一层
-// 均匀加法"—— 后者正是"不直视太阳也整屏发白"的机制。
 layout(rgba16f, set = 0, binding = 4) uniform image2D godRayTarget;
-// 上一帧的 godRayTarget（与当前目标同分辨率；兼容历史半分辨率档）。按相机运动
-// 重投影后做时间累积，用来消除每像素抖动噪声与条带。权重为 0（或历史无效）时
-// 退化为"只用本帧"。
 layout(set = 0, binding = 8) uniform sampler2D godRayHistory;
-// 2026-10-14 重构（第二刀）：场景 TLAS，每个 march 样本向太阳发一条遮蔽射线。
-//
-// 为什么必须换掉阴影图（历史 binding 5/7）：阴影图的 texel 世界尺寸随距离增长，
-// 旧档近图 256² 只覆盖 Z_EXTENT_BLOCKS=160 格（现为 1024²，仍有限），而本 pass 的
-// march 能伸到数百格 ⇒ 薄墙、远墙、墙角**必然**漏光。这是"怎么调偏置都还穿墙"的
-// 结构性原因，不是参数问题。
-// ray query 的遮挡误差只来自几何本身（单面/alpha 叶子按 cull mask 约定处理）。
 layout(set = 0, binding = 9) uniform accelerationStructureEXT sceneTlas;
-// 2026-10-14 重构（第二刀）：这里的 binding 5（sunShadowMap）与 binding 6
-//（terrainHeightMap）**已删**，理由：
-//   · sunShadowMap ―― 太阳可见性已改为逐样本 ray query（见 binding 9），本 pass
-//     里再无人读它。（它的历史：本 pass 早先**就是**逐样本射线，2026-09 为性能换成
-//     这张图，2026-10-14 靠"隔步重算 + 只做 any-hit"换回来。）
-//   · terrainHeightMap ―― 本 pass 的空气介质只按雾密度或旧档自有薄霾取值，不再吃
-//     地形高度场 ⇒ 地形高度场在本 pass 里没有消费者（生产端函数 terrainGroundHeight /
-//     terrainHeightUv 一次都没被调用）。
-// ⚠ 这两张图**仍在被云 pass 使用**，所以生产者 rt_sun_shadow / rt_terrain_height
-//   照旧每帧跑；这里只是本 pass 不再绑定它们。
-// ⚠ C++ 侧的 light set layout 也已删掉 5/6/7，只剩 0..4、8、9（见 VulkanCore.cpp
-//   的 lightBindings 与 bindingCount=7）。
 
 const int MAX_LIGHT_RAY_STEPS = 48;
-// 2026-10-04（P3）：6 → 12。云隙光柱的干净度几乎完全由这个数决定（旧档每步只有
-// 4-6 个样本，粗到看不出云缝结构）。
-// ⚠ 2026-10-14 补注：本 pass 自 2026-10-06 起已是**原分辨率** march，"像素数 1/4"
-// 那句前提早已不成立；而 2026-10-14 第二步又给每个 march 样本加了 ray query 遮挡
-//（隔 VL_SHADOW_RAY_STEP_STRIDE 步重算一次）⇒ 这两个数是本 pass 执行时最大的两笔
-// 开销（每像素样本数 × 隔步重算的射线）；默认只在水下分支发生，A/B 空气路径同样。
-// 要压成本就动它们。
 const int MAX_OCCLUSION_SAMPLES = 12;
 const float PI = 3.14159265359;
 const float MIN_TRANSMITTANCE = 0.02;
 const float SOLAR_LATITUDE_35_COS = 0.81915204429;
 
-// 散射的来源辐亮度不再是云层的 SUN_LIGHT_SCALE（云确实被 sunColor × 6 照亮，
-// 但空中散射的来源是阳光本身）。见下面的 GODRAY_SUN_ENERGY。
 
-// ---------------------------------------------------------------
-// 介质（当前默认不执行；A/B 与水下分别说明）
-//
-// 默认 VL_AIR_GODRAYS = 0：空气介质不参与本 pass，唯一来源是体积雾。
-// A/B（VL_AIR_GODRAYS = 1）：
-//   · VL_EXP_STEPS = 1：复用 fog_density_common.glsl 的 FogDensity 与 VFOG_*
-//     标定，与雾同一份介质；太阳项按参考的 `exp2(-lightingDensity *
-//     VFOG_SUNLIGHT_ABSORPTION) * phase`，相位 = HG * 0.7 + 0.035。
-//   · VL_EXP_STEPS = 0：回退到本文件自有的薄霾 + 指数高度层
-//     （VL_MEDIUM_SIGMA / VL_LAYER_*），只用于旧档对照。
-// 水下：介质换成水色吸收 + 散射，不读雾车道。
-//
-// 历史：2026-09-25 曾把介质与雾共用；2026-09-30 拆成“空气 + 雾”两个散射通道；
-// 2026-10-03 改成自有薄霾 + 雾加成；2026-10-19 最终版先接回单一 FogDensity，
-// 随后空气光柱退役。下面常量中带“旧档”的只在 VL_EXP_STEPS = 0 或水下生效。
-//
-// 光柱的明暗图案来自 visibility（云影 march × 逐样本太阳射线），介质只提供
-// 散射体 —— 树隙、云缝、门洞，任何遮挡体的剪影处都有光柱。
-// ---------------------------------------------------------------
 
-// 旧档薄纱（仅 VL_EXP_STEPS = 0 的 A/B 回退）：与高度无关，保证高空/天顶仍有
-// 一层极淡的散射。2026-10-04 再平衡（用户截图“地面惨白”）：天空已由
-// sky_atmosphere 画过大气散射，这里再按满程叠加就是二次计数 ⇒ 0.0022 → 0.0011。
 const float VL_MEDIUM_SIGMA = 0.0011;
-// 旧档层：本 pass 自己的指数高度剖面（形状取自解耦时雾的剖面，参考高度/标高是
-// 本文件常量）。数值取当时雾的出厂值（143 / 124），使旧档观感不跳变；当前
-// 默认路径与 VL_EXP_STEPS = 1 的共享介质都不读这些常量。
 const float VL_LAYER_SIGMA = 0.0022;
 const float VL_LAYER_HEIGHT = 143.0;
 const float VL_LAYER_SCALE_HEIGHT = 124.0;
-// 旧档回退的 exp 下限：防地下/深谷 exp 爆炸。当前共享的 fogDensityAt() 不含
-// 这个闸门，别把本常量当成雾的全局约束。
 const float VL_LAYER_MIN_EXPONENT = -4.0;
-// 旧档回退的雨天加厚（标量）；共享介质路径改用雾的 rain 标定，不再读它。
 const float VL_MEDIUM_RAIN_BOOST = 2.5;
 
-// 云层的 6.0，于是空中散射的上限也是 6 倍场景白 —— 这是"耀眼"的另一半。
-// 2026-09-30 重构把它砍到 0.9（≈0.3 倍场景白），用户 2026-10-01 反馈"体积光
-// 不明显"，这里抬到 2.0（≈0.67 倍场景白，回补当初那一刀的一部分）。
-//
-// 以下观感标定是空气光柱仍为主路径时定的；空气退役后 GODRAY_SUN_ENERGY 仍被
-// 水下分支与 VL_EXP_STEPS = 0 回退使用，默认空气路径不再执行。
-//
-// 2.0 的含义：太阳方向、满雾、正午，光束顶到约 0.67 倍场景白
-// （2.0 × ~0.62 相机高度因子 × ~0.5 光学深度）。黎明 strength ×3 且雾同样加厚，
-// 最亮处约 1.3-1.8，落在显示白附近靠 shoulder 收 —— 再往上会重新变成当初那个
-// "耀眼"的太阳锥，别一次提太多。
-// 整体偏亮/偏暗只改这一行（白天与夜里按比例同步平移）。
-// 2026-10-03 2.0 → 2.5：用户「不直视太阳也要看到光柱」再平衡的一部分（见
-// 通道拆分注释）。当初 2.0 的标定是在饱和日冕白盘共存时定的，白盘收敛到
-// 0.22× 后正向有充足余量；侧向的大头由 BIAS/AIR 承担，这里只补整体档位。
-// 正向合计仍 ≈2.2×（< 当初 0.9 档时日冕+光柱叠加的观感），别一次提太多。
 const float GODRAY_SUN_ENERGY = 2.5;
 
-// 月光占日照的能量比，与云层同一约定（volumetric_clouds.comp 的
-// CLOUD_MOON_LIGHT_SCALE = CLOUD_SUN_LIGHT_SCALE * (0.05 / 1.22077458876)，
-// 后者是月光满相位时的亮度归一）。
-// 2026-10-01：夜云的月光直射从 0.03 抬到 0.05，这里同步跟到 0.05 —— 两者必须
-// 同档，否则夜里云被照亮了而光柱还停在旧档，月光柱会显得比云还暗。
 const float GODRAY_MOON_FRACTION = 0.05 / 1.22077458876;
 
-// 相机高度因子（仅 VL_EXP_STEPS = 0 回退的空气路径）：
-//     heightDensity = clamp(exp(-(cameraY + WORLD_BASIC_HEIGHT) / 1200.0), 0.0, 1.0)
-// 相机越高，同一束光柱穿过的空气越少，于是整体压暗 —— 飞到云上时光柱不该还
-// 本树没有同名量，直接写进来。海平面附近 ≈ 0.65，y = 320 处 ≈ 0.36。
-// VL_EXP_STEPS = 1 的 A/B 路径改用参考的 lightEnergy，不再乘这个因子。
 const float GODRAY_HEIGHT_DENSITY_BASE = 500.0;
 const float GODRAY_HEIGHT_DENSITY_SCALE = 1200.0;
 
-// （`miePhase(LdotV, 0.6, 0.36)`）。当前主路径不再调用 miePhase()，下面两个
-// 常量只保留作历史对照。
 const float GODRAY_MIE_G = 0.6;
 const float GODRAY_MIE_G2 = 0.36;
 
-// ---------------------------------------------------------------
-// 2026-10-02 参考重构：相位 / 步长 / 雾内自阴影
-//
-//   1) 相位是 `HG(VdotL, 0.65) * 0.7 + 0.035`（L112）—— g = 0.65 时前向
-//      ≈0.79、侧向 ≈0.054、背向 ≈0.042，前/后比 ≈19×。旧 CS(0.6) 的前向
-//      尖峰更强；本树最终按参考改用 HG。
-//   2) 视 march 用指数前密分布（参考 L128-130 `pow(11,(i+noise)/n)*0.1-0.1`）：
-//      近处样本密、远处疏；jitter 折进指数而非位置偏移，所以无逐帧条带。
-//   3) A/B 路径沿太阳方向对**同一份雾密度**再做一段递增步长 march
-//      （参考 L148-156 的 `VFOG_VOLUMETRIC_LIGHTING`），得到“雾自己挡自己”的
-//      束内层次。
-//
-// 历史：2026-10-03 曾把相位改成“各向同性主体 + HG 前向加成”；2026-10-19
-// 按参考回到 HG * 0.7 + 0.035。VL_HG_PHASE 已退役，保留定义只为兼容旧编译
-// 命令；VL_EXP_STEPS 只影响 VL_AIR_GODRAYS = 1 的 A/B 空气路径。
-// ---------------------------------------------------------------
 #ifndef VL_HG_PHASE
 #define VL_HG_PHASE 1
 #endif
@@ -228,82 +55,24 @@ const float GODRAY_MIE_G2 = 0.36;
 #define VL_EXP_STEPS 1
 #endif
 
-// 参考 `HenyeyGreenstein(VdotL, 0.65) * 0.7` 的旧档常数。当前 A/B 路径直接读
-// 雾的 anisotropy lane（cloudParams8.x），下面三个常量已无人读取，仅保留作
-// 旧档说明。
 const float GODRAY_HG_G = 0.65;
 const float GODRAY_HG_SCALE = 0.7;
 const float VL_PHASE_ISOTROPIC = 1.0;
 
-// 2026-10-06 设置清理：雾内自阴影的四个常量（GODRAY_SUNLIGHT_STEPS /
-// MAX_GODRAY_SUNLIGHT_STEPS / GODRAY_SUNLIGHT_STEPLENGTH / GODRAY_SUNLIGHT_ABSORPTION）
-// 随设置删除，着色器里那段 march 已移除。
 
-// 取代旧的"体积光最远距离"（出厂 288 格）。仍会被场景深度截断，
-// 所以近处几何的像素照旧只走几步。
-// 2026-10-03 重构再收：288 → 128。恒定薄霾下，开阔天空像素的加法冲程
-// （对天空亮度额外叠的光晕总量）= sigma × marchEnd × 光源项，由这个距离
-// 直接界定；且 128 格外的光柱经透视压缩早已细过一像素。指数步长仍前密
-// 后疏，同样的步数下近景光柱的采样密度反而更高。
 const float GODRAY_MAX_DISTANCE = 128.0;
 
-// 取代旧的"体积光强度"旋钮：太阳越低光柱越强。
-// 注意它**不是**调整体亮度的旋钮 —— 整体偏亮/偏暗改 GODRAY_SUN_ENERGY
-// （那个同时平移白天与夜里，且定住太阳方向那团的上限）；改这里只动昼夜对比。
-// 2026-10-03 正午档 1.0 → 1.8：当天 sky_atmosphere 七修把米氏日晕接到日冕
-// 滑杆（0.18 → 0.25× 标定）后，之前"白天体积光"的观感大头其实是被云影雕刻
-// 的饱和日冕白盘（比本 pass 高约两个数量级），白盘收到 0.22× 后真正的光柱
-// 显出来了，但正午 1.0 的基线撑不起 beam 观感。只抬正午、不动 MORNING
-// （黎明 1.3-1.8 的显示白峰值是 10-02 标定过的，保持），也不动
-// GODRAY_SUN_ENERGY（文件头警告过别回"耀眼太阳锥"）。
 const float GODRAY_MORNING_STRENGTH = 3.0;
 const float GODRAY_NOON_STRENGTH = 1.8;
 
-// The cloud shadow march reuses the deck's own extinction, so the beams stay
-// consistent with how the deck shades itself.  This multiplier makes the
-// contrast between lit and shadowed air a little stronger than the raw cloud
-// extinction gives, which is what reads as distinct beams rather than a
-// uniform glow.
 const float OCCLUSION_EXTINCTION_SCALE = 1.8;
 const float OCCLUSION_MAX_OPTICAL_DEPTH = 6.0;
 
-// 2026-10-14 重构（第二刀）：`GODRAY_TERRAIN_SHADOW_STRENGTH` 已删。
-// 它原本是"阴影图贡献了多少"的诊断开关（1.0 = 地形完全遮挡 / 0.0 = 退回只有云影），
-// 出厂就是 1.0 ⇒ 用途只剩 A/B。阴影图换成逐样本 ray query 后遮挡是 0/1 硬判定，
-// 再乘一个"强度"只可能削弱物理，没有留在代码里的理由。
-//（原代码形如 `mix(1.0, terrainVisibility, 1.0)`，恒等于 `terrainVisibility`，
-// 所以删掉它是**逐位等价**的改动。）
 
-// ---------------------------------------------------------------
-// 水下体积光（2026-09-30 水下视角 = 体积雾 + 体积光）
-//
-// 旧版在相机入水时把整个 pass 关掉（水下的散射交给 rt_test.rgen 的
-// applyUnderwaterWaterColumn），结果水下只有一层环境雾色、没有任何
-// 方向性光束 —— 用户判为"水下应该有体积雾和光"。水下分支照此补上。
-//
-// 分工：水柱（rgen）管天空穹顶的环境雾色与消光；
-// 这里只管**太阳/月亮的方向性光束**。介质是水：
-//   消光 = 水色吸收（与水柱同一套滑杆）+ 入散射系数
-//   光束从哪里来 = 波面入射点的四重门：菲涅尔透射 × 水下斜程吸收 ×
-//   波闪（坡度聚焦）× 云影，再乘地形影（逐样本 ray query，
-//   昼夜方向约定与空气侧一致 —— 夜里自动翻到月亮方向）。
-// 与 water_wave_field.glsl 的关系：本文件确实 include 该头（见顶部），并用
-// WATER_WAVE_FIELD_NO_DESCRIPTORS 跳过 binding 33/59 的声明，只调用
-// waterNaturalWaveGradientCapped()；无描述符路径在该头里回退到解析 
-// 细波层（ROUTE C 已屏蔽），因此不扩 C++ 描述符布局。旧档 Seascape / psrdnoise
-// 已随旧后端退役。
-// 波闪的用途是"光束透过波面的聚散"，不需要与表面法线逐波对齐。
-// ---------------------------------------------------------------
 const float WATER_GODRAY_MAX_DISTANCE = 48.0;
-// 入散射系数档位。waterScatterColor × amount ≈ (0.019,0.13,0.114)，
-// ×0.35 ≈ 0.04/格 —— 12-24 步、每步 2-4 格的 march 积分出可读的光束，
-// 又不会把整屏顶到曝光上限。
 const float WATER_GODRAY_SCATTER_SCALE = 0.35;
-// 波闪强度（坡度 → 聚焦增益的放大系数）与夹顶范围。
 const float WATER_GODRAY_SHIMMER = 8.0;
-// 出水 bound 的波幅余量：波峰最高 ~0.15，留 0.25 防止 march 越过波面。
 const float WATER_GODRAY_WAVE_AMPLITUDE = 0.25;
-// 空气→水菲涅尔的 Schlick F0：((1-1.33)/(1+1.33))² ≈ 0.020。
 const float WATER_SURFACE_F0 = 0.020;
 
 // 水色三件套 —— 与 rt_test.rgen 的同名函数逐字同步（真源在 rgen，本 pass
@@ -344,14 +113,11 @@ float waterScatteringAmount()
 float waterGodRayShimmer(vec2 worldXZ, vec3 lightDirection)
 {
     vec2 lightAzimuth = normalize(lightDirection.xz + vec2(1.0e-5, 0.0));
-    // 强度倍率取与可见水面同一个 cam.waterFftParams.y（GUI「海浪」）：关掉海浪
-    // （<= 0）时可见水面与波闪一起消失 ⇒ 此处返回中性 1.0（不闪）。
     const float amplitude = cam.waterFftParams.y;
     if(amplitude <= 0.0)
     {
         return 1.0;
     }
-    // 该 out 参数在此只作形参占位（回退路径恒写 0），声明为局部变量即可。
     float shimmerCameraDistance = 0.0;
     float slope = dot(
         waterNaturalWaveGradientCapped(worldXZ, shimmerCameraDistance, 2, 1.0, 0.0),
@@ -364,20 +130,6 @@ float saturate(float value)
     return clamp(value, 0.0, 1.0);
 }
 
-// 抖动的**时间**种子。只有时域累积真正在工作时才逐帧刷新。
-//
-// 抖动的全部意义是靠时域平均把条带磨掉（march 步位置 + 阴影查表各一次）。一旦
-// 没有时域累积（历史权重 0 = 出厂/用户当前档，或历史失效），逐帧换相位就只剩
-// "每帧重新掷一次"——在缝隙、叶隙、剪影这类一两像素宽的特征上就是逐帧二值翻转
-// = 闪烁，而唯一的解药此时并不存在。冻结帧号项后，每像素仍保留固定的空间相位
-//（继续打散条带），但结果不随时间抖：静止时画面稳定，静止看闪烁即消失。
-// 2026-10-06 逐像素帧种子（叶隙闪烁根治）。
-//
-// 之前这个种子是**全局**判定（只看 historyValid / 权重 / 速度），但真正决定
-// "本像素这一跳能不能被历史平均掉"的是**本像素自己**：把 marchEnd 处的世界点重投影一次，
-// 落在画面外、或相机刚重置的像素根本没有可用历史 —— 那些像素继续逐帧换采样，
-// 只会让叶隙的二值翻转更闪。所以改成：由 main 在 march **之前**按像素写好，
-// 这里只读（temporalJitter 的相位与 SUN_SHADOW_FRAME_SEED 都用它）。
 uint gGodRayFrameSeed = 0u;
 
 uint godRayJitterFrameSeed()
@@ -392,10 +144,6 @@ float temporalJitter(ivec2 pixel)
     state *= 2246822519u;
     state ^= state >> 13u;
     float value = float(state & 0x00ffffffu) / float(0x01000000u);
-    // 2026-10-06：帧间相位与体积云同源，改成**黄金比低差异序列**（原来把 frameCount
-    // 直接揉进哈希 = 逐帧白噪声，历史只有几帧时平均不收敛 ⇒ 光柱逐帧闪）。
-    // godRayJitterFrameSeed 的时域门控原样保留：无历史时返回 0 ⇒ 相位锁 0，
-    // 保持静止图案（没有时域可平均，随机化只会让它爬）。
     return fract(
         value + float(godRayJitterFrameSeed() & 0x3ffu) * 0.6180339887498949);
 }
@@ -462,39 +210,11 @@ float sceneDistanceForDepth(vec2 ndc, float depthValue)
     return length(sceneViewPosition.xyz / sceneViewPosition.w);
 }
 
-// ===============================================================
-// 2026-10-04 重构（P1）：时间重投影 + {散射, 透射率} 输出
-//
-// 为什么改：旧档全分辨率逐像素 march、且把结果**纯加法**写回场景。两个后果
-// 都被用户实测到了 ——（a）加法项没有自己的消光，与天空大气二次计数 ⇒ 整屏发白；
-// （b）没有时间累积，抖动只能靠每帧不同的噪声"隐掉"，条带与噪点靠步数硬堆。
-//
-// 现结构：本 pass march 后输出 rgb=入散射、a=透射率；god_ray_composite.comp
-// 做深度感知上采样并合成 `scene*a+rgb`。于是光柱既遮挡背景（有体积感），又能在
-// 同一批像素上做时间累积（更干净）。2026-10-04 最初为 1/2 分辨率，2026-10-06
-// 起恢复全分辨率；合成/上采样代码保留以兼容半分辨率 A/B。
-// ===============================================================
 
-// 透射率 1、无辐射 = 合成的恒等元（禁用/提前退出的像素都写它）。
 const vec4 GODRAY_NEUTRAL = vec4(0.0, 0.0, 0.0, 1.0);
 
-// 重投影时天空像素（深度 0，无几何）使用的固定距离：取该视角方向上 64 格处的
-// 空气点做重投影，足够代表"这一段视线"的视差。
 const float VL_REPROJECT_SKY_DISTANCE = 64.0;
-// 有界历史：把历史值钳到本帧值的这个倍数内，抑制鬼影/拖尾。
 const float VL_REPROJECT_HISTORY_MAX = 2.0;
-// 2026-10-06 根治"叶隙闪烁"：下界必须比上界宽得多。
-//
-// 原来的钳制是**相对本帧的比值钳制** [radiance/2, radiance*2]。它在连续噪声上没问题，
-// 但在**二值翻转**（叶隙：本帧要么被叶面挡住≈0、要么是光柱）面前是自毁的 ——
-// 被判为"暗"的那几帧，历史被立刻钳到 ≤ 0，等亮帧回来时历史已经没了 ⇒ 结果在
-// 0 与光柱之间跳，正是"怎么调参都治不好"的那一半（L1020 记的是另一半）。
-//
-// 上界保持 2.0（压亮侧漏光 / 防鬼影的原始意图不变）；下界放宽到 1/8：
-//   · 短暂翻转（叶面在几帧里被抖过）⇒ 历史衰减而不是被清零 ⇒ 能被平均掉；
-//   · 持续变暗（真的被挡住 / 云真的移走）⇒ 仍然按 (1 - historyWeight) 每帧衰减
-//     ⇒ 约 10 帧内掉到 10% 以下，不存在拖影。
-// 这是"防鬼影"与"抗二值翻转"之间唯一诚实的折中，且只影响体积光这一个消费者。
 const float VL_REPROJECT_HISTORY_MAX_DOWN = 8.0;
 
 void storeGodRay(ivec2 pixel, vec3 radiance, float transmittance)
@@ -523,19 +243,11 @@ vec2 reprojectUv(vec3 worldPoint, out bool valid)
         return vec2(-1.0);
     }
     vec2 prevNdc = prevClip.xy / prevClip.w;
-    // 2026-10-05：范围从 1.5 收紧到 1.0。
-    //
-    // 1.5 的松边界允许"上一帧落在画面外 25% 以内"的像素继续复用历史；但画面外的
-    // uv 会被采样器 clamp 到边缘纹素，等于把屏幕边缘那一列/行的历史整条抹过来 ——
-    // 表现就是快速转视角时屏幕边缘出现一条亮带（白边）。画面外意味着该像素本帧
-    // 是新暴露的，本来就不存在可用的历史，拒掉才是正确行为。
     if(any(greaterThan(abs(prevNdc), vec2(1.0))))
     {
         return vec2(-1.0);
     }
     valid = true;
-    // 本 pass 的 ndc 约定是 y 取反后的（见 main 里的 ndc.y = -ndc.y），
-    // 所以 uv 的 y 要再翻回来才对得上纹理坐标。
     return vec2(prevNdc.x * 0.5 + 0.5, 0.5 - prevNdc.y * 0.5);
 }
 
@@ -547,10 +259,6 @@ vec2 reprojectUv(vec3 worldPoint, out bool valid)
 // 档位上不成立 —— 它只在半分辨率档才会发生。
 float conservativeDepth(ivec2 pixel, ivec2 fullSize)
 {
-    // 2026-10-06：改成**比例自适应**。原来硬编码 `halfPixel * 2` —— 那是"1/2 分辨率"
-    // 的假设。现在体积光改成原分辨率 march（C++ 里 godRayWidth 不再 /2），比例就是
-    // 1:1，本函数退化成"取本像素自己的深度"（这才是叶隙该有的锐度）。
-    // 保留 2×2 分支是为了还能退回半分辨率档做 A/B。
     ivec2 targetSize = max(imageSize(godRayTarget), ivec2(1));
     ivec2 scale = max(fullSize / targetSize, ivec2(1));
     ivec2 base = clamp(pixel * scale, ivec2(0), max(fullSize - scale, ivec2(0)));
@@ -559,36 +267,14 @@ float conservativeDepth(ivec2 pixel, ivec2 fullSize)
     {
         for(int x = 0; x < scale.x; ++x)
         {
-            // reverse-Z：值越大越近 ⇒ 取 max 即"最近的那个面"（保守截断）。
             d = max(d, texelFetch(sceneDepth, base + ivec2(x, y), 0).r);
         }
     }
     return d;
 }
 
-// `tyndall_cloud_field.glsl` 提供 tyndallInterval / tyndallDensity / tyndallTime。
-// 它要求调用方先声明 cam 与 cloudShapeNoise（还有 cloudCurlNoise），上面的 UBO
-// 与 sampler 声明已经满足。顺序与 volumetric_clouds.comp 一致。
 #include "tyndall_cloud_field.glsl"
 
-// 2026-10-14 重构（第二刀）：本 pass 不再需要"太阳阴影图"这一整套 —— 太阳可见性
-// 已换成逐样本 ray query（见 binding 9 与 sunVisibilityRayQuery）。于是这里删掉了
-// 原来的四件事：
-//   · #define SUN_SHADOW_CONSUMER / #define SUN_SHADOW_FAR_MAP + binding 7
-//     （近/远两张图的查表包装器）
-//   · #define SUN_SHADOW_PCF_TAPS_4（为那张图做的 2×2 PCF）
-//   · #define SUN_SHADOW_FRAME_SEED（给 PCF 抖动用的帧种子）
-//   · #define TERRAIN_HEIGHT_CONSUMER + #include "terrain_height.glsl"
-//     （体积雾清空后本 pass 的介质不再吃雾的高度剖面 ⇒ 地形高度场没有消费者）
-//
-// 这个库**仍然要 include，只为一件事**：它定义了 SUN_SHADOW_CULL_MASK 与
-// SUN_SHADOW_ORIGIN_BIAS —— 我们射线的掩码/偏置必须与生产端逐字一致
-//（见 sun_shadow.glsl:118/126）。这两个常量在库的"公共区"，与消费者无关。
-//
-// 为什么删掉消费者宏却仍然能编译：库里整个消费者半边包在
-// `#ifdef SUN_SHADOW_CONSUMER`（sun_shadow.glsl:289-450）里，不定义它，
-// 那段对 `sunShadowMap` 的引用根本不会被编译（同一个开关也是 rgen 用的）。
-// 2026-10-14：诊断结束，消费者半边保持**关闭** —— 本 pass 不再读任何影图。
 #include "sun_shadow.glsl"
 
 // Fraction of sunlight that survives the cloud deck between `position` and the
@@ -615,13 +301,9 @@ float cloudSunTransmittance(vec3 position, vec3 lightDirection)
         vec3 samplePosition = position + lightDirection *
             (entryDistance + stepLength * (float(i) + 0.5));
 #if C3_CLOUD_SHADOW_GATE_ON
-        // 云影密度门控（tyndall_cloud_field.glsl 单一真源，与 rgen 地形云影
-        // 同一道门槛）：只有大块云核参与，保证光柱里的云影与地面云影一致。
         opticalDepth += tyndallShadowGate(
             tyndallDensity(samplePosition, true, stepLength)) * stepLength;
 #else
-        // tyndallDensity tests the shell height *before* it touches a texture,
-        // so samples that miss the deck cost almost nothing.
         opticalDepth += tyndallDensity(samplePosition, true, stepLength) * stepLength;
 #endif
         if(opticalDepth * cam.cloudParams2.z >= OCCLUSION_MAX_OPTICAL_DEPTH)
@@ -632,35 +314,8 @@ float cloudSunTransmittance(vec3 position, vec3 lightDirection)
     return exp(-opticalDepth * cam.cloudParams2.z * OCCLUSION_EXTINCTION_SCALE);
 }
 
-// 空气介质（仅 A/B 空气路径）：
-//   · VL_EXP_STEPS = 1：复用 fog_density_common.glsl 的 fogDensityAt()，与体积雾
-//     同一份介质；
-//   · VL_EXP_STEPS = 0：本文件自有的 VL_MEDIUM_SIGMA / VL_LAYER_* 旧档薄霾。
-// 默认 VL_AIR_GODRAYS = 0 时两条空气路径都不编译，只有水下分支运行。
-// 与雾唯一始终共享的只剩“太阳可见性”的约定（SUN_SHADOW_CULL_MASK /
-// SUN_SHADOW_ORIGIN_BIAS），那是射线口径，不是介质。
 
-// ===============================================================
-// 2026-10-14 重构（第二刀）：逐样本 ray query 太阳可见性
-// ===============================================================
-// 取代 `sunShadowVisibility()`（阴影图 + PCF + Z 淡出）。三条理由，按重要性排：
-//   1. **距离**：阴影图的 texel 世界尺寸随距离平方增长，而 march 伸到 288 格 ⇒
-//      薄墙/远墙/墙角必然漏光。这是"怎么调偏置都还穿墙"的结构性原因。
-//      ray query 的遮挡误差只来自几何本身。
-//   2. **口径一致**：云影走 `cloudSunTransmittance()`（真实 march），地形影却走一张图，
-//      同一根太阳射线被两套口径判断。现在两者都是射线。
-//   3. **成本可控**：见 VL_SHADOW_RAY_STEP_STRIDE —— 可见性沿视线变化很慢，
-//      隔步重算、中间沿用，成本降到 1/4 而看不出差别。
-//
-// 值得注意的是：本 pass 早先**就是**逐样本射线，2026-09 才为性能换成阴影图
-// （见 binding 5 的注释）。这次换回来，靠的是隔步重算 + 只做 any-hit。
-//
-// flags/mask/bias 与生产端逐字一致（cpp/shaders/sun_shadow.glsl:220-244）：
-// `TerminateOnFirstHit|SkipClosestHit` —— 我们只问"路上有没有东西"，永远不会
-// 调用命中着色器。这是硬件能做的最便宜的射线。
 const float VL_SHADOW_RAY_DISTANCE = 1024.0;
-// 隔几步发一条新射线（1 = 每步都发，最准也最贵）。可见性沿一条 288 格的视线变化很慢
-// —— 只有穿门洞、叶隙、墙角时才会跳 —— 所以 4 是"看不出差别"的折中。
 const int VL_SHADOW_RAY_STEP_STRIDE = 4;
 
 float sunVisibilityRayQuery(vec3 position, vec3 sunDirection)
@@ -703,8 +358,6 @@ vec3 marchUnderwaterGodRays(
     int steps
 )
 {
-    // 出水 bound：视线朝上时 march 必须在水面停下 —— 水面之上是空气，
-    // 那段不属于水下介质（空气分支在相机入水时不运行，天空像素本来就亮）。
     float marchEnd = min(sceneDistance, WATER_GODRAY_MAX_DISTANCE);
     if(worldDirection.y > 1.0e-4)
     {
@@ -720,26 +373,19 @@ vec3 marchUnderwaterGodRays(
     float stepLength = marchEnd / float(steps);
     float surfaceY = cam.waterSimSurfaceAndOrigin.x;
 
-    // 介质：消光 = 水色吸收 + 入散射；入散射系数单独给档（见 SCALE 注释）。
     vec3 sigmaAbsorption = waterAbsorptionColor();
     vec3 sigmaScatter = waterScatterColor() * waterScatteringAmount() *
         WATER_GODRAY_SCATTER_SCALE;
     vec3 sigmaExtinction = sigmaAbsorption + sigmaScatter;
 
-    // 波面入射的菲涅尔透射（空气→水，Schlick）。太阳贴地平时 cos→0，
-    // 透射→0，贴地平的光本来也进不了水。
     float cosIncidence = clamp(lightDirection.y, 0.0, 1.0);
     float fresnelReflect = WATER_SURFACE_F0 +
         (1.0 - WATER_SURFACE_F0) * pow(1.0 - cosIncidence, 5.0);
     float surfaceTransmittance = 1.0 - fresnelReflect;
 
     vec3 radiance = vec3(0.0);
-    // 水的消光是逐通道的（红先死），视线方向的自消光跟着用 vec3；
-    // 提前退出看最大通道 —— 三个通道都衰减到阈值以下才停。
     vec3 transmittance = vec3(1.0);
     float distance = jitter * stepLength;
-    // 2026-10-14 重构（第二刀）：地形影的射线结果，隔 VL_SHADOW_RAY_STEP_STRIDE
-    // 步重算一次，中间沿用（可见性沿视线变化很慢）。
     float terrainVisibility = 1.0;
 
     for(int step = 0; step < MAX_LIGHT_RAY_STEPS; ++step)
@@ -751,14 +397,9 @@ vec3 marchUnderwaterGodRays(
         float depthBelowSurface = surfaceY - position.y;
         if(depthBelowSurface > 0.0)
         {
-            // 光源到样本的水下斜程（垂直深度按光线仰角换算），波面入射点
-            // 就在这条斜程与水面的交点上。斜程吸收是逐通道的（红先死），
-            // 进辐亮度项给光束上色，不进标量 visibility。
             float slantDepth = depthBelowSurface / max(lightDirection.y, 0.05);
             vec3 surfaceCrossing = position + lightDirection * slantDepth;
             vec3 lightPathTransmittance = exp(-sigmaAbsorption * slantDepth);
-            // 2026-10-14 重构（第二刀）：地形影从阴影图换成逐样本 ray query
-            //（隔步重算，中间沿用）。
             if(step % VL_SHADOW_RAY_STEP_STRIDE == 0)
             {
                 terrainVisibility = sunVisibilityRayQuery(position, lightDirection);
@@ -771,8 +412,6 @@ vec3 marchUnderwaterGodRays(
                 lightEnergy * visibility * phase * sigmaScatter * strength *
                 stepLength;
         }
-        // 视线方向的自消光用完整消光（吸收+散射），与空气分支同一做法，
-        // 防止浓介质把 march 积分到无穷。
         transmittance *= exp(-sigmaExtinction * stepLength);
         distance += stepLength;
     }
@@ -787,12 +426,7 @@ void main()
     {
         return;
     }
-    // 注意：下面每个"无事可做"的分支都必须写中性值（透射率 1、无辐射）——
-    // 否则上一次的历史会留在目标里，被合成 pass 当成有效结果吸收进画面。
 
-    // 2026-09-30：相机在水里不再整体关掉 —— 改走 marchUnderwaterGodRays()
-    // 的水下分支（介质换成水、闸门换成波面四重门），与 rgen 水柱按来源分账：
-    // 水柱管天空穹顶的环境雾色，这里只加太阳/月亮的方向性光束。
     if(cam.godRayParams0.x < 0.5 || abs(cam.weatherParams.z - 1.0) >= 0.25)
     {
         storeGodRayNeutral(pixel);
@@ -801,9 +435,6 @@ void main()
 
     vec3 sunDirection0 = sunDirection();
     float sunElevation = sunDirection0.y;
-    // sunDirection() keeps travelling below the horizon after sunset, so the
-    // *lit* direction has to flip to the moon there or the beams would come out
-    // of the ground.  Same convention as the cloud deck.
     vec3 lightDirection = sunElevation >= 0.0 ? sunDirection0 : -sunDirection0;
     if(abs(lightDirection.y) <= 1.0e-4)
     {
@@ -825,18 +456,9 @@ void main()
         vec4(normalize(viewTarget), 0.0)).xyz);
     vec3 cameraPosition = cam.viewInverse[3].xyz;
 
-    // A ray that hits terrain never gets to scatter in front of it, so clipping
-    // to the scene is both correct and the single biggest cost saver: most
-    // pixels are a few dozen blocks from geometry.
-    // 常从场景全分辨率深度图取；若将来退回半分辨率档，conservativeDepth() 会
-    // 按比例取 2×2 里最近的那个面（保守截断）。
     ivec2 fullSize = ivec2(textureSize(sceneDepth, 0));
     float depthValue = conservativeDepth(pixel, fullSize);
 
-    // 2026-10-06 逐像素帧种子（叶隙闪烁根治）。
-    // 用 marchEnd 处的世界点做一次重投影：只有"有可用上一帧同位置信号"的像素才允许
-    // 逐帧换采样（由历史平均掉）；否则冻结相位与阴影查表帧号 ⇒ 图案静止、不再闪。
-    // 放在 march 之前：步进相位与阴影查表都发生在 march 内部，必须先用上。
     {
         bool seedValid;
         vec3 seedPoint = cameraPosition + worldDirection *
@@ -859,47 +481,21 @@ void main()
     float stepLength = marchEnd / float(steps);
     float jitter = temporalJitter(pixel);
 #if VL_EXP_STEPS
-    // 2026-10-02 参考重构（指数前密步长）：参考 VolumetricFog.glsl:128-130
-    //   exponential = pow(11.0, (i + noise) * rSteps); t = exponential * 0.1 - 0.1
-    // 里 `t` 是**归一化光线参数**（不是世界长度），位置 = start + t * rayVector。
-    // 本树改进：把末样本归一化到恰好 1.0（即 marchEnd）—— 参考的原始公式在
-    // noise→0 时只走到 ~0.64，远处一整段会丢。jitter（即参考的 noise）折进
-    // 指数而非位置偏移，与参考一致：近密远疏，且没有逐帧位置条带。
     float rayStepInv = 1.0 / float(steps);
     float expStepNorm = max(
         pow(11.0, (float(steps - 1) + jitter) * rayStepInv) * 0.1 - 0.1, 1.0e-4);
-    // 参考 VolumetricFog.glsl:94：rayLength = length(rayVector) * rSteps * 0.23979
-    // ⇒ 与 stepDensity 的标定同源。
     const float vlRayLength = marchEnd * rayStepInv * 0.23979;
 #endif
 
-    // 昼夜因子（水下分支与 VL_EXP_STEPS = 0 回退使用）：太阳越低越强。
-    // `1 - sunY` 在正午为 0、地平线为 1（夜晚被 clamp 到 1），五次方让它
-    // 只在低太阳时才明显抬起来。用的是**未翻转**的太阳高度。
     float timeStrength = pow(clamp(1.0 - sunElevation, 0.0, 1.0), 5.0);
-    // 2026-10-03 新增强度通道：godRayParams0.w（CameraUBO.godRayParams[3]，
-    // 09-25 重构后一直空置的保留位，全树无人读）。设置界面「体积光强度」
-    // 滑杆 → g_godRayIntensity → 本 lane，默认 1.0 = 与无滑杆档逐位一致。
-    // 乘在 strength 上（而不是 GODRAY_SUN_ENERGY）是因为它同时喂空气与水下
-    // 两个分支，且不碰 10-02 定下的黎明显示白峰值标定。
     float intensityScale = clamp(cam.godRayParams0.w, 0.0, 4.0);
     float strength = mix(GODRAY_NOON_STRENGTH, GODRAY_MORNING_STRENGTH, timeStrength)
         * intensityScale;
-    // 相位：参考 VolumetricFog.glsl:112 的 HG(VdotL, g) * 0.7 + 0.035。
-    // g 取雾的 anisotropy lane（cloudParams8.x，默认 0.65）；g = 0.65 时
-    // 前向 ≈0.79、侧向 ≈0.054、背向 ≈0.035。旧档“各向同性主体 + HG 加成”
-    // 的写法已退役，不再有 ≈1.0 的侧向底。
     float phaseCos = dot(worldDirection, lightDirection);
     float phase = henyeyGreenstein(phaseCos, cam.cloudParams8.x) * 0.7 + 0.035;
-    // 昼夜因子 × 相机高度因子（仅 VL_EXP_STEPS = 0 回退的空气路径使用）。
-    // VL_EXP_STEPS = 1 的参考路径改用 lightEnergy * cloudParams8.y *
-    // intensityScale，不再乘 time/height；默认空气退役后 sunStrength 不参与输出。
     float sunStrength = strength * clamp(exp(-(cameraPosition.y +
         GODRAY_HEIGHT_DENSITY_BASE) / GODRAY_HEIGHT_DENSITY_SCALE), 0.0, 1.0);
 
-    // 水下分支：介质换成水、光束闸门换成波面四重门。写出口径与空气分支
-    // 完全一致（加在最终场景图上），写完直接返回 —— 下面的雾场参数与
-    // 空气 march 全部不适用。
     if(cam.waterSimState.w != 0u)
     {
         vec3 waterRadiance = marchUnderwaterGodRays(
@@ -913,25 +509,19 @@ void main()
             rayleighPhase(dot(worldDirection, lightDirection)),
             jitter,
             steps);
-        // 水下介质换水后只贡献方向性光束，自消光未建模 ⇒ 透射率恒 1
-        //（与旧档"纯加法"口径一致，只是加法改由合成 pass 完成）。
         storeGodRay(pixel, waterRadiance, 1.0);
         return;
     }
 
 #if VL_AIR_GODRAYS
-    // 互斥：雾开启时本 pass 空气分支输出中性（见文件头 VL_AIR_GODRAYS 说明）。
     if(cam.cloudParams7.x > 0.5)
     {
         storeGodRayNeutral(pixel);
         return;
     }
 
-    // 介质参数在循环外解析一次。
     float rain = saturate(cam.weatherParams.x);
 
-    // 参考 VolumetricFog.glsl:104-107 + Volumetric_FS.glsl:173-186 的标定。
-    // 与 volumetric_fog.glsl 的 evaluateAnalyticFog() 逐项同式。
     const float vlBaseDensity =
         max(cam.cloudParams7.y, 0.0) *
         (rain * 0.15 + 0.08) /
@@ -944,33 +534,14 @@ void main()
         min(cam.cloudParams7.z, cam.cloudParams7.w);
     const int vlSunSteps =
         clamp(int(cam.cloudParams9.y + 0.5), 1, 8);
-    // 2026-10-19：介质**重新接回**雾车道（与参考的单一 FogDensity 一致）。
-    // 上一版（同日早先）为了"调雾不搬动光柱"曾把光柱介质解耦成本文件常量；
-    //
-    // 2026-10-06 设置清理：雾内自阴影标定（godRaySelfShadow / godRayParams2.z）
-    // 出厂为 0（no-op），随设置一并删除 —— 束内明暗由下面的 visibility
-    //（云影 × 逐样本射线影）给出。
 
     vec3 radiance = vec3(0.0);
     float transmittance = 1.0;
-    // 视 march 的样本位置与步权统一成 (position, stepAdvance)：
-    //   VL_EXP_STEPS=1：fraction 由参考指数公式给出（归一化到末样本 =1），
-    //     stepAdvance = Δfraction × marchEnd。
-    //     ⚠ 与参考的已知偏差：参考 VolumetricFog.glsl:128-130 的
-    //     `t = pow(11, (i+noise)/steps)*0.1-0.1` **不归一化**，noise→0 时末样本
-    //     只到 0.64，靠 TAA 的时间抖动平均出剩余段。本 pass 没有对光柱做
-    //     时域累积（只有重投影混合），所以保留归一化，让光柱覆盖到 marchEnd；
-    //     位置用归一化 fraction、步权仍用参考的 exponential 标定。
-    //   VL_EXP_STEPS=0：逐字节回旧均匀步长 —— 旧代码首样本只前移 jitter×step，
-    //     但步权仍取整步，这里原样保留。
 #if VL_EXP_STEPS
     float previousFraction = 0.0;
 #else
     float distance = jitter * stepLength;
 #endif
-    // 2026-10-14 重构（第二刀）：地形/构筑物影的射线结果，隔
-    // VL_SHADOW_RAY_STEP_STRIDE 步重算一次，中间沿用 —— 可见性沿视线变化很慢，
-    // 只有穿门洞、叶隙、墙角时才会跳。
     float terrainVisibility = 1.0;
 
     for(int step = 0; step < MAX_LIGHT_RAY_STEPS; ++step)
@@ -989,14 +560,6 @@ void main()
         distance += stepLength;
 #endif
 #if VL_EXP_STEPS
-        // =====================================================
-        // 介质 + 太阳项（2026-10-19 重建）
-        //
-        // 介质：fogDensityAt()（共享头 fog_density_common.glsl）——与体积雾
-        // 同一份密度场、同一组 VFOG_* 标定。
-        // 太阳项：参考 VolumetricFog.glsl:144-158 的**沿光方向密度 march**
-        //（4 步、步长 5.0、每步 ×1.5），不是逐样本阴影查询。
-        // =====================================================
         const float exponential =
             pow(11.0, (float(step) + jitter) * rayStepInv);
         const float stepDensity = exponential * vlRayLength * 1.442695;
@@ -1044,17 +607,12 @@ void main()
         const float cloudVisibility = cloudSunTransmittance(position, lightDirection);
         const float visibility = cloudVisibility * terrainVisibility;
 
-        // 参考 VolumetricFog.glsl:192-208 的能量合成。
         stepRayDensity *= integral;
 
-        // 参考 VolumetricFog.glsl:225：rayColor *= 1.2 * VFOG_SUNLIGHT_DENSITY。
-        // 本工程把 1.2 折进 lightEnergy 的标定，这里只乘 VFOG_SUNLIGHT_DENSITY
-        //（cloudParams8.y）与设置界面的「体积光强度」倍率。
         radiance += lightColor * lightEnergy * stepRayDensity * visibility *
             (cam.cloudParams8.y * intensityScale);
         transmittance *= absorption;
 #else
-        // 旧档（VL_EXP_STEPS=0 的均匀步长回退）：介质仍是本 pass 自有的指数层。
         float vlLayerDensity = exp(max(
             -(position.y - VL_LAYER_HEIGHT) / VL_LAYER_SCALE_HEIGHT,
             VL_LAYER_MIN_EXPONENT));
@@ -1077,9 +635,6 @@ void main()
 #endif
     }
 
-    // ---- P1：时间重投影 + 有界历史融合 ----
-    // 车道 cloudProfileParams.z = 历史权重（0 = 关 ⇒ 退化为只用本帧，逐位等价于
-    // 无时间累积的旧行为）；历史无效（首帧/相机重置）时同样跳过。
     float historyWeight = clamp(cam.cloudProfileParams.z, 0.0, 0.95);
     if(historyWeight > 0.0 && cam.historyValid != 0u)
     {
@@ -1090,15 +645,6 @@ void main()
         if(reprojectValid)
         {
             vec4 history = textureLod(godRayHistory, prevUv, 0.0);
-            // 有界历史：抑制鬼影（云在动、遮挡在变时历史不该拖尾）。
-            //
-            // 2026-10-06：钳制必须是**双向**的。旧档只 `min`（只压亮侧），于是
-            // "本帧偏暗"的那一半噪声永远漏过：抖动让某帧低估计时，历史被钳到
-            // 2×该低值、下一帧又被混进结果 —— 边缘沿"变暗"方向继续抖，时域
-            // 永远收敛不了（这正是"怎么修就是闪"里时域档也治不好的那一半）。
-            // 上下都钳，滤波器在两个方向上都稳定（标准 TAA 邻域钳制的简化版）。
-            // 2026-10-06：下界用更宽的比值（VL_REPROJECT_HISTORY_MAX_DOWN），
-            // 否则叶隙二值翻转会被"本帧≈0"那几帧把历史清零。论证见该常量注释。
             history.rgb = clamp(history.rgb,
                 radiance / VL_REPROJECT_HISTORY_MAX_DOWN,
                 radiance * VL_REPROJECT_HISTORY_MAX);
@@ -1107,22 +653,6 @@ void main()
             transmittance = mix(transmittance, history.a, historyWeight);
         }
     }
-    // 2026-10-18：太阳遮挡诊断视图（**仅标记文件存在时生效**）。
-    //
-    // 2026-10-14 第一版在诊断结束后把输出块删了、只留注释，C++ 侧
-    // `godRayParams0.y`（populateGodRayParams，读 run/godray_debug_vis.flag）
-    // 却一直在写 ⇒ 这个入口处于"半死"状态。现在补回实现，默认路径零改动：
-    // 标记文件不存在 ⇒ params[1] = 0 ⇒ 本块不执行，逐位等于现状。
-    //
-    // 读法（合成是 scene*a + rgb，这里把 a 写成 0 ⇒ 整屏被 rgb 替换，
-    // 地形/墙/天空一视同仁，光柱本身不出现在画面里）：
-    //   R = 被几何挡住（1 - terrainVisibility）
-    //   G = 判为受光（terrainVisibility）
-    //   B = marchEnd / GODRAY_MAX_DISTANCE —— **本像素的视 march 被场景深度截到多远**
-    // 于是墙/洞内一张截图能同时回答两个问题：
-    //   · 绿 ⇒ 太阳射线没被挡住：查 TLAS 内容（实例是否被剔除/清位）
-    //   · 蓝接近 1 ⇒ 视 march 没被墙截断（该 3 格就截断却走到 128）⇒ 深度链路的问题
-    //   室内 1–5 格的墙应当 **红 + 蓝≈0.02~0.04**；若红但蓝=1，光柱是叠在墙上的。
     if(cam.godRayParams0.y > 0.5)
     {
         float marchClip = clamp(marchEnd / GODRAY_MAX_DISTANCE, 0.0, 1.0);
@@ -1134,9 +664,6 @@ void main()
     }
     storeGodRay(pixel, radiance, transmittance);
 #else
-    // 空气体积光退役（VL_AIR_GODRAYS = 0）：输出中性 —— 透射率 1、无辐射，
-    // 合成 pass `scene * a + rgb` 因此逐位不改变画面。光柱由体积雾的 rayColor
-    // 提供（参考只有一份），水下分支仍在上面的 waterSimState 分支里返回。
     storeGodRayNeutral(pixel);
 #endif
 }

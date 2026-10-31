@@ -786,7 +786,7 @@ void main() {
     // -3 visibility rays are used by Sun / Local Light / AO.
     // Glass must NOT terminate them.
     //
-    // We accumulate RGB transmittance in payload.albedo.
+    // We accumulate RGB transmittance in unpackAlbedoUnorm(payload.albedoPacked).
     // Opaque geometry is still accepted and terminates normally.
     // =====================================================
 
@@ -879,8 +879,7 @@ void main() {
         {
             // 仍然消耗一格预算：清玻璃当空气，但不能让一条射线在
             // "玻璃墙"里无限穿下去（性能与栈深）。
-            payload.glassFaceBudget = payload.glassFaceBudget + 1.0;
-            if(payload.glassFaceBudget >= float(ORION_GLASS_CHAIN_MAX_FACES))
+            if(0.0 >= float(ORION_GLASS_CHAIN_MAX_FACES))
             {
                 return;
             }
@@ -932,7 +931,6 @@ void main() {
         const bool acceptLayer = true;
 #endif
 
-        payload.glassFaceBudget = payload.glassFaceBudget + 1.0;
 
         if(!acceptLayer)
         {
@@ -961,7 +959,6 @@ void main() {
         bool chainAcceptLayer;
 #if VPT_GLASS_ALPHA_BLEND_PAIR_FACES
         chainAcceptLayer = true;
-        payload.glassFaceBudget = payload.glassFaceBudget + 1.0;
 #else
         chainAcceptLayer = glassChainAcceptEntry(payload, gl_HitTEXT);
 #endif
@@ -974,9 +971,7 @@ void main() {
                 chainAlpha,
                 chainTransmission,
                 chainSurfaceWeight);
-            payload.glassSurfaceWeightAccum +=
-                payload.transmittanceAccum * chainSurfaceWeight;
-            payload.transmittanceAccum *= chainTransmission;
+                vec3(1.0) * chainSurfaceWeight;
         }
 #else
         paneTransmission = glassAlphaBlendTransmission(
@@ -986,14 +981,12 @@ void main() {
         // 一个半透明体只乘一次（进入面）。介质状态推进也在契约里。
         if(glassChainAcceptEntry(payload, gl_HitTEXT))
         {
-            payload.transmittanceAccum *= paneTransmission;
         }
 #endif
 #else
         // 一个半透明体只乘一次（进入面）。介质状态推进也在契约里。
         if(glassChainAcceptEntry(payload, gl_HitTEXT))
         {
-            payload.transmittanceAccum *=
                 paneTransmission *
                 getTransparentProfileTransmissionAnyHit(chainProfileRaw);
         }
@@ -1001,8 +994,8 @@ void main() {
 
         // 终止判据唯一一处（累积透射 / 面预算）。
         if(glassChainShouldAbort(
-               payload.transmittanceAccum,
-               payload.glassFaceBudget))
+               vec3(1.0),
+               0.0))
         {
             return;
         }
@@ -1084,24 +1077,19 @@ if(
         // 预算是面数口径：每进入一次记 2 面（进+出），与旧档
         // GI_GLASS_VISIBILITY_MAX_FACES = 16 面 = 8 层逐值同义。
         // =====================================================
-        const bool glassWasInside = payload.glassInside > 0.5;
+        const bool glassWasInside = 0.0 > 0.5;
         const bool glassRegionBreak =
-            payload.glassEntryT >= 0.0 &&
-            gl_HitTEXT - payload.glassEntryT > 1.5;
+            -1.0 >= 0.0 &&
+            gl_HitTEXT - -1.0 > 1.5;
         const bool isLightExitFace = !glassWasInside || glassRegionBreak;
 
         if(isLightExitFace)
         {
-            payload.glassInside = 1.0;
-            payload.glassEntryT = gl_HitTEXT;
-            payload.glassFaceBudget = payload.glassFaceBudget + 2.0;
         }
         else
         {
-            payload.glassInside = 0.0;
         }
 
-        payload.lastGlassFaceT = gl_HitTEXT;
         #else
         uint glassFaceOrdinal =
             uint(
@@ -1133,12 +1121,11 @@ if(
         // —— "一片一滤"的预期语义，多层会均匀略暗（验证判据第 3 条）。
         // A/B：-DGI_GLASS_SEAM_RESET=0 逐位回到旧档。
         // =====================================================
-        if(payload.lastGlassFaceT >= 0.0 &&
-            gl_HitTEXT - payload.lastGlassFaceT > 1.5)
+        if(-1.0 >= 0.0 &&
+            gl_HitTEXT - -1.0 > 1.5)
         {
             glassFaceOrdinal = 0u;
         }
-        payload.lastGlassFaceT = gl_HitTEXT;
 #endif
 
         bool isLightExitFace =
@@ -1148,8 +1135,7 @@ if(
         // —— parallaxRayTravel 只剩面序一个用途，重置不再连预算一起清零。
         payload.parallaxRayTravel =
             float(glassFaceOrdinal + 1u);
-        payload.glassFaceBudget =
-            payload.glassFaceBudget + 1.0;
+            0.0 + 1.0;
         #endif
 
 
@@ -1191,14 +1177,14 @@ if(
                     1.0
                 );
 
-            payload.albedo *=
+            payload.albedoPacked = packAlbedoUnorm(unpackAlbedoUnorm(payload.albedoPacked) * (
                 glassSheetTransmissionScalarF(
                     glassTint,
                     glassCosTheta
                 ) *
                 getTransparentProfileTransmissionAnyHit(
                     getTransparentProfileFromRawMaterialId(materialId)
-                );
+                )));
         }
 
 
@@ -1224,10 +1210,10 @@ if(
         // —— 表达式与旧档 glassFaceOrdinal + 1u >= MAX 逐值同义。
         if(
             max(
-                payload.albedo.r,
-                max(payload.albedo.g, payload.albedo.b)
+                unpackAlbedoUnorm(payload.albedoPacked).r,
+                max(unpackAlbedoUnorm(payload.albedoPacked).g, unpackAlbedoUnorm(payload.albedoPacked).b)
             ) < GI_GLASS_VISIBILITY_MIN_TRANSMITTANCE ||
-            payload.glassFaceBudget >=
+            0.0 >=
                 float(GI_GLASS_VISIBILITY_MAX_FACES)
         )
         {

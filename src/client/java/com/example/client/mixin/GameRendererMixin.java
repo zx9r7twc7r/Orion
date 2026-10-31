@@ -31,10 +31,7 @@ public class GameRendererMixin {
     @Inject(method = "render", at = @At("HEAD"))
     private void rtx$resetEntityFrameOpenFlag(CallbackInfo ci) {
         EntityRtCapture.resetEntityFrameOpen();
-        // 2026-10-13 帧预算二分（见 FrameBudget）：纯读时钟，不动任何渲染状态。
         FrameBudget.head();
-        // 2026-10-24 基准会话（见 com.example.client.bench.BenchmarkSession）：
-        // 未开启时是一行 boolean 判空；开启后每帧两次 nanoTime + 一行 JSON。
         BenchmarkSession.frameStart();
     }
 
@@ -49,7 +46,6 @@ public class GameRendererMixin {
     @Inject(method = "render", at = @At("RETURN"))
     private void rtx$frameBudgetTail(CallbackInfo ci) {
         FrameBudget.tail();
-        // 与 HEAD 配对：量的是 GameRenderer.render() 自身的墙钟（含我们的注入与 Java 钩子）。
         BenchmarkSession.frameEnd();
     }
 
@@ -74,11 +70,6 @@ public class GameRendererMixin {
      */
     @Inject(method = "renderItemInHand", at = @At("HEAD"))
     private void rtx$armRtInjectionBeforeHand(CallbackInfo ci) {
-        // 2026-10-25：手提交前必须保证实体帧窗口是开的。
-        // 世界阶段（LevelRenderer.render HEAD）开过 ⇒ 这里幂等空操作，不会清空已捕获
-        // 的世界实体；若某帧世界没渲染而手仍提交，这里是唯一的开窗点。
-        // 不开窗的后果不是丢手，而是手的 uploadEntityBatch 被原生
-        // if(!g_entityFrameOpen) 静默丢弃（见 EntityRtCapture.beginEarlyFrame 的说明）。
         EntityRtCapture.beginEarlyFrame();
         if (NativeVulkan.rtInjectedToMainTarget || NativeVulkan.guiRtPending) {
             return;
@@ -87,8 +78,6 @@ public class GameRendererMixin {
         if (minecraft == null || minecraft.gameRenderer == null) {
             return;
         }
-        // 26.3 的主渲染目标挂在 GameRenderer 上（Minecraft.getMainRenderTarget()
-        // 已不存在）：gameRenderer.mainRenderTarget()。与 GUI 那条路径取的是同一张图。
         final RenderTarget mainTarget = minecraft.gameRenderer.mainRenderTarget();
         if (mainTarget == null) {
             return;
@@ -118,25 +107,8 @@ public class GameRendererMixin {
         }
     }
 
-    /**
-     * 2026-10-25：实体帧窗口的收口（手路径）—— 这是"手进光追"的关键一步。
-     *
-     * <p>26.3 的顺序是 世界（{@code LevelRenderer.render}）→ 手
-     * （{@code renderItemInHand}）。手/手持物的 feature 批次在后者的
-     * {@code featureRenderDispatcher.prepareFrame(handAndScreenSubmitNodeStorage)}
-     * 里才 prepareGroup（mod 的捕获点就在 prepareGroup 内），所以实体帧必须等到
-     * 这一次 prepareFrame 之后才能收。</p>
-     *
-     * <p>注入位置刻意选在 prepareFrame 的 INVOKE 之后、而不是方法 RETURN：
-     * 同一个 try-with-resources 的下一项就是
-     * {@code createCommandEncoder().createRenderPass("Item in hand", ...)}，而 RT 注入
-     * （{@code VulkanCommandEncoderMixin}）发生在那个 render pass 的
-     * {@code vkCmdBeginRendering} 之前 —— 只要 AS 在那之前重建完成，手就在<b>同一帧</b>
-     * 出现在 RT 里，没有一帧延迟。</p>
-     *
-     * <p>条件分支（第三人称 / 隐藏 HUD / 旁观）走不到注入点，由
-     * {@link #rtx$finishEntityFrameFallback} 兜底。</p>
-     */
+    
+
     @Inject(
             method = "renderItemInHand",
             at = @At(
@@ -164,26 +136,8 @@ public class GameRendererMixin {
         EntityRtCapture.finishEntityFrame();
     }
 
-    /**
-     * 2026-10-25 B1 最后一步：手进光追之后，<b>取消光栅手的绘制</b>，让 RT 那一份显形。
-     *
-     * <p>为什么 Redirect {@code renderAllFeatures} 而不是在 {@code renderItemInHand}
-     * 上 {@code ci.cancel()}：RT 注入的触发点是这一个方法里
-     * {@code createRenderPass("Item in hand", ...)} 的 {@code vkCmdBeginRenderingKHR}
-     * 之前（见 {@code VulkanCommandEncoderMixin.vulkan$injectRtBeforeGui}）。整个方法
-     * 一旦 cancel 掉，render pass 就不会被创建 ⇒ RT 永远不会写进 main target ⇒
-     * 画面变成"只有光栅世界、没有光追"。而 handAndScreenSubmitNodeStorage 的
-     * prepareFrame 仍必须跑（那是 mod 捕获手/手持物几何的唯一入口）。</p>
-     *
-     * <p>所以只砍"把批次画到屏幕"这一步：submit → prepareFrame（捕获进实体批次 +
-     * {@link EntityRtCapture#finishEntityFrame()} 收帧）→ createRenderPass（触发 RT
-     * 注入）→ <b>这里跳过 renderAllFeatures</b>（不画光栅手）→ 空 render pass 关闭。
-     * frame.close() 仍会照常执行 finishExecute / endDraw 清理，未消费的 draw 只是
-     * 浪费一次几 KB 的 staged 上传。</p>
-     *
-     * <p>回退：{@code -Dorion.handRt=0} 或环境变量 {@code ORION_HAND_RT=0} 恢复原版
-     * 光栅手（此时 RT 里仍有手，只是被盖住，等同搬迁完成、未关光栅的状态）。</p>
-     */
+    
+
     @Redirect(
             method = "renderItemInHand",
             at = @At(
@@ -207,13 +161,8 @@ public class GameRendererMixin {
 
     private static boolean rasterHandSkipLogged;
 
-    /**
-     * 手是否走光追（B1）。默认为真。
-     *
-     * <p>关掉后回到 2026-10-25 之前的外观：光栅手照旧画在 RT 之上。RT 里的手仍在
-     * （帧窗口搬迁是独立的一步），只是被盖住 —— 这正是二分"看不见手到底是 RT 没画
-     * 还是被盖"的开关。</p>
-     */
+    
+
     private static final boolean HAND_RT_ENABLED = resolveHandRtEnabled();
 
     private static boolean resolveHandRtEnabled() {

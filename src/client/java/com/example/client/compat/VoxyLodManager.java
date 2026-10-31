@@ -21,38 +21,12 @@ public final class VoxyLodManager {
     private static final int MAX_LOD_BYTES_PER_MESH = 64 * 1024 * 1024;
     private static final int MAX_UPLOADS_PER_FRAME = 2;
     private static final boolean LOG_UPLOADS = false;
-    /**
-     * 取证日志总开关（`-Dorion.lod.diag=false` 关闭）。
-     *
-     * <p>为什么要有：{@code [VOXY-LOD SEAM]} / {@code MAP} / {@code LEVELS} 各是每 10~20 秒一行、
-     * 一行几百字符，正常游玩时纯属噪声。排查衔接问题时它们是唯一证据，所以默认开；
-     * 交付给用户当"日常档"时用启动参数一行关掉，不必改代码重新构建。</p>
-     */
+    
+
     private static final boolean DIAG = !"false".equalsIgnoreCase(System.getProperty("orion.lod.diag", "true"));
 
-    // =====================================================
-    // 性能取证（2026-09-26；用户报"站着不动帧率也低、关掉远场明显恢复"）
-    //
-    // 为什么先是"量"而不是"改"：两侧此前都没有帧时间测量 ——
-    // 本文件里搜 nanoTime/frameTime/elapsed 是 0 处，VulkanCore.cpp 里搜
-    // `[PERF`/frameTime/gpuTime/timestamp 也是 0 处。在这种状态下挑优化点就是猜。
-    //
-    // 这里只加两件东西，都不改渲染结果：
-    //   1) `[LOD PERF]`，每 300 帧一行：帧时间 avg/p1/max（p1 = 最差的 1%，即 1% low）
-    //      + 远场**当前活着**的几何总量（网格数 / quad 数 / 折成 C++ Vertex 的字节数，
-    //      C++ 每 quad 展开 6 顶点、Vertex=48B，见 VulkanCore.cpp:8541）
-    //      + 这窗口内跨 JNI 传的字节数 + 原版侧在 RT 里/已被擦除的 section 数。
-    //   2) 一个**运行时可切**的 A/B 开关：运行目录里出现文件 `orion_lod_off`
-    //      就停止供远场几何并撤下已上传的，删掉文件立刻恢复（每 30 帧查一次存在性）。
-    //
-    // ⚠ 为什么开关必须"运行时可切"：用户此前的对照是"把视距调到 2"，那**同时**把原版
-    // 近场的几何量砍掉了，属于混淆对照，得不出"远场贵多少"。这个开关只动远场几何，
-    // 原版接管状态（lodProviding / 覆盖表）故意保持不变，所以两段读数之差就是远场
-    // 几何的净代价。
-    // =====================================================
     private static final boolean PERF = !"false".equalsIgnoreCase(System.getProperty("orion.lod.perf", "true"));
     private static final String AB_MARKER = "orion_lod_off";
-    /** 自动 A/B 的开关文件：文件存在 ⇒ 每 {@link #abAutoSeconds()} 秒自动切换一次远场几何。 */
     private static final String AB_AUTO_MARKER = "orion_lod_ab";
     private static final int PERF_WINDOW_FRAMES = 300;
     private static final int AB_CHECK_FRAMES = 30;
@@ -64,29 +38,16 @@ public final class VoxyLodManager {
     private static int perfMarkerTicks;
     private static boolean farFieldSuppressed;
 
-    // -----------------------------------------------------
-    // 渲染线程 Java 侧分组耗时（2026-09-26，用户要"整体优化"）
-    //
-    // 为什么先量这个：基帧 26~31ms 是实测值，但**我们自己的 Java 在里面占多少完全没有数**。
-    // 远场几何的 A/B 已经证明"几何量"几乎免费（858MB 顶点 ≈ 0ms），可那只排除了"画多少"，
-    // 没排除"每帧跑多少代码" —— 桥的 poll、快照比较、覆盖表、状态机、实体/粒子捕获
-    // 全都在渲染线程上逐帧跑，而它们在那个 A/B 的两臂里**都存在**，所以那个实验看不见它们。
-    // 靠读代码猜这些占多少就是猜，所以先逐帧累加各组件的墙钟时间。
-    //
-    // 只测 CPU（渲染线程的 Java 时间），不测 GPU；GPU 各 pass 要 C++ 时间戳（要重编 DLL）。
-    // -----------------------------------------------------
-    public static final int PERF_BRIDGE = 0;   // VoxyCompat.tick()：远场桥 poll（重建/细层采样/快照）
-    public static final int PERF_LOD = 1;      // tick 其余部分（上传/JNI、覆盖表、状态机）
-    public static final int PERF_ATLAS = 2;    // publishAtlas
-    public static final int PERF_DH = 3;       // DhBridge.tick
-    public static final int PERF_FFG = 4;      // FarFieldGate.updateNearby
-    public static final int PERF_CAPTURE = 5;  // 实体/粒子捕获 + NativeVulkan.beginEntityFrame
+    public static final int PERF_BRIDGE = 0;
+    public static final int PERF_LOD = 1;
+    public static final int PERF_ATLAS = 2;
+    public static final int PERF_DH = 3;
+    public static final int PERF_FFG = 4;
+    public static final int PERF_CAPTURE = 5;
     private static final String[] PERF_PART_NAMES = {"bridge", "lod", "atlas", "dh", "ffg", "capture"};
     private static final long[] PERF_PART_NANOS = new long[PERF_PART_NAMES.length];
-
     /** 组件耗时累加。调用点在渲染线程热路径上，所以这里必须零分配。 */
     public static void perfAdd(int part, long nanos) {
-        // 自身兜住开关：mixin 侧的三个调用点无法访问私有的 PERF。
         if (!PERF) return;
         PERF_PART_NANOS[part] += nanos;
     }
@@ -114,51 +75,23 @@ public final class VoxyLodManager {
         return count;
     }
 
-    // Keep a stable insertion order so one Voxy streaming revision cannot turn into an unbounded
-    // render-thread JNI/BLAS burst. A newer version replaces the pending source atomically.
     private static final Map<Long, VoxyCompat.LodMesh> PENDING_UPLOADS = new LinkedHashMap<>();
     private static Object world;
     private static long observedRevision = Long.MIN_VALUE;
-    /**
-     * 上次重算窗口过滤时，相机所在的 **64 格对齐格**（见 {@link #overlapsVanillaWindow}）。
-     *
-     * <p>⭐ 2026-09-26（用户报"视距内区块会反复和 LOD 冲突撞色"）：让位判据只依赖这个锚点，
-     * 而重算却只挂在 {@code revision} 变化上。玩家**只移动、voxy 没有新数据**时 revision
-     * 不变 ⇒ 跨过 64 格边界后窗口整体平移，但过滤不会重算：新落进近场窗口的**已上传** LOD
-     * 不会被 {@code removeVoxyLodMesh} 撤下，而原版那一片区块照常进出 ViewArea 被正常编译
-     * 绘制 ⇒ 同一位置两层几何打架（谁近谁赢 = 闪烁 + 撞色）；等下一次 revision 变化才纠正，
-     * 于是表现为"反复"。锚点进条件后，每跨一次 64 格边界重算一次。</p>
-     */
+    
+
     private static long observedWindowX = Long.MIN_VALUE;
     private static long observedWindowZ = Long.MIN_VALUE;
-    /**
-     * 取证（2026-09-26）：被【窗口让位判据】撤下的已上传网格数 / 因源里已无而回收的网格数。
-     *
-     * <p>为什么必须分开记：修复"跨 64 格边界不重算窗口过滤"这个 bug 之后，**唯一能证明它
-     * 真的生效**的现象就是"窗口撤下"这个计数在玩家跨边界时增长。若它始终为 0，说明过滤
-     * 仍没被触发（那就得回去查触发条件，而不是判据本身——上一轮就是错在只验判据没验触发）。</p>
-     */
+    
+
     private static long perfRetractWindow;
     private static long perfRetractGone;
     private static long diagnosticTicks;
     private static boolean lodProviding;
     private static int uploadedAtlasHash;
-    /**
-     * 真的被非空 voxy LOD 网格覆盖的 64 格 cell 集合（键见 {@link #cellKey}）。
-     *
-     * <p>为什么必须有它：{@code lodProviding} 是**全局**的——只要 voxy 在任何地方
-     * 给了非空网格就为真。而 FarFieldGate 过去只看这个全局标志 + 到相机的距离，
-     * 于是把 64 格外的近场 section 全部压掉，哪怕 voxy 在那个位置**根本没有**
-     * 网格（数据还在 retry 队列里）。两边都不画 ⇒ 实机表现为"空洞能看到横截面"。
-     * 覆盖表把那个判断从"全局"降级为"逐位置"。</p>
-     *
-     * <p>⭐ 09-25 二次收紧 + 三次修正：cell 只有在对应网格<b>第一次上传成功</b>之后
-     * 才计入（判据见 {@link #refreshCoverage}）。完全按"版本一致"判定会让覆盖随
-     * voxy 的 revision 反复消失，反而把远场搅成反复重编译；完全不判"上传过"又会在
-     * 首次积压时压掉还没有 LOD 的位置，留下十几秒真空洞。</p>
-     */
+    
+
     private static volatile Set<Long> coveredLodCells = Set.of();
-    /** 当前 revision 下"有效且非空"的 LOD 网格快照，覆盖表由它与上传状态共同推出。 */
     private static List<VoxyCompat.LodMesh> coverageCandidates = List.of();
 
     private VoxyLodManager() {
@@ -218,20 +151,6 @@ public final class VoxyLodManager {
         coveredLodCells = covered.isEmpty() ? Set.of() : Set.copyOf(covered);
     }
 
-    // =====================================================
-    // 远场树叶一次性取证（2026-09-25）
-    //
-    // 为什么在 Java 而不在 C++：C++ 的 std::cout **不会**进 run/logs/latest.log
-    // （日志里只有 Java 的 System.err / System.out），写在 C++ 里等于谁都读不到。
-    //
-    // 要回答的只有三件事：
-    //   1) 透明桶里到底有没有材质 1（桥给 LeavesBlock 的官方编号）的 quad；
-    //   2) 这些 quad 有没有拿到图集格（atlasU == 0xFFFF 表示没拿到，着色器里
-    //      就是 pad2 < 0 的顶点色回退路径）；
-    //   3) 那一格的图集 alpha —— 它直接决定 rt_test_translucent.rahit 的 cutout
-    //      （combinedAlpha < 0.1 ⇒ ignoreIntersectionEXT）会不会把整片树冠丢掉。
-    // 只跑前几次上传，跑完自动闭嘴。
-    // =====================================================
     private static int diagRuns;
 
     private static void diagnoseMesh(VoxyCompat.LodMesh mesh) {
@@ -278,8 +197,6 @@ public final class VoxyLodManager {
             line.append(" leaves=").append(leaves)
                     .append(" leavesNoTile=").append(noTile)
                     .append(" leavesZeroShade=").append(zeroShade)
-                    // 水有没有图集格决定它走 tiled 通路（吃 pad2 小数位）还是 RGB 直乘
-                    // 通路 —— 这是判断"水该不该吃烘焙 shade"的前提，必须有日志证据。
                     .append(" waterTile=").append(waterTile)
                     .append(" waterNoTile=").append(waterNoTile);
             if (firstTile >= 0) {
@@ -287,27 +204,12 @@ public final class VoxyLodManager {
             }
             System.err.println(line);
         } catch (Throwable failure) {
-            // 取证代码绝不允许把渲染线程带崩：宁可少一行日志。
-            // （2026-09-25：tileAlphaStats 的 mip 层偏移把 mip4 自己那一层也加了进去，
-            //   只要前几个网格里出现带图集格的树叶 quad 就必定越界，实测崩过一次。）
             System.err.println("[VOXY-LOD DIAG] failed: " + failure);
         }
     }
 
-    /**
-     * 每 10 秒一行：**覆盖表的环分布** + 每级网格到相机的距离范围。
-     *
-     * <p>为什么需要它：用户报"视距与 LOD 之间是真空的（看不到几何、直接见天空）"，
-     * 而且那片他跑过（voxy 该有数据）。几何既然存在（探针显示 L0/L1 水面有 31 万+
-     * quad），"完全空"就只可能出在"哪片位置被判成已覆盖、于是把原版 section 擦掉"
-     * 这条链上。环分布能一次分开两种情形：
-     * <ul>
-     *   <li>某个环上 covered=0，而该环在原版视距内 ⇒ 覆盖表缺一块（衔接判据的问题）；</li>
-     *   <li>所有环都有覆盖 ⇒ 位置判对了，是那批网格没被画出来（得往
-     *       uploadVoxyLodMesh / TLAS 那边查）。</li>
-     * </ul>
-     * 每级的距离范围还能顺带告出"voxy 给的网格最远到多少格"。</p>
-     */
+    
+
     private static long ringReportTicks;
 
     private static void reportRings() {
@@ -339,7 +241,6 @@ public final class VoxyLodManager {
                 .append(" farthest=").append(farthest)
                 .append(" vanilla=").append(FarFieldWindow.renderDistanceChunks() * 16)
                 .append(" seam=").append(FarFieldGate.seamSections() * 16);
-        // 每级网格到相机的距离范围：voxy 到底把哪一级铺到了多远。
         int[] levelNear = new int[4];
         int[] levelFar = new int[4];
         int[] levelCount = new int[4];
@@ -364,27 +265,6 @@ public final class VoxyLodManager {
         System.err.println(line);
     }
 
-    // =====================================================
-    // 远场"衔接带"取证（2026-09-26）
-    //
-    // 用户症状："视距与 LOD 之间是真空的（直接见天空）"，且他跑到那里看过，判断
-    // 是**衔接**的问题（那片位置 voxy 本该有数据）。几何既然存在于 provider，
-    // "完全空"只可能出在这条链的某一环，所以取证必须把每一环并排摆出来：
-    //
-    //   1) 覆盖表 cov：我们说这些 64 格 cell"有已上传的 LOD 几何"；
-    //   2) 真的交给原生侧的 LOD 几何 up/opqK/alpK：环内已上传网格数与 quad 数（千）；
-    //   3) 被"近场让位"判据丢掉的网格 drop：位置判据是否把这一带整环吃掉；
-    //   4) 原版侧两个状态 van/sup：RT 里还留着的 section 数 / 已被擦除的 section 数。
-    //
-    // 判读（关键）：
-    //   - 某环 sup>0 而 up=0(opqK=0) ⇒ 原版被擦掉、LOD 没补上 = 用户看到的真空；
-    //   - 某环 drop>0 而 pub=0/up=0 ⇒ LOD 数据被"让位判据"整环丢掉（判据错，可修）；
-    //   - 某环 pub=0 且 drop=0 且 cov=0 ⇒ provider 本来就没给这一环数据（要动 voxy 侧）；
-    //   - 某环 van=0 且 sup=0 且 cov>0 ⇒ 原版那一段**从未编译**（不是被擦掉）。
-    //
-    // 环用**切比雪夫**距离（128 格方环），因为接管窗口本身就是方格（见
-    // FarFieldGate.gridDistance）；欧氏距离会把"正对面那一堵墙"摊薄到相邻环里。
-    // =====================================================
     private static long seamReportTicks;
 
     private static void reportSeam() {
@@ -414,8 +294,6 @@ public final class VoxyLodManager {
         int[] alphaQuads = new int[RING_COUNT];
         int[] waterQuads = new int[RING_COUNT];
         for (Uploaded entry : UPLOADED_VERSIONS.values()) {
-            // 环号按**网格中心**算，与上面的 pub/drop 一致：上一版这里用的是 origin，
-            // 宽网格（L2/L3）会串到相邻环，导致 pub 与 up 看起来对不上。
             int ring = ringOf(entry.originX() + entry.width() * 0.5,
                     entry.originZ() + entry.width() * 0.5, camera.x, camera.z);
             uploaded[ring]++;
@@ -524,9 +402,6 @@ public final class VoxyLodManager {
         HashSet<Long> uploadedCells = new HashSet<>();
         HashSet<Long> waterCells = new HashSet<>();
         for (Uploaded entry : UPLOADED_VERSIONS.values()) {
-            // ⚠ 必须按**跨度**标格，不能只标 origin 那一格：L2/L3 网格宽 128/256 格，
-            // 只标 origin 会把它们盖住的其余格误显示成"没有上传网格"（上一版 MAP 的
-            // 'c' 大片出现就是这个错，并让我把覆盖不足看大了）。
             int firstX = Math.floorDiv(entry.originX(), 64);
             int lastX = Math.floorDiv(entry.originX() + entry.width() - 1, 64);
             int firstZ = Math.floorDiv(entry.originZ(), 64);
@@ -583,26 +458,8 @@ public final class VoxyLodManager {
         return (bytes[offset] & 0xFF) | ((bytes[offset + 1] & 0xFF) << 8);
     }
 
-    /**
-     * 每 10 秒一行：按 LOD 级别统计**水面 quad**，把两个症状一次分开。
-     *
-     * <p>要回答的两个问题：
-     * <ul>
-     *   <li>「离得远的 LOD 没水面」——远处的级别（L2/L3）到底有没有 waterSurf &gt; 0？
-     *       若为 0，是 provider 没给几何（我们着色器无从下手）；若不为 0，就是渲染侧
-     *       把它画没了（才是我们的问题）。</li>
-     *   <li>「水面分界线」——waterVert 是竖直水面 quad 的数量（LOD cell 量化的台阶
-     *       侧面），surfY 是该级别水面顶面 Y 的范围。同一个级别内 surfY 跨几格、
-     *       相邻级别 surfY 不一致，台阶就是几何上真实存在的。</li>
-     * </ul>
-     *
-     * <p>水平/竖直用 quad 前三顶点的局部 Y 是否相同来判定（面是轴对齐的，顶/底面
-     * 三个顶点同 Y；侧面不同）；cellW = width/32，顶面在 cell 顶边界 ⇒ 水面 Y =
-     * originY + y + cellW。waterEdgeVert 是"贴在网格边界平面上的竖直水面 quad"
-     * —— 它们是可见性判据在 section 越界时一律 return true 造出来的**水体内部薄片**
-     * （邻居其实是水，只是不在同一个网格里），C++ 解码器会把这批整批丢掉，这个
-     * 计数就是用来验证"丢掉的正是它们"。</p>
-     */
+    
+
     private static long levelReportTicks;
 
     private static void reportLevels() {
@@ -629,9 +486,6 @@ public final class VoxyLodManager {
                 int y2 = u16(transparent, quad + 34);
                 if (y0 == y1 && y1 == y2) {
                     buckets[base + 1]++;
-                    // ⚠ 水平顶面的顶点 Y **就是**水面所在平面（emitFace 的 UP 面放在 y+s），
-                    // 不能再加 cellBlocks —— 上一版多加了一格，把 L0/L1 的水面读成 5/6，
-                    // 看起来像"每层有一个台阶"，差点把诊断带偏（实际两者都是 4，同高）。
                     int surfaceY = mesh.originY() + y0;
                     if (surfaceY < buckets[base + 4]) buckets[base + 4] = surfaceY;
                     if (surfaceY > buckets[base + 5]) buckets[base + 5] = surfaceY;
@@ -703,8 +557,6 @@ public final class VoxyLodManager {
                 sum += alpha;
             }
         }
-        // 累加 mip0..mip3（**不含** mip4 自己那一层，它的偏移就是累加结果本身；
-        // 边界必须是 `>` 不是 `>=`，否则会多算一层，任何 tile 都越界）。
         int layerOffset = size * size;
         for (int edge = size / 2; edge > size / 16; edge >>= 1) layerOffset += edge * edge;
         int mip4 = atlas[(layerOffset + (tile / 64) * (size / 16) + (tile & 0x3F)) * 4 + 3] & 0xFF;
@@ -712,12 +564,8 @@ public final class VoxyLodManager {
                 + " tileAvgA=" + (sum / 256) + " tileMip4A=" + mip4;
     }
 
-    /**
-     * 桥上一次是否为"可用"。用来把"由可用变不可用"的那一次清理与稳态区分开。
-     *
-     * <p>2026-10-10：下面那条分支此前每 tick 都调 {@link #clearNative()}，改成只在
-     * 状态切换时调之后，必须有这个门闩，否则"桥从可用变成不可用"的那一刻没人清。</p>
-     */
+    
+
     private static boolean voxyWasActive;
 
     /** Render-thread entry point. Native copies data synchronously before this method returns. */
@@ -744,23 +592,6 @@ public final class VoxyLodManager {
                     + " pending=" + PENDING_UPLOADS.size()
                     + " providing=" + lodProviding);
         }
-        // =====================================================
-        // 2026-10-10 修复：**不能每 tick 都清**。
-        //
-        // 【病灶】原来这里无条件 clearNative()，而它内部会调
-        // FarFieldGate.onLodHardReset() ⇒ 覆盖表每 tick 被清空一次、lodProviding
-        // 每 tick 被置 false。**没装 voxy 时本分支每 tick 都成立**（active=false），
-        // 于是实测（2026-10-10 一局 5 分钟，纯原版区块）：
-        //   · [FFG] world states cleared 刷了 **2972 行**（≈10 次/秒），每行都是一次
-        //     渲染线程上的同步 stdout 打印，rt_debug.log 被顶到 22.9MB；
-        //   · 覆盖表每 tick 归零 ⇒ "连续两次不在 ViewArea"的两次观测永远凑不齐
-        //     ⇒ 离开视距的 section 几何**永远擦不掉**（[LOD PERF] 全程 erased=0），
-        //     这是"内存/显存只涨不落"的另一半原因（另一半见 FarFieldGate.updateNearby）；
-        //   · [FFG] 那条诊断被刷废，永远看不到真实状态。
-        //
-        // 【修法】只在"桥由可用变不可用"的那一次清（voxyWasActive 门闩），
-        // 并保留"确实还有网格没撤下"的兜底，保证切换瞬间一定清干净。
-        // =====================================================
         if (minecraft.level == null || !VoxyCompat.active()) {
             if (voxyWasActive
                     || !UPLOADED_VERSIONS.isEmpty()
@@ -783,7 +614,6 @@ public final class VoxyLodManager {
         long sourceRevision = VoxyCompat.revision();
         var camera = VoxyCompat.cameraPosition(minecraft);
         if (camera == null) return;
-        // ⭐ 见 observedWindowX 的说明：窗口过滤必须随"相机跨 64 格边界"重算，不能只随 revision。
         long windowX = Math.floorDiv((int) Math.floor(camera.x), FarFieldGate.LOD_SECTION_BLOCKS);
         long windowZ = Math.floorDiv((int) Math.floor(camera.z), FarFieldGate.LOD_SECTION_BLOCKS);
         if (sourceRevision != observedRevision
@@ -793,8 +623,6 @@ public final class VoxyLodManager {
             observedWindowZ = windowZ;
             List<VoxyCompat.LodMesh> meshes = VoxyCompat.meshes();
             Set<Long> visibleSources = new HashSet<>(meshes.size());
-            // ⭐ 被判据挡下的 key（仍被桥发布、只是落进近场窗口）。用它区分"窗口让位撤下"
-            // 与"源里已经没有了"——前者才是本修复该产生的动作，后者是正常的出圈回收。
             Set<Long> windowDropped = new HashSet<>();
             List<VoxyCompat.LodMesh> candidates = new ArrayList<>(meshes.size());
             boolean providing = false;
@@ -805,8 +633,6 @@ public final class VoxyLodManager {
                     continue;
                 }
                 visibleSources.add(mesh.key());
-                // 覆盖判定必须看"两桶里确实有几何"：voxy 会为空位置给出空网格，
-                // 若把那也算成"有 LOD 可接管"，近场被压掉后两边都不画 = 空洞。
                 boolean hasGeometry = mesh.opaque().length > 0 || mesh.transparent().length > 0;
                 providing |= hasGeometry;
                 if (hasGeometry) candidates.add(mesh);
@@ -831,7 +657,6 @@ public final class VoxyLodManager {
                 return true;
             });
         }
-        // 每帧上报供给状态;FarFieldGate 侧带 2 秒粘滞,流式空窗不回退。
         FarFieldGate.onLodObservation("voxy", lodProviding);
 
         int uploads = 0;
@@ -853,15 +678,11 @@ public final class VoxyLodManager {
             pending.remove();
             uploads++;
         }
-        // 覆盖表只认"已上传且版本一致"（见 refreshCoverage），刚上传的这批要立刻补进去。
         if (uploads > 0) refreshCoverage();
         if (PERF) perfAdd(PERF_LOD, System.nanoTime() - partStart);
         if (!DIAG) return;
-        // 每 10 秒一行按级别的水面统计（见 reportLevels 的说明）。
         reportLevels();
-        // 每 10 秒一行覆盖表环分布（见 reportRings 的说明）。
         reportRings();
-        // 每 10 秒一行"衔接带"环统计 + 每 20 秒一张 cell 图（见 reportSeam 的说明）。
         reportSeam();
     }
 
@@ -885,8 +706,6 @@ public final class VoxyLodManager {
         }
         perfLastNanos = now;
         if ((++perfMarkerTicks % AB_CHECK_FRAMES) == 0 && updateAbState()) {
-            // 切换那一帧既有人为停顿（撤几何/重传），又有一个跨越切换点的长空档，
-            // 两者都会污染窗口：把已攒的窗口先交出去，并作废下一次 delta。
             if (perfCount > 0) {
                 reportPerf();
                 perfCount = 0;
@@ -903,7 +722,6 @@ public final class VoxyLodManager {
         long sum = 0L;
         for (long value : sorted) sum += value;
         double avgMs = sum / (double) perfCount / 1e6;
-        // p1 = 最差的 1%（即 1% low）：排好序后取 99% 位置。
         double p1Ms = sorted[Math.min(perfCount - 1, (int) (perfCount * 0.99))] / 1e6;
         double maxMs = sorted[perfCount - 1] / 1e6;
         long opaque = 0L, alpha = 0L, water = 0L;
@@ -915,15 +733,12 @@ public final class VoxyLodManager {
             int bucket = entry.width() <= 32 ? 0 : entry.width() <= 64 ? 1 : entry.width() <= 128 ? 2 : 3;
             byWidth[bucket] += entry.opaqueQuads() + entry.transparentQuads();
         }
-        // C++ 每个 quad 展开成 2 三角形 = 6 个顶点，Vertex = 48B（VulkanCore.cpp:8541 static_assert）。
         long vertexMB = (opaque + alpha) * 6L * 48L >> 20;
         HashSet<Long> vanillaInRt = new HashSet<>();
         HashSet<Long> vanillaErased = new HashSet<>();
         FarFieldGate.collectStates(vanillaInRt, vanillaErased);
         var camera = VoxyCompat.cameraPosition(Minecraft.getInstance());
-        // 位置是配对用的：只有 ON/OFF 两段在同一个 pos 上，帧时间之差才是远场的净代价。
         String pos = camera == null ? "?" : (Math.round(camera.x) + "," + Math.round(camera.z));
-        // 渲染线程 Java 侧分组耗时（每帧平均 ms）。只在 ≥0.005ms 时打印，避免噪声刷屏。
         StringBuilder javaParts = new StringBuilder();
         double javaTotal = 0.0;
         for (int part = 0; part < PERF_PART_NAMES.length; part++) {
@@ -946,7 +761,6 @@ public final class VoxyLodManager {
                 + " bySecW{32,64,128,256}=" + byWidth[0] + "," + byWidth[1] + ","
                 + byWidth[2] + "," + byWidth[3]
                 + " | uploadWindow meshes=" + perfUploadMeshes + " MB=" + (perfUploadBytes >> 20)
-                // 窗口让位撤下 / 源已无回收：前者在跨 64 格边界时应增长（本修复的生效证据）。
                 + " retract=" + perfRetractWindow + "/" + perfRetractGone
                 + " | vanilla inRt=" + vanillaInRt.size() + " erased=" + vanillaErased.size()
                 + " | pos=" + pos);
@@ -960,7 +774,6 @@ public final class VoxyLodManager {
                 int parsed = Integer.parseInt(value.trim());
                 if (parsed > 0) return parsed;
             } catch (NumberFormatException ignored) {
-                // 落到默认值
             }
         }
         return 60;
@@ -994,7 +807,6 @@ public final class VoxyLodManager {
         }
         if (auto) {
             int seconds = abAutoSeconds();
-            // 墙钟相位：每 seconds 秒翻一次。偶数段 ON、奇数段 OFF。
             want = ((System.currentTimeMillis() / 1000L) / seconds) % 2L != 0L;
             reason = "自动 A/B 每 " + seconds + " 秒交替";
         } else {
@@ -1012,7 +824,6 @@ public final class VoxyLodManager {
             UPLOADED_VERSIONS.clear();
             PENDING_UPLOADS.clear();
         } else {
-            // 强制下一帧重排队全部网格（revision 判定只看 revision 是否变化）。
             observedRevision = Long.MIN_VALUE;
         }
         System.err.println("[LOD PERF] 远场几何 " + (want ? "已停供" : "已恢复")
@@ -1042,20 +853,12 @@ public final class VoxyLodManager {
      * 设备重建(F3+T 等)后的保险。
      */
     private static void publishAtlas() {
-        // ⭐ 2026-09-26 性能：图集只在提供方重建纹理时才变（启动 / 资源重载）。
-        // 降到每 32 帧查一次：真变化最多晚 32 帧（≈0.5s）生效。
-        // ⭐ 2026-10-04 性能：便宜检查改为**零克隆**直读哈希 —— 稳态下（图集未变）
-        // 不再每 32 帧克隆 ≈5.6MB。哈希与旧路径逐位同值。只有直读哈希判定
-        // "变了"或到了 600 tick 保险重发时才走 lodAtlas() 的防御性克隆上传，
-        // 上传内容与旧实现完全一致。
         if ((diagnosticTicks & 31L) != 0L) return;
         byte[] atlasRef = VoxyCompat.lodAtlasDirect();
         if (atlasRef == null || atlasRef.length == 0) return;
         int hash = Arrays.hashCode(atlasRef);
         if (hash == uploadedAtlasHash && (diagnosticTicks % 600L) != 0L) return;
 
-        // 候选上传：经防御性克隆取一致快照（旧行为），并对克隆结果再校验一次
-        // 哈希 —— 覆盖直读哈希恰逢提供方重建而被撕裂的极端情况。
         byte[] atlas = VoxyCompat.lodAtlas();
         int size = VoxyCompat.lodAtlasSize();
         if (atlas == null || atlas.length == 0 || size <= 0) return;
@@ -1125,8 +928,6 @@ public final class VoxyLodManager {
                 * FarFieldGate.LOD_SECTION_BLOCKS;
         int camBaseZ = Math.floorDiv((int) Math.floor(cameraZ), FarFieldGate.LOD_SECTION_BLOCKS)
                 * FarFieldGate.LOD_SECTION_BLOCKS;
-        // 近场一定会画的方块范围（与 FarFieldGate.updateNearby 的 distance < seamSections() 同源）：
-        // section 索引 base-(seam-1) .. base+(seam-1)，每格 16 方块。
         int seamBlocks = FarFieldGate.seamSections() * BLOCKS_PER_CHUNK;
         int keepMinX = camBaseX - (seamBlocks - BLOCKS_PER_CHUNK);
         int keepMaxX = camBaseX + seamBlocks - 1;

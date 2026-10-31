@@ -1,17 +1,6 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-// ===========================================================================
-// 体积云 v5 噪声烘焙（2026-10-25，与 cloud_v5_core.glsl 配套）
-//
-// 布局与 cloud_bevy_noise.comp **逐位一致**（atlas/worley/base/shape 四个
-// storage binding），宿主可以直接复用同一张 descriptor set，只是多一条管线：
-//   mode 0：weather map → atlasImage（2D；R 覆盖率 / G 云型 / B 密度）
-//   mode 1：detail 侵蚀 → worleyImage（3D；R G B = 三档 Worley）
-//   mode 2：base 形状   → baseVolume（3D；R = Perlin-Worley，G B A = 三档 Worley）
-//   mode 3：保留（v4 的 shape 生成器不在这里，v5 不用 binding 3）
-// 一次性烘焙（启动时各 dispatch 一次），之后只读。风动画走采样偏移，不重烘。
-// ===========================================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -22,9 +11,8 @@ layout(rgba16f, set = 0, binding = 3) uniform writeonly image3D shapeVolume;
 
 layout(push_constant) uniform BakePush
 {
-    vec4 params;   // x = mode
+    vec4 params;
 } pc;
-
 #define V5_NOISE_BAKER 1
 #include "cloud_v5_core.glsl"
 

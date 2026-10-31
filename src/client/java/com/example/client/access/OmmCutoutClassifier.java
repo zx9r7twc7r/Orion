@@ -23,20 +23,10 @@ public final class OmmCutoutClassifier {
     private static final int FULLY_TRANSPARENT = 0;
     private static final int FULLY_OPAQUE = 1;
     private static final int UNKNOWN_OPAQUE = 3;
-    // rahit accepts alpha >= 0.1.  For byte alpha that is 26..255.
-    // Shared with PBRAtlasStorage's per-sprite see-through scan so both sides
-    // agree on what counts as a visible texel.
     public static final int ALPHA_CUTOFF = 26;
     private static final byte UNKNOWN_OPAQUE_BYTE = (byte) 0xFF;
-    // Section rebuilds can produce many distinct UV triangles over a long
-    // session. Keep the memoization bounded so stale geometry cannot grow the
-    // heap without limit between atlas reloads.
     private static final int MAX_CACHE_ENTRIES = 16_384;
 
-    // Native uploadCutoutOmmSection copies the bytes synchronously into
-    // g_cutoutOmmInputs, so a per-thread grow-only output buffer is safe to
-    // reuse across sections.  Meshes larger than the cap allocate a fresh
-    // owned buffer instead, keeping the scratch growth bounded.
     private static final int MAX_SCRATCH_BYTES = 8 * 1024 * 1024;
 
     private static final Map<TriangleKey, TriangleResult> CACHE =
@@ -92,9 +82,6 @@ public final class OmmCutoutClassifier {
         output.limit(byteCount);
         output.position(0);
 
-        // One native memset instead of a per-byte Java loop: the buffer is
-        // always direct (memAlloc above), so this writes the identical 0xFF
-        // fill in a single pass.
         MemoryUtil.memSet(MemoryUtil.memAddress(output), 0xFF, byteCount);
 
         final long base = MemoryUtil.memAddress(vertices);
@@ -160,10 +147,6 @@ public final class OmmCutoutClassifier {
             return 0;
         }
 
-        // Mutable thread-local key avoids one record allocation + one capturing
-        // lambda per triangle on the per-quad hot path.  On a cache miss a
-        // fresh immutable key is allocated for storage; the mutable one is
-        // never stored, so later mutation cannot corrupt an existing entry.
         final TriangleKey key = KEY_SCRATCH.get();
         key.set(
                 region,
@@ -178,9 +161,6 @@ public final class OmmCutoutClassifier {
         if (result == null) {
             result = classifyTriangle(region, u0, v0, u1, v1, u2, v2);
             if (CACHE.put(new TriangleKey(key), result) == null) {
-                // Bound the memoization like the previous per-triangle
-                // CACHE.size() check, but amortized: the counter only moves on
-                // actual insertions and the bound stays approximate by design.
                 if (CACHE_INSERTIONS.incrementAndGet() > MAX_CACHE_ENTRIES) {
                     CACHE.clear();
                     CACHE_INSERTIONS.set(0);
@@ -302,7 +282,6 @@ public final class OmmCutoutClassifier {
         );
     }
 
-    // Exact index mapping required by VK_OPACITY_MICROMAP_FORMAT_4_STATE_EXT.
     private static int barycentricsToOmmIndex(float u, float v, int level) {
         u = clamp01(u);
         v = clamp01(v);
@@ -362,8 +341,6 @@ public final class OmmCutoutClassifier {
         }
 
         public void free() {
-            // Scratch-backed results reuse the thread-local buffer; only
-            // buffers allocated past the scratch cap are owned here.
             if (owned && data != null) {
                 MemoryUtil.memFree(data);
             }

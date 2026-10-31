@@ -31,7 +31,6 @@ public abstract class BlockableEventLoopMixin {
         FrameBudget.taskPumpTail();
     }
 
-    // R 的擦除边界是 Runnable（<R extends Runnable>），故按擦除后的描述符匹配。
     @Inject(method = "doRunTask(Ljava/lang/Runnable;)V", at = @At("HEAD"))
     private void fb$taskRunHead(Runnable task, CallbackInfo ci) {
         FrameBudget.taskRunHead();

@@ -49,8 +49,6 @@ public abstract class DhRenderListHookMixin {
 
     @Inject(method = "tryTick", at = @At("RETURN"))
     private void orion$publishEnabledSections(DhBlockPos2D center, CallbackInfo ci) {
-        // 本混入对每个装了 DH 的玩家都会加载，所以先问一句要不要抄：关掉接管链时
-        // 每 tick 白拷一份上千长度的清单是纯浪费。
         if (!DhLodMeshSink.wantsEnabledSections()) return;
         try {
             final ArrayList<LodRenderSection> sections = new ArrayList<>();
@@ -62,7 +60,6 @@ public abstract class DhRenderListHookMixin {
             }
             DhLodMeshSink.onEnabledSections(positions);
         } catch (Throwable ignored) {
-            // 抄清单绝不允许影响 DH 的 tick。
         }
     }
 }

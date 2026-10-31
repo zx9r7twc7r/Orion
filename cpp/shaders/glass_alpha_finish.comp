@@ -1,29 +1,8 @@
 #version 460
 
-// ============================================================================
-// glass_alpha_finish.comp —— 半透明合成（**逐字照抄** Remix 的合成式）
-//
-// 原文：_ref/dxvk-remix/src/dxvk/shaders/rtx/pass/composite/composite.comp.slang
-//   :520   backgroundAlpha = surface.backgroundTransparency;
-//   :812   return vec4(radianceOutput * backgroundAlpha + alphaBlendOutput, 1.f);
-//
-// 分工：
-//   glass_alpha_blend.comp   产出 alphaBlendOutput（= surfaceLight * color.a，
-//                            原文 composite_alpha_blend.comp.slang:273）
-//   本 pass                  做 radianceOutput * backgroundAlpha + alphaBlendOutput
-//   backgroundAlpha 存在 74 号图的 x 通道（AlphaBlendSurface.backgroundTransparency）
-//
-// 为什么必须单独一个 pass：邻居搜索要读 rtOutput 的**邻居格**（取邻像素光照），
-// 而合成要写本格。同一 dispatch 跨格读 + 写同一张 storage image 是竞态。
-// 本 pass 只做"本格读 + 本格写"，没有跨格依赖。
-//
-// 判据用 hitT（74 号图 y 通道）：AlphaBlendSurface::isValid() == hitT > 0
-// （alpha_blend_surface.slangh:95-98）。空槽由宿主清成 (bgT=1, hitT=0)。
-// ============================================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-// 与 glass_alpha_blend.comp 共用同一个 set layout（宿主只建一份）。
 layout(rgba16f, set = 0, binding = 0) uniform image2D sceneColor;
 layout(rgba16f, set = 0, binding = 1) uniform image2D alphaBlendGbuffer;
 layout(rgba16f, set = 0, binding = 2) uniform image2D alphaBlendMeta;
@@ -68,21 +47,6 @@ void main()
 
     const vec4 meta = imageLoad(alphaBlendMeta, pixel);
 
-    // =====================================================
-    // 2026-10-28 探针：这两档必须**先于** meta 判据执行。
-    //
-    // 起因：之前所有档都写在 `meta.y <= 0 → return` 之后，于是
-    //   "这个像素没有 alpha blend 数据" 这一整类情况**在任何档下都看不出变化**，
-    //   表现为"改了十几轮一点变化都没有"。这里把两件事变成肉眼可见：
-    //
-    //   14 = 整屏强制涂红（不看 meta、不看任何图）
-    //        整屏红   ⇒ 本 pass 确实在写最终图（部署/顺序都对）
-    //        只有玻璃红 ⇒ 玻璃像素存在，只是数据可能无效
-    //        完全不变 ⇒ 输出被后续 pass 覆盖，或本 pass 没被 dispatch
-    //   1  = 输出 radiance 图（含 blend 对"无数据"像素涂的洋红）
-    //        洋红     ⇒ 该像素**没有** alpha blend 数据（没走这条链）
-    //        彩色     ⇒ 走了链（R=bgT G=a B=层数/8）
-    // =====================================================
     if(pc.dbgMode == 14u)
     {
         imageStore(sceneColor, pixel, vec4(1.0, 0.0, 0.0, 1.0));
@@ -98,29 +62,13 @@ void main()
         return;
     }
 
-    // isValid() == hitT > 0 —— 不是 alpha blend 面就一个字节都不动。
     if(meta.y <= 0.0)
     {
         return;
     }
 
-    // =====================================================
-    // 2026-10-29 探针 15：**只把玻璃像素**涂成常量灰，其它像素保持正常画面。
-    //
-    // 与 14（整屏涂红）的分工：
-    //   14 证明"本 pass 在写最终图"，但不区分像素类别；
-    //   15 只作用在 meta.y > 0 的像素上 ⇒ 直接把"噪点是否落在玻璃像素内"变成肉眼可判：
-    //     玻璃区域变均匀灰、干净     ⇒ 噪点就在玻璃像素的合成结果里
-    //     玻璃区域仍是颗粒           ⇒ 这些像素的 meta.y <= 0，压根不是玻璃像素
-    //                                  （我们所有玻璃档当然都动不到它们）
-    // =====================================================
     if(pc.dbgMode == 15u)
     {
-        // 2026-10-29 同屏对照：左半亮红 (1,0,0)、右半中灰 (0.5)。
-        // 两者在**同一个版本、同一帧**里渲染，消除"上次干净"这类跨版本误判。
-        //   左噪右净 ⇒ 与亮度/颜色/阈值有关（bloom 等带阈值的 pass）
-        //   两边都噪 ⇒ 与玻璃像素位置/引导有关
-        //   两边都净 ⇒ 颗粒根本不在本 pass 的输出里
         const vec3 probeColor =
             (((pixel.x / 16) & 1) == 0)
                 ? vec3(1.0, 0.0, 0.0)
@@ -130,8 +78,6 @@ void main()
         return;
     }
 
-    // 诊断模式：blend 已经把三个量写成颜色，这里不再合成。
-    // 模式 9：纯背景输出（bgT 视为 1，不加表面项）。
     if(pc.dbgMode == 9u)
     {
         imageStore(
@@ -150,27 +96,10 @@ void main()
         return;
     }
 
-    // 原文 composite.comp.slang:812
     vec3 radianceOutput = max(imageLoad(sceneColor, pixel).rgb, vec3(0.0));
     const vec3 alphaBlendOutput = imageLoad(alphaBlendRadiance, pixel).rgb;
     const float backgroundAlpha = clamp(meta.x, 0.0, 1.0);
 
-    // =====================================================
-    // 2026-10-29：**背景透射项的降噪**（玻璃像素内的邻域平均）
-    //
-    // 到这里为止，逐项排除得到的结果是：玻璃像素合成式里的
-    //   a（常量 0.3）、bgT（常量 0.7）、表面项（77 号图，已平滑）、albedo（已平滑）
-    // 都不再是载体，剩下唯一带 1spp 方差的量就是 radianceOutput 本身
-    // —— 也就是 rgen 写的 behindRadiance（玻璃后面那个接收面的全辐射）。
-    //
-    // 它本应由 DLSS-RR 降掉（1spp 信号本就是靠时域累积收敛的），但玻璃像素的
-    // 引导是"pane 的镜面 F0=0 + 接收面的法线/粗糙度/albedo"这套混合记录，
-    // RR 对它的降噪明显弱于普通不透明像素。这里在同一条链上补一次空间平均。
-    //
-    // 门限：只平均 **meta.y > 0（同属玻璃像素）** 且 **hitT 相近（同一块玻璃）**
-    // 的邻居，所以不会跨物体、不会把远处玻璃的景深糊进来。
-    // A/B：-DVPT_GLASS_ALPHA_BLEND_BEHIND_SMOOTH=0 关闭。
-    // =====================================================
 #ifndef VPT_GLASS_ALPHA_BLEND_BEHIND_SMOOTH
 #define VPT_GLASS_ALPHA_BLEND_BEHIND_SMOOTH 0
 #endif
@@ -195,7 +124,6 @@ void main()
                     continue;
                 }
 
-                // 同一块玻璃：玻璃面到相机的距离相近（相对差 < 5%）。
                 const float depthDifference =
                     abs(neighbourMeta.y - meta.y) / max(meta.y, 1.0e-3);
 

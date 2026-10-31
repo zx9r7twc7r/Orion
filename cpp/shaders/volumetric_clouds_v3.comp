@@ -1,18 +1,6 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-// ===========================================================================
-// 体积云 v3 —— 云模型（MIT，完整移植）
-//
-// 模型本体在 cloud_v3_core.glsl（与离线预览工具 tools/cloudpreview 共用同一份代码）。
-// 本文件只负责**引擎侧接口**：
-//   · CameraUBO / 描述符绑定（形状 128³ / 细节 32³ / curl 128² / weather 512²）
-//   · 球壳求交（与 tyndall 同一约定）、场景深度裁剪
-//   · 直射/天光颜色（本引擎的太阳-月亮链、方向性天光）
-// · 复合（mix(background, marchColor, accumDensity) ⇒ 预乘 + 透射率）
-//   · 平面云 / 体积雾 / 空气透视尾段（与 v2 一致，不属于云模型）
-//
-// ===========================================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -21,18 +9,17 @@ layout(set = 0, binding = 0) uniform CameraProperties
     #include "camera_ubo.glsl"
 } cam;
 
-layout(set = 0, binding = 1) uniform sampler3D cloudShapeNoise;      // v3: 128³ 低频形状
-layout(set = 0, binding = 2) uniform sampler3D cloudCurlNoise;       // v3: 32³ 高频细节
+layout(set = 0, binding = 1) uniform sampler3D cloudShapeNoise;
+layout(set = 0, binding = 2) uniform sampler3D cloudCurlNoise;
 layout(rgba16f, set = 0, binding = 3) uniform writeonly image2D cloudOutput;
 layout(rg32f, set = 0, binding = 4) uniform writeonly image2D cloudDepthOutput;
 layout(set = 0, binding = 5) uniform sampler2D sceneDepth;
 layout(set = 0, binding = 6) uniform sampler2D sunShadowMap;
 layout(set = 0, binding = 7) uniform sampler2D terrainHeightMap;
 layout(set = 0, binding = 8) uniform sampler2D sunShadowMapFar;
-layout(set = 0, binding = 9) uniform sampler2D cloudBaseNoise;       // v2 遗留，v3 不用
-layout(set = 0, binding = 10) uniform sampler2D cloudV3CurlNoise;    // 128² curl
-layout(set = 0, binding = 11) uniform sampler2D cloudV3WeatherMap;   // 512² 天气图
-
+layout(set = 0, binding = 9) uniform sampler2D cloudBaseNoise;
+layout(set = 0, binding = 10) uniform sampler2D cloudV3CurlNoise;
+layout(set = 0, binding = 11) uniform sampler2D cloudV3WeatherMap;
 #include "cloud_v3_core.glsl"
 
 const float V3_EMPTY_DISTANCE = 1000000.0;
@@ -76,8 +63,6 @@ float hgPhase(float cosine, float g)
 #define SUN_SHADOW_FAR_MAP 1
 #define SUN_SHADOW_CONSUMER 1
 #define SUN_SHADOW_PCF_TAPS_4 1
-// 2026-10-21：体积雾的近图 ∪ 远图合并可见性（治"背光面照常出光柱"），
-// 原因见 sun_shadow.glsl 的 sunShadowFogVisibility。
 #define SUN_SHADOW_FOG_UNION 1
 #include "sun_shadow.glsl"
 
@@ -108,7 +93,6 @@ void main()
         return;
     }
 
-    // ---- 视线 / 场景深度 ----
     vec2 ndc = (vec2(pixel) + 0.5) / vec2(size) * 2.0 - 1.0;
     ndc.y = -ndc.y;
     vec4 viewPosition = cam.projInverse * vec4(ndc, 1.0, 1.0);
@@ -135,7 +119,6 @@ void main()
     }
     float sceneDistance = sceneDistanceForDepth(ndc, rawSceneDepth);
 
-    // ---- 直射 / 天光颜色 ----
     vec3 lightDirection0 = sunDirection();
     float sunElevation = lightDirection0.y;
     vec3 lightDirection = sunElevation >= 0.0 ? lightDirection0 : -lightDirection0;
@@ -181,7 +164,6 @@ void main()
         radianceAntiSun * weightAntiSun) / max(weightZenith + weightSunSide + weightAntiSun, 1.0e-4);
     skyColor *= clamp(cam.cloudParams5.w, 0.0, 3.0);
 
- // ---- 模型参数----
     float baseAltitude = cam.cloudParams0.x;
     float layerThickness = max(cam.cloudParams0.y, 1.0);
     float coverageMaster = clamp(cam.cloudParams0.z, 0.0, 1.0);
@@ -195,8 +177,6 @@ void main()
     float heightGradientSkew = 1.0 + clamp(cam.cloudParams6.y, 0.0, 1.0);
     float erosionScale = 0.005 * clamp(cam.cloudParams6.w, 0.25, 2.0);
     float curlStrength = 0.5 * clamp(cam.cloudParams1.z, 0.25, 2.0);
-    // 天气图 1 tile 覆盖多少格：预览器里 5000 格（5 km）才与参考观感一致；
-    // 50000 会让整片天空落在同一个天气格上（覆盖度恒定 ⇒ 云连成一片）。
     float weatherScale = 5000.0 * clamp(cam.cloudParams6.x, 0.25, 4.0);
     float erosionAmount = 1.4 * clamp(cam.cloudParams1.x / 0.15, 0.25, 2.0);
 
@@ -204,18 +184,12 @@ void main()
     settings.eccentricity = 0.6;
     settings.silverIntensity = 0.7 + 0.3 * clamp(cam.cloudParams6.z, 0.0, 1.0);
     settings.silverSpread = 0.1;
-    // 参考常量是 5.0；预览对比下 10 才接近"白云"的亮度（我们的太阳颜色与
-    // 参考的 SUN_INTENSITY=0.78 不同，这一步是量纲对齐，不是模型改动）。
-    // 参考常量 5.0 是配他们自己的 tonemap（ACES + 1/16 稀疏 + 时间累积）；
-    // 我们的直出色域更暗，实测 12 才接近"白云"。这是量纲对齐，不是模型改动。
     settings.brightness = 12.0;
-    // 云底环境补光：参考没有这一项（0 = 逐字行为）；用天光强度滑杆给到 0~0.3。
     settings.ambientStrength = 0.25 * clamp(cam.cloudParams5.w, 0.0, 3.0);
 
     int viewSteps = int(clamp(cam.cloudParams2.x, 1.0, 96.0));
     int lightSamples = int(clamp(cam.cloudParams2.y, 1.0, 6.0));
 
-    // ---- 球壳求交 ----
     vec2 anchorXZ = cam.cloudParams3.xy;
     vec3 shellOrigin = vec3(anchorXZ.x, baseAltitude, anchorXZ.y);
     vec3 earthCenter = vec3(anchorXZ.x, baseAltitude - TYNDALL_RADIUS, anchorXZ.y);
@@ -259,34 +233,22 @@ void main()
         inputs.curlStrength = curlStrength;
         inputs.weatherScale = weatherScale;
         inputs.erosionAmount = erosionAmount;
-        // 消光按**整层光学厚度**标定，而不是每格：参考观感 ≈ 12 个 OD 穿过整层。
-        // 这样 400 格层给 0.03/格、16 km 层给 0.0007/格，观感与层厚无关
-        // （之前的固定 0.03/格会让 16 km 的层瞬间变成实心白墙）。
         inputs.extinction = (12.0 / max(layerThickness, 1.0)) *
             clamp(cam.cloudParams0.w / 5.0, 0.05, 2.0);
         inputs.ambientColor = skyColor;
         inputs.requestedSteps = viewSteps;
         inputs.lightSamples = lightSamples;
-        // 2026-10-18 修"一直闪"：Halton 抖动相位原来跟着帧号变，而我们的 resolve
-        // 在云分辨率下并不总能收敛（相机一动历史就被拒）⇒ 每帧换相位 = 整片噪点闪烁。
-        // 改成固定相位（静止图案），噪声不再流动；要动态则靠步数/分辨率，不靠抖动。
         inputs.frameIndex = 7;
 
         march = v3MarchClouds(cloudShapeNoise, cloudCurlNoise, cloudV3CurlNoise,
             cloudV3WeatherMap, inputs, settings, cloudDistance);
     }
 
-    // ---- 复合（A4）：mix(background, marchColor, accumDensity) ----
     float cloudOpacity = clamp(march.a, 0.0, 1.0);
     vec3 scattering = march.rgb * cloudOpacity * sunColor;
-    // 2026-10-18 修"莫名其妙的黑"：参考只有太阳项，云底/背光面算出来接近 0，
-    // 在夜晚或太阳低角度时整片发黑。这里补一个随覆盖度缩放的天空环境项
-    // 。0.55 只是让阴影可读，
-    // 不参与太阳项，所以不会把云洗白。
     scattering += skyColor * cloudOpacity * 0.55;
     float transmittance = 1.0 - cloudOpacity;
 
-    // ---- 平面云 / 雾 / 空气透视（同 v2）----
     if(highDistance < cloudDistance)
     {
         scattering = highCloud.rgb + highCloud.a * scattering;
@@ -298,10 +260,8 @@ void main()
     transmittance *= highCloud.a;
     cloudDistance = min(cloudDistance, highDistance);
 
-    // 2026-10-23：环境项接沿视线的真实晴空辐亮度，按 fogExtrasParams.z 混入。
     const vec3 fogAmbientLegacy =
         mix(vec3(0.055, 0.070, 0.125), vec3(0.62, 0.72, 0.92), dayAmount);
-    // 2026-10-23 修正：半球平均，不用视线方向（否则太阳位置出白斑、隔墙发光）。
     const vec3 fogAmbientSky = fogSkyAmbient(
         worldDirection,
         sunElevation,
@@ -324,7 +284,6 @@ void main()
         cam.cloudParams8.x, cam.cloudParams8.y, cam.cloudParams8.z, cam.cloudParams8.w,
         cam.cloudParams9.x, cam.cloudParams9.y, cam.cloudParams9.z,
         cam.fogExtrasParams.y, cam.fogExtrasParams.w, cam.fogExtrasParams.x,
-        // 2026-10-23 雨天地面雾浪（两个死 lane 复用，见 v1 同名段）。
         cam.cloudParams4.y, cam.cloudParams4.z, cam.cloudParams4.w, cam.cloudParams9.w);
 
     {

@@ -1,49 +1,17 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-// Equirectangular single-scattering sky precompute.  Adapted from the
-// D0B_RenderSky idea (low-resolution sky scattering +
-// transmittance textures) but marching from the camera position instead of
-// a screen-space frustum, so any miss ray can sample it by world direction.
-// One march computes both outputs: the in-scattered radiance and the
-// per-channel transmittance along the same ray.
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-// =====================================================
-// 2026-09-30 大气重写（方案 A）：Bruneton 预计算 LUT 路径。
-// SKY_ATM_BRUNETON 1 = 物理天空走 Bruneton LUT（transmittance/scattering/
-// singleMie 三张预计算纹理查表，多次散射已烘焙）；0 = 旧 25×5 march 路径
-// （逐字节回退档）。运行时开关：skyParams1.y（设置里的「物理天空」）
-// ON → Bruneton、OFF → 旧 legacy 渐变，随时 A/B。
-// 手调暮色盘/金色层/zenith-blue 补丁在 Bruneton 路径下全部退役 ——
-// 暮色/火烧天由物理参数（臭氧 + 多次散射）推导。
-// 保留的薄风格层：夜晚月光蓝地板、雨天压暗去饱和（P1）、散射强度滑杆、
-// 太阳盘透射染色输出（rmiss 消费）。
-// 2026-10-03 七修（蔚蓝天 + 太阳缩小）：Bruneton 路径拆开 GetSkyRadiance
-// 的合成式，单次米氏项乘 aureoleScale（= 日冕滑杆/0.18 × 0.25，与 legacy
-// 同标定）—— 日冕滑杆从此统一管两条路径的米氏日晕/白雾；瑞利系数抬升见
-// bruneton/atmosphere.glsl，曝光反比补偿见 SKY_ATM_EXPOSURE。
-// =====================================================
 #ifndef SKY_ATM_BRUNETON
 #define SKY_ATM_BRUNETON 1
 #endif
-// PI 用宏定义：兼容 SKY_ATM_BRUNETON=0（不 include bruneton）的回退编译；
-// bruneton/definitions 内部有 #if !defined(PI) 守卫，会自动跳过。
 #define PI 3.14159265359
 #if SKY_ATM_BRUNETON
 #include "bruneton/atmosphere.glsl"
 #include "bruneton/common.glsl"
 #include "bruneton/runtime.glsl"
-// 亮度标定：Bruneton 输出光谱辐亮度 × 天空光度系数 ≈ cd/m² 量级，
-// 再乘本常数映射到旧档曝光量级。首验后可调。
-// 2026-10-03 蔚蓝档：atmosphere.glsl 瑞利系数抬升（×1.2 均匀、蓝 ×1.35）后
-// 天顶亮度升约 ×1.224，曝光按反比 0.0004 → 0.00033 补偿，天顶亮度档位不变、
-// 只让色相变蓝。若单独回滚 atmosphere.glsl，这里要同步回 0.0004。
 const float SKY_ATM_EXPOSURE = 0.00033;
-// 诊断视图（SKY_ATM_DEBUG，默认 0 = 正常输出）：
-//   1 = 视线方向透射率（健康：地平线偏红橙 → 天顶接近白/浅蓝，整体不黑）
-//   2 = 散射 LUT 原始查询 ×50（健康：地平线亮、天顶暗的蓝白渐变）
-//   3 = 透射 LUT 在视线方向的查询（健康：地平线深红 → 天顶白）
 #ifndef SKY_ATM_DEBUG
 #define SKY_ATM_DEBUG 0
 #endif
@@ -57,13 +25,7 @@ layout(set = 0, binding = 0) uniform CameraProperties
 layout(rgba16f, set = 0, binding = 1) uniform writeonly image2D skyScatteringOutput;
 layout(rgba16f, set = 0, binding = 2) uniform writeonly image2D skyTransmittanceOutput;
 
-// 2026-10-06：星图（rt_star_map.png）也要进这张天空 LUT —— 它不再是 rmiss 里的
-// 纯装饰，而是夜间天空真实的一部分：解析天空反射、任何读 LUT 的光照都会带上它。
-// 本 pass 用的是自己那套 set（binding 0..5 是 Bruneton LUT 与相机），这里加 6。
 layout(set = 0, binding = 6) uniform sampler2D starMap;
-// 2026-10-09：末地图集（rt_end_atlas.png）也进这张 LUT。2026-10-18 起末地天空
-// 改为 Star Nest（见 end_sky_common.glsl），星空不再采图集；binding 保留以免
-// 打乱描述符布局（图集仍被地球/云代码使用）。
 layout(set = 0, binding = 7) uniform sampler2D endSkyAtlas;
 #if SKY_ATM_BRUNETON
 layout(set = 0, binding = 3) uniform sampler2D brunetonTransmittance;
@@ -71,54 +33,27 @@ layout(set = 0, binding = 4) uniform sampler3D brunetonScattering;
 layout(set = 0, binding = 5) uniform sampler3D brunetonSingleMie;
 #endif
 
-const float EARTH_RADIUS = 6360.0;   // km, matches the miss-shader cloud shells
+const float EARTH_RADIUS = 6360.0;
 const float ATMOSPHERE_HEIGHT = 60.0;
 const float RAYLEIGH_SCALE_HEIGHT = 8.5;
 const float MIE_SCALE_HEIGHT = 1.2;
-const vec3 RAYLEIGH_BETA = vec3(5.8e-3, 1.355e-2, 3.31e-2); // km^-1 at sea level
+const vec3 RAYLEIGH_BETA = vec3(5.8e-3, 1.355e-2, 3.31e-2);
 const vec3 MIE_BETA = vec3(4.0e-3);
-const vec3 OZONE_BETA = vec3(2.0e-3, 1.0e-3, 3.0e-4);       // red > green > blue
+const vec3 OZONE_BETA = vec3(2.0e-3, 1.0e-3, 3.0e-4);
 const int VIEW_STEPS = 25;
 const int LIGHT_STEPS = 5;
-// Calibrated so a noon zenith matches the legacy gradient sky brightness
-// (CPU simulation of this march: raw zenith blue ≈ 0.19, legacy ≈ 0.58).
-// The scatter slider multiplies the final radiance in main().
 const float EXPOSURE = 3.0;
 
-// Circumsolar aureole control.  MIE_BETA * miePhase() peaks at 2.93 with
-// g = 0.78, so the in-scattered radiance right beside the sun reaches ~7x the
-// zenith value.  The display transform saturates in the highlights (uchimura
-// in rr_sdr_post.comp compresses rather than hard-clips), so a lobe this bright
-// and this wide still reads as a gigantic sun once it goes supra-white: the
-// saturated solid angle keeps growing with its energy.
-// The halo slider (skyParams0.y, default 0.18) scales this forward lobe only.
-// The Mie extinction that reddens the low sun is deliberately NOT scaled, so
-// sunset colour is unaffected.  0.18 -> 0.25x (normal-sized sun), 1.0 -> 1.39x
-// (heavy haze), 0.0 -> no aureole at all.
-// This lobe is also kept OUT of the skyScatterIntensity multiplier in main()
-// (see the aureoleRadiance accumulator) for the same reason: the scatter slider
-// owns sky brightness, the halo slider owns the sun, and neither moves the other.
 const float HALO_SLIDER_DEFAULT = 0.18;
 const float AUREOLE_SCALE_AT_DEFAULT = 0.25;
 
 const float SOLAR_LATITUDE_35_SIN = 0.57357643635;
 const float SOLAR_LATITUDE_35_COS = 0.81915204429;
 
-// 2026-10-06：星图与极光也进这张 LUT。两者共用 rmiss 的同一份实现
-// （star_map_common.glsl / aurora_common.glsl），保证 LUT 里的方向与可见天空
-// 严格对齐 —— 否则"照亮世界的极光"会跟眼睛看到的帘幕错位。
 #include "star_map_common.glsl"
 #include "aurora_common.glsl"
 
-// LUT 里这份贡献的缩放。256x128 的 texel 是 1.4°，装下的是星图/极光在该 texel 上的
-// **面积平均**（极光帘幕峰值远高于均值），而 rmiss 已经把"锐利"那一份画在可见天空
-// 上了 ⇒ 两份相加会比物理亮度高一点。0.35 是把它压回"帘幕略微更亮但不发白"的口径；
-// 想要更强的环境照明就往上调（代价是可见天空里的帘幕一起变亮）。
 const float SKY_LUT_SKY_EXTRA_SCALE = 0.35;
-// 2026-10-18 末地天空（Star Nest）写进 LUT 的缩放。它与上面那条**不是**同一回事：
-// 末地的可见天空由 rt_test.rmiss 自己覆盖（主世界才读 LUT）⇒ 不存在"LUT 与可见
-// 天空两份相加"的问题，LUT 只是把同一份星空留给读 LUT 的路径（低菲涅尔玻璃的解析
-// 天空反射），所以 1.0 才与眼睛看到的一致。只想调玻璃里的星空就动这一个数。
 const float SKY_LUT_END_SKY_SCALE = 1.0;
 
 float scalarExtinction(vec3 beta)
@@ -132,57 +67,19 @@ float saturate(float value)
 }
 
 
-// 曙暮光带。曾试过「半边天」版本：一个比 Mie 前向瓣宽得多的视方向瓣，按方位
-// 铺满朝阳侧半个天空。用户否掉了 —— 橘色只该出现在「太阳所在的那一行」，也就
-// 是只看俯仰、不看方位的一条带，而不是半个天空换色。那个实现按死代码规则屏蔽
-// 保留在 main() 里（#if 0），作为后续接口选项。
-//
-// 2026-09-30 六修（用户：「把夕阳和日出的整片天空变色改成只有太阳那一小块天空
-// 和地平线变色，然后渐变回黑夜/蓝天」）。探针 `_sky_dome_probe.py` 实测：太阳降到
-// 约 6° 以下时，**整个天穹 100% 面积**的暖度 (R-B)/(R+B) 都 > 0.25（整片橘）。
-//
-// 根因不在曙暮项的强度，而在**入射光色**：`skyModelSunColor()` 在低太阳时做
-// 「金色饱和拉伸 + 橘色相乘」，蓝通道过零被钳到 0（实测 5.9° 时 lightColor =
-// (1.472, 0.313, 0.010)，地平线处 (1.691, 0.223, 0.000)）。而天穹的散射亮度
-// **整个正比于 lightColor**（`lightColor × lightTransmittance × RAYLEIGH_BETA
-// × phase`）—— 蓝通道是 0，瑞利散射就一个蓝光子都散不出来，整片天自然一起变橘。
-// 这同时也是「橘色能铺满全天空、却怎么调 TWILIGHT_ROW_* 都压不下去」的原因：
-// 手调的曙暮项只是加在 ambient 上的一点点缀（0.22 / 0.035），量级比直射散射项
-// 小一个数量级。
-//
-// 修法（六修，见 main() 里的 SUN_CAP_* / HORIZON_WARM_*）：把入射光色改成
-// **逐方向**在两个档之间插值 ——
-//   暖档 = lightColor（sunColor，被暮色盘染过的真实阳光色，低太阳时无蓝）
-//   冷档 = vec3(1.0)（天顶白。物理基色 skySunPhysicalBaseColor 是「天顶锚定」
-//          的，airmass = 1 处恰好逐位等于 vec3(1)，所以这不是拍脑袋的白，
-//          而是模型自己的未染色入射光；红化交给逐样本的 lightTransmittance
-//          与 viewTransmittance 各算一次，本来就已计入）
-// 暖档只出现在两处：太阳角锥（"太阳那一小块天空"）与贴地平线的薄暖带
-// （"地平线变色"），其余方向回白档 ⇒ 瑞利蓝保留，高空自然渐变回蓝天。
-// 冷侧乘 sunsetWeight，所以白天该权重为 0 ⇒ **逐位**等于旧档（实测 phase
-// 0.25/0.30/0.36/0.75/0.85/0.10/0.15 天穹最大绝对差 0.00000）。
-//
-// 角直径/地平线宽度的旋钮都做成 #ifndef 常量，方便直接改档复编（与云侧的
-// CLOUD_FIRE_* 同一套约定）。
 #ifndef SUN_CAP_COS_INNER
-// 太阳角锥内径的 cos（0.9613 = cos16°）：此角内全额暖档。
 #define SUN_CAP_COS_INNER 0.9613
 #endif
 #ifndef SUN_CAP_COS_OUTER
-// 角锥外径的 cos（0.7880 = cos38°）：此角外回冷档。
 #define SUN_CAP_COS_OUTER 0.7880
 #endif
 #ifndef HORIZON_WARM_TOP
-// 地平线暖带归零的仰角（弧度）。0.14 ≈ 8°，可见部分约贴地 0..5°。
 #define HORIZON_WARM_TOP 0.14
 #endif
 #ifndef TWILIGHT_HORIZON_STRENGTH
-// 地平线暖带的加法余量（全方位）。入射光色已经给了暖色，这一项只负责把
-// 贴地那一条线再提亮一点；0.0 = 只靠入射光色。
 #define TWILIGHT_HORIZON_STRENGTH 1.5
 #endif
 #ifndef TWILIGHT_CAP_STRENGTH
-// 太阳角锥的加法余量。入射光色已经给出角锥内的暖色，默认 0（留作加大光晕用）。
 #define TWILIGHT_CAP_STRENGTH 0.0
 #endif
 
@@ -191,8 +88,6 @@ float saturate(float value)
 
 #include "sky_model_common.glsl"
 
-// 2026-10-09 末地天空（图集银河 UV + 程序化银河）的单一真源，与 rt_test.rmiss
-// 共用同一份代码 ⇒ LUT 里那份银河与可见天空逐位对齐。
 #include "end_sky_common.glsl"
 
 // 2026-09-30 P2：实现移入 sky_model_common.glsl（单一共享版本）。
@@ -235,7 +130,6 @@ vec3 atmosphereDensities(float altitude)
 {
     float rayleigh = exp(-max(altitude, 0.0) / RAYLEIGH_SCALE_HEIGHT);
     float mie = exp(-max(altitude, 0.0) / MIE_SCALE_HEIGHT);
-    // Chappuis-band ozone sheet between 15 and 35 km.
     float ozoneCenter = 25.0;
     float ozoneWidth = 10.0;
     float d = (altitude - ozoneCenter) / ozoneWidth;
@@ -264,22 +158,8 @@ void main()
     vec3 direction = directionForPixel(pixel, size);
     float directionElevation = direction.y;
 
-    // Non-overworld dimensions keep the exact legacy gradient so the look
-    // is unchanged where no sun cycle exists.
     if(abs(cam.weatherParams.z - 1.0) >= 0.25 || cam.skyParams1.y < 0.5)
     {
-        // 2026-10-05 末地：不叠任何大气 ⇒ 散射 LUT 里不写大气散射。
-        // 2026-10-18：写 **Star Nest 星空**（与 rt_test.rmiss 的可见天空同一份
-        // 代码 end_sky_common.glsl）。可见天空那一侧仍是 rmiss 自己覆盖（本 LUT
-        // 在末地不参与可见天空），所以这里写的是"读 LUT 的路径"能看到的东西：
-        // 低菲涅尔玻璃的解析天空反射。缩放见 SKY_LUT_END_SKY_SCALE。
-        //
-        // ⚠ 透射 LUT 必须写 **1.0（无消光）**，不能写 0：它不是"大气的通量"而是
-        //   rmiss 给日盘染色的乘数（rt_test.rmiss 的 diskColor *= textureTint），
-        //   写 0 会把末地的太阳盘整个涂黑。没有大气 ⇒ 透射率就是 1。
-        //
-        // ⚠ Bruneton 的启动期预计算不要动：它在 Java 更新维度码之前就跑，那时
-        //   weatherParams.z 还是默认的 1.0，所以改动只落在运行期分支。
         if(abs(cam.weatherParams.z - 3.0) < 0.25)
         {
             vec3 skyNest = endSkyRadiance(
@@ -297,29 +177,10 @@ void main()
     }
 
 #if SKY_ATM_BRUNETON
-    // ===== Bruneton LUT 路径 =====
     vec3 sunDirB = sunDirection();
     float sunElevationB = sunDirB.y;
     float cameraAltitude = max(cam.playerPositionAndWater.y, 0.0) / 1000.0;
     vec3 cameraKm = vec3(0.0, EARTH_RADIUS + cameraAltitude, 0.0);
-    // 2026-10-03 七修（用户：「太阳显得太大了」）：不再调 GetSkyRadiance，
-    // 把它的合成式拆开 —— combined×RayleighPhase 原样保留，singleMie×
-    // MiePhase 乘 aureoleScale 后再加。原因：GetSkyRadiance 内部把「瑞利+
-    // 多次散射」与「单次米氏」一次性加死，米氏前向瓣（β_mie×phase 在
-    // nu→1 处 ~3.6 的尖峰）没有能量旋钮；瓣比天顶亮一个量级，uchimura 高肩
-    // 只压缩不削能量，supra-white 饱和区的视直径随瓣能量单调增长 —— 太阳
-    // 就成了一个二三十度的白盘（legacy march 在 2026-09-30 定位并解耦过
-    // 同一现象，见本文件 aureole 常量注释）。
-    //
-    // 标定与 legacy 完全一致：aureoleScale = 日冕滑杆/0.18 × 0.25，
-    // 滑杆 0.18 → 0.25×（正常大小太阳），1.0 → 1.39×（重霾），0 → 无日晕。
-    // 日冕滑杆（skyParams0.y）从此在两条路径语义统一：既管 rmiss 的 pow64
-    // 光晕，也管 LUT 天空里的米氏日晕与整片米氏白雾（白天想更蔚蓝就调低它）。
-    //
-    // 相机恒在大气层内（玩家海拔 ≤ ~0.4km << top_radius 60km），不需要
-    // GetSkyRadiance 的出界重定位分支；ray_r_mu_intersects_ground 恒 false
-    // （GROUND 未定义，与 GetSkyRadiance 现行为逐位一致）。类型提醒：
-    // bruneton 的 Number/Length 是 float 宏，混用无碍。
     float rCamKm = length(cameraKm);
     float muB = dot(cameraKm, direction) / rCamKm;
     float muSunB = dot(cameraKm, sunDirB) / rCamKm;
@@ -330,9 +191,6 @@ void main()
         rCamKm, muB, muSunB, nuB, false, singleMieB);
     float aureoleScaleB = clamp(cam.skyParams0.y, 0.0, 4.0)
         / HALO_SLIDER_DEFAULT * AUREOLE_SCALE_AT_DEFAULT;
-    // 2026-10-22：日晕拆成独立一项。alpha 通道写它的亮度占比，
-    // rt_test.rmiss 在「阴影水面反射」射线上（bit 15）用它从 LUT 天空里减掉
-    // 烘进去的米氏日晕 —— 见下面的 imageStore 注释。
     vec3 spectralRayleighB = combinedB * RayleighPhaseFunction(nuB);
     vec3 spectralAureoleB = singleMieB *
         MiePhaseFunction(ATMOSPHERE.mie_phase_function_g, nuB) * aureoleScaleB;
@@ -371,58 +229,24 @@ void main()
 #endif
     vec3 radiance = spectral * SKY_SPECTRAL_RADIANCE_TO_LUMINANCE *
         SKY_ATM_EXPOSURE;
-    // 夜晚月光蓝地板（Bruneton 深夜输出趋黑；星图在 rmiss）。
-    // 2026-10-01 回退：曾抬到 0.45 想让夜景亮一点，结果这层加法地板直接
-    // 把 rmiss 加在上面的星图洗掉（星是加性的，底越亮星越看不见）。
-    // 星河是这一层的前提，地板保持 0.22。夜云偏亮的需求交给
-    // volumetric_clouds.comp 的夜光常量（与天空层解耦）。
     float nightAmount = smoothstep(-0.03, -0.35, sunElevationB);
-    // 2026-10-01 修（星空图被夜空底色盖住）：
-    // 这里曾经是直接加法 `* 0.22`，得到夜空底色 (0.066,0.092,0.187)。而重写前的
-    // legacy 分支（本文件 #else，line ~435）把**同一个常量塞进 ambient**，再乘
-    // 散射系数 (RAYLEIGH_BETA*0.06 + MIE_BETA*0.5 ≈ 0.002~0.004) 后积分，等效夜空
-    // 只有 (0.014,0.023,0.067) —— 直加把夜天顶一次性抬亮了约 3~4 倍。
-    //
-    // 星图（rt_star_map.png）漫射背景/银河经 STAR_MAP_EXPONENT(4.4) 解码后只有
-    // 0.01~0.02 量级，低于旧底色太多；底色一抬高，星图的延展内容（银河带、暗星）
-    // 整片沉进去 —— 只剩最亮的几颗点星，观感就是「星空图被一层蓝盖住」。这也解释
-    // 了 0.45→0.22 看着没变化：两个值都远在银河亮度之上。
-    //
-    // 降到 0.05 回落到 legacy 等效夜空（略暗、给星图留余量，用户明确不需要更亮的
-    // 夜空）。nightAmount 在 sunElevation > -0.03 时为 0 ⇒ 白天逐位不变。
-    // 旋钮：想更黑压更低（0.02~0.03），想留一点地平线辉光往上提（0.08）。
     radiance += vec3(0.30, 0.42, 0.85) * 0.05 * nightAmount;
-    // 2026-10-06：极光进 LUT（它是真实光，雪面泛青靠它）。
-    // ⚠ 星图**不进** LUT（用户要求）：LUT 会被当环境光消费，星图进去等于让满天星
-    //   给地面打光。星星只该是"看得见的装饰"，只留在 rmiss 的可见天空里。
-    // 极光的夜间 / 雨雪 / 维度 / 生物群系门控都在 evaluateAurora 内，与 rmiss 同源。
-    // 非主世界在上面已早退 ⇒ 末地/下界逐位不变。
     radiance += SKY_LUT_SKY_EXTRA_SCALE * (
         evaluateAurora(direction, sunElevationB));
-    // 雨天压暗去饱和（P1 语义保留）
     float rainSky = clamp(cam.weatherParams.x, 0.0, 1.0);
     float thunderSky = clamp(cam.weatherParams.y, 0.0, 1.0);
     float rainLuma = dot(radiance, vec3(0.2126, 0.7152, 0.0722));
     radiance = mix(radiance, vec3(rainLuma), rainSky * 0.55) *
         mix(1.0, 0.35, rainSky) *
         mix(vec3(1.0), vec3(0.72, 0.78, 0.86), thunderSky);
-    // 2026-10-21 雷暴频闪：LUT 整体加一次短促天光闪（也是 ambient 的光源 ⇒
-    // 地表/云间接会被同一次闪点亮），门控与包络见 sky_model_common.glsl。
     radiance += lightningFlashEnvelope() * vec3(1.6, 1.75, 2.0);
     radiance = clamp(radiance * cam.skyParams1.z, 0.0, 8.0);
-    // 太阳盘染色输出（rmiss 消费）：视线方向的分通道透射率
     float rCam = length(cameraKm);
     float muSun = dot(cameraKm, sunDirB) / rCam;
     vec3 sunTrans = GetTransmittanceToSun(
         ATMOSPHERE, brunetonTransmittance, rCam, muSun);
     float lumaT = max(dot(sunTrans, vec3(0.2126, 0.7152, 0.0722)), 1.0e-4);
     vec3 normalizedTint = min(sunTrans / lumaT, vec3(4.0));
-    // alpha = 米氏日晕（单次散射前向瓣）在本次输出里的亮度占比 0..1。
-    // 只有 rt_test.rmiss 的「阴影水面反射」分支读它（bit 15）：日盘与 pow64
-    // 日冕是解析合成的，可以被 bit 关掉；这一项却烘进了 RGB，不单独给占比就
-    // 只能整片压天空。占比用拆开前的线性量算 —— 后面的雨/雷暴调制是乘法，
-    // 不改变占比。旧值 exp(-od*0.5) 无任何消费者（binding 42 只有 rgen/rmiss
-    // 读，且都只取 .rgb）。
     float spectralLuma = max(
         dot(spectral, vec3(0.2126, 0.7152, 0.0722)), 1.0e-6);
     float aureoleLuma = dot(
@@ -439,16 +263,6 @@ void main()
     vec3 lightColor = sunColor(sunDir);
     float sunElevation = sunDir.y;
 
-    // =====================================================
-    // 2026-09-30 P1 雨天天穹响应（评估轮定位的缺陷：旧穹顶不读 rain，
-    // 暴雨时从云缝看天仍是晴朗蓝天）。三件事随雨插值，非主世界已在
-    // 前面 return，夜晚/正午在 rain=0 时逐位同旧档：
-    //   1. 气溶胶加浓：Mie β ×(1+rain·2.5) —— 天空发白、地平线雾化、
-    //      日晕被雾洗开（视 march 与光 march 的 odM 同步放大，保持自洽）；
-    //   2. 整体压暗 ×mix(1, 0.35, rain)：rgen 对远景雾源用同族 0.20，
-    //      穹顶是自发光体留 0.35，避免雨幕全黑；
-    //   3. 去饱和 55% 向亮度灰度收敛 + 雷暴沿用全局冷移系数。
-    // =====================================================
     float rainSky = clamp(cam.weatherParams.x, 0.0, 1.0);
     float thunderSky = clamp(cam.weatherParams.y, 0.0, 1.0);
     float rainMieScale = 1.0 + rainSky * 2.5;
@@ -469,8 +283,6 @@ void main()
     }
     if(marchEnd <= 0.0)
     {
-        // Looking straight down from orbit-level altitude is impossible for a
-        // player; store a neutral fallback rather than an unlit ray.
         imageStore(skyScatteringOutput, pixel, vec4(0.0, 0.0, 0.0, 1.0));
         imageStore(skyTransmittanceOutput, pixel, vec4(1.0, 1.0, 1.0, 1.0));
         return;
@@ -479,18 +291,11 @@ void main()
     float stepLength = (marchEnd - atmosphereEntry) / float(VIEW_STEPS);
     float aureoleScale = cam.skyParams0.y / HALO_SLIDER_DEFAULT * AUREOLE_SCALE_AT_DEFAULT;
 
- // Multiscatter stand-in :
-    // unshadowed ambient keeps the horizon and night sky from going black.
     float sunAmount = smoothstep(-0.12, 0.30, sunElevation);
     float twilightAmount = smoothstep(-0.45, -0.03, sunElevation) *
         (1.0 - smoothstep(-0.03, 0.25, sunElevation));
     float nightAmount = smoothstep(-0.03, -0.35, sunElevation);
-    // 曙暮光带：地平线附近那条暖色。色相跟随 sunColor() 的黎明/黄昏选择，
-    // 否则整片天换了色、只有这条还留着旧的橙，接缝会看得出来。
-    // 深度夜切到月光蓝地板，避免夜空发黑。
     vec3 twilightBand = twilightPalette(sunElevation);
-    // 退休的「半边天」视方向瓣：按方位铺满朝阳侧半个天空。保留为选项，但要
-    // 重新启用得先解决它和云的分界 —— 云不吃这一项，所以整片云底会显得脏。
 #if 0
     const float TWILIGHT_WIDE_STRENGTH = 0.22;
     const float TWILIGHT_WIDE_ZENITH_FADE = 0.45;
@@ -498,22 +303,14 @@ void main()
         mix(1.0, 1.0 - TWILIGHT_WIDE_ZENITH_FADE,
             smoothstep(0.20, 0.90, directionElevation));
 #endif
-    // 2026-09-30 六修：暖色只留「太阳那一小块天空 + 地平线」（见文件头注释）。
-    // 太阳角锥 = 以太阳方向为心的球冠；地平线暖带 = 只看俯仰、全方位的一条薄线。
     float sunCap = smoothstep(SUN_CAP_COS_OUTER, SUN_CAP_COS_INNER,
         dot(direction, sunDir));
     float horizonWarm = 1.0 - smoothstep(0.0, HORIZON_WARM_TOP, directionElevation);
     float warmGate = max(sunCap, horizonWarm);
-    // 2026-09-30 夕阳感修复（用户对照实拍截图）：黄昏时高仰角天顶必须
-    // 回到蓝 —— 旧档 lightColor（低太阳时深橘）把整个天球的环境项都染橘，
-    // 全天一片橘汤。物理上高仰角的多重散射走短路径、瑞利蓝色主导，暖色
-    // 只应贴地平线。lowSun 门保证正午不受影响（正午该项本来就是白）。
     float lowSun = 1.0 - smoothstep(0.10, 0.35, sunElevation);
     float zenithBlueWeight = lowSun * smoothstep(0.015, 0.15, directionElevation);
     vec3 sunAmbientColor = mix(lightColor, vec3(0.60, 0.72, 1.00),
         zenithBlueWeight);
-    // 入射光色：暖档 lightColor / 冷档天顶白（见文件头）。sunsetWeight 乘在
-    // 冷侧 ⇒ 白天（= 0）逐位回旧档，只有曙暮窗口才发生空间局部化。
     float sunsetWeight = 1.0 - smoothstep(0.04, 0.22, sunElevation);
     vec3 skyLightColor = mix(lightColor, vec3(1.0),
         (1.0 - warmGate) * sunsetWeight);
@@ -527,12 +324,6 @@ void main()
     float odM = 0.0;
     float odO = 0.0;
     vec3 radiance = vec3(0.0);
-    // 日晕（Mie 前向瓣）单独累加。「大气散射强度」滑杆只该管天空有多亮，
-    // 不能顺手把日晕一起放大：日晕是一圈 30–40 度的前向瓣，显示变换在亮部
-    // 饱和，所以过曝区域的视直径随能量单调增长 —— 滑杆一拉高，太阳就变成
-    // 一个巨大的白盘。解耦后日晕的能量只由「日晕滑杆」决定（与本节顶部注释
-    // 描述"0.18 -> 0.25x 正常尺寸"的语义一致），滑杆 = 1.0 时输出与解耦前
-    // 逐位相同。
     vec3 aureoleRadiance = vec3(0.0);
 
     for(int step = 0; step < VIEW_STEPS; ++step)
@@ -541,9 +332,6 @@ void main()
         float altitude = length(position) - EARTH_RADIUS;
         vec3 densities = atmosphereDensities(altitude);
 
- // Light march toward the sun. Short budget (uses the same
-        // order at 1/8 resolution); the reddening at grazing angles comes
-        // mostly from the accumulated view optical depth.
         float sunEntry;
         float sunExit;
         float sunGroundEntry;
@@ -573,19 +361,10 @@ void main()
         }
 
         float viewCosine = dot(direction, sunDir);
-        // 瑞利散射与环境项 —— 这两支吃「大气散射强度」滑杆。
-        // The ambient term represents multiply-scattered light, so it is
-        // attenuated only partially by the accumulated optical depth.
-        // 2026-09-30 六修：入射光色换成逐方向的 skyLightColor（暖区外回天顶白，
-        // 保住瑞利蓝），见文件头注释。旧档这里直接用 lightColor。
         vec3 baseRadiance =
             skyLightColor * lightTransmittance * (RAYLEIGH_BETA * rayleighPhase(viewCosine))
             + ambient * (RAYLEIGH_BETA * 0.06 + MIE_BETA * 0.5 * rainMieScale)
             * exp(-(odR + odM) * 0.3);
-        // 日晕单独一支，不参与该滑杆。米氏消光（压低太阳让它变红的那部分）
-        // 本来就没被滑杆缩放，所以这个拆分不影响日出日落染色。
-        // 日晕是**太阳本体**的光晕，必须用被暮色染过的 lightColor，不能跟着
-        // 天穹用 skyLightColor（否则太阳周围的白盘会失去日落红）。
         vec3 aureoleSample =
             lightColor * lightTransmittance *
             (MIE_BETA * miePhase(viewCosine) * aureoleScale * rainMieScale);
@@ -600,23 +379,16 @@ void main()
         odO += densities.z * stepLength;
     }
 
-    // 只有天空主体吃「大气散射强度」；日晕按标定倍率成像，滑杆不再影响太阳大小。
-    // P1 雨天：散射与日晕一起压暗去饱和（日晕也被雾洗开），雷暴冷移。
     vec3 skyRadiance = radiance * cam.skyParams1.z + aureoleRadiance;
     float rainLuma = dot(skyRadiance, vec3(0.2126, 0.7152, 0.0722));
     skyRadiance = mix(skyRadiance, vec3(rainLuma), rainDesat) * rainDim *
         mix(vec3(1.0), vec3(0.72, 0.78, 0.86), thunderSky);
     radiance = clamp(skyRadiance * EXPOSURE, 0.0, 8.0);
-    // 2026-10-21 雷暴频闪：同一次闪也进 LUT（ambient 光源），门控见
-    // sky_model_common.glsl。thunder=0 时该函数逐位返回 0 ⇒ 旧档不变。
     radiance += lightningFlashEnvelope() * vec3(1.6, 1.75, 2.0);
     vec3 perChannelTransmittance = exp(-(RAYLEIGH_BETA * odR +
         MIE_BETA * odM + OZONE_BETA * odO * cam.skyParams1.w));
     float luminanceT = max(dot(perChannelTransmittance, vec3(0.2126, 0.7152, 0.0722)), 1.0e-4);
-    // Normalized tint: the disk colour becomes a sunset red without changing
-    // its brightness, so the disk-luminance slider keeps full control.
     vec3 normalizedTint = min(perChannelTransmittance / luminanceT, vec3(4.0));
-    // alpha = 米氏日晕亮度占比，与 Bruneton 路径同义（rmiss 的 bit 15 消费）。
     float skyRadianceLuma = max(
         dot(skyRadiance, vec3(0.2126, 0.7152, 0.0722)), 1.0e-6);
     float aureoleLuma = dot(
@@ -625,5 +397,5 @@ void main()
         vec4(radiance, clamp(aureoleLuma / skyRadianceLuma, 0.0, 1.0)));
     imageStore(skyTransmittanceOutput, pixel,
         vec4(normalizedTint, luminanceT));
-#endif // SKY_ATM_BRUNETON
+#endif
 }

@@ -1559,7 +1559,7 @@ const bool DBG_KILL_BEHIND_DIRECT = false;   // 2026-10-28 临时判决
 // 「只有二次弹射有颜色」的观察。
 // =====================================================
 const bool DBG_SHOW_GLASSTINT = false;
-// 1 = 原始 glassTint(=payload.albedo)  2 = blockTransmission  3 = sheetTransmission
+// 1 = 原始 glassTint(=unpackAlbedoUnorm(payload.albedoPacked))  2 = blockTransmission  3 = sheetTransmission
 const uint DBG_GLASSTINT_STAGE = 1u;
 
 // 判决实验 Z：main 入口可达性探针。true 时整屏输出纯品红。
@@ -7916,7 +7916,7 @@ uint makeTraceState(uint purpose)
 // contract the sun / AO / rain queries already run -- no private hit group and,
 // deliberately, no SER arm (reordering the visibility group was measured
 // harmful: +1.99ms on rt, see the SER notes).  The Any-Hit sheet model is what
-// makes crossed stained panes FILTER the ray (payload.albedo) instead of
+// makes crossed stained panes FILTER the ray (unpackAlbedoUnorm(payload.albedoPacked)) instead of
 // stopping it, so the local-light pool behind one pane uses the same model as
 // the sunlit pool behind it.
 vec3 traceVptLocalLightVisibility(
@@ -7960,13 +7960,9 @@ vec3 traceVptLocalLightVisibility(
     }
 
     hit.hitDistance = 1.0;
-    hit.albedo = vec3(1.0);
+    hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
     hit.parallaxRayTravel = 0.0;
     hit.glassAlpha = 0.0;
-    hit.lastGlassFaceT = -1.0;
-    hit.glassFaceBudget = 0.0;
-    hit.glassInside = 0.0;
-    hit.glassEntryT = -1.0;
     hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
 
     // [12] 本地光可见性射线（traceVptLocalLightVisibility 的真实发射点）。
@@ -7992,7 +7988,7 @@ vec3 traceVptLocalLightVisibility(
         return vec3(0.0);
     }
 
-    return clamp(hit.albedo, vec3(0.0), vec3(1.0));
+    return clamp(unpackAlbedoUnorm(hit.albedoPacked), vec3(0.0), vec3(1.0));
 }
 
 uint getRayPurpose(uint state)
@@ -9032,7 +9028,7 @@ if(hitMaterialId >= 2.5)
     {
         transmittance *=
             glassSheetTransmission(
-                payload.albedo,
+                unpackAlbedoUnorm(payload.albedoPacked),
                 payload.normal,
                 currentDir
             );
@@ -13395,21 +13391,17 @@ for(
                 hit.hitDistance =
                     1.0;
 
-                hit.albedo =
-                    vec3(1.0);
+                hit.albedoPacked = packAlbedoUnorm(
+                    vec3(1.0));
 
                 hit.parallaxRayTravel =
                     0.0;
 
-                hit.lastGlassFaceT = -1.0;
-                hit.glassFaceBudget = 0.0;
-                hit.glassInside = 0.0;
-                hit.glassEntryT = -1.0;
                 hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
                 // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
                 // 见 HANDOFF-2026-10-21-VERTEX-32B-TERRAIN.md §8。否则累乘起点是
                 // 上一条射线的残留 albedo，逐帧不同 ⇒ 静止时被 DLSS-RR 当信号累积。
-                hit.albedo = vec3(1.0);
+                hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
 
 
 #ifdef RT_ENABLE_SER
@@ -13465,7 +13457,7 @@ for(
                 {
                     sampleTransmittance =
                         clamp(
-                            hit.albedo,
+                            unpackAlbedoUnorm(hit.albedoPacked),
                             vec3(0.0),
                             vec3(1.0)
                         );
@@ -13661,9 +13653,9 @@ vec3 traceGlassSceneReflectionOneRay(
     if(payload.hitDistance < 0.0)
     {
         // The common ray miss shader already returns the renderer's real
-        // sky radiance in payload.albedo.  Keep it as environment reflection.
+        // sky radiance in unpackAlbedoUnorm(payload.albedoPacked).  Keep it as environment reflection.
         reflectedSceneRadiance =
-            payload.albedo;
+            unpackAlbedoUnorm(payload.albedoPacked);
     }
     else if(getLegacyMaterialId(payload.state) <= 0.5)
     {
@@ -13677,7 +13669,7 @@ vec3 traceGlassSceneReflectionOneRay(
             payload.normal;
 
         vec3 reflectionHitAlbedo =
-            payload.albedo;
+            unpackAlbedoUnorm(payload.albedoPacked);
 
 #if GI_GLASS_DOMINANT_GUIDE
         // Route A's reflection endpoint record, read from the same payload the
@@ -14164,21 +14156,17 @@ vec3 evaluateSecondaryDiffuseLocalLights(
             hit.hitDistance =
                 1.0;
 
-            hit.albedo =
-                vec3(1.0);
+            hit.albedoPacked = packAlbedoUnorm(
+                vec3(1.0));
 
             hit.parallaxRayTravel =
                 0.0;
 
-            hit.lastGlassFaceT = -1.0;
-            hit.glassFaceBudget = 0.0;
-            hit.glassInside = 0.0;
-            hit.glassEntryT = -1.0;
             hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
             // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
             // 见 HANDOFF-2026-10-21-VERTEX-32B-TERRAIN.md §8。否则累乘起点是
             // 上一条射线的残留 albedo，逐帧不同 ⇒ 静止时被 DLSS-RR 当信号累积。
-            hit.albedo = vec3(1.0);
+            hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
 
 
 #ifdef RT_ENABLE_SER
@@ -14240,7 +14228,7 @@ vec3 evaluateSecondaryDiffuseLocalLights(
             {
                 localShadowTransmittance =
                     clamp(
-                        hit.albedo,
+                        unpackAlbedoUnorm(hit.albedoPacked),
                         vec3(0.0),
                         vec3(1.0)
                     );
@@ -14428,7 +14416,7 @@ vec3 traceTransparentLowCostGI(
     if(payload.hitDistance < 0.0)
     {
         incomingRadiance =
-            payload.albedo;
+            unpackAlbedoUnorm(payload.albedoPacked);
     }
     else
     {
@@ -14451,7 +14439,7 @@ vec3 traceTransparentLowCostGI(
         {
             incomingRadiance =
                 payload.emission +
-                payload.albedo *
+                unpackAlbedoUnorm(payload.albedoPacked) *
                 ambientRadiance;
         }
         else
@@ -14460,7 +14448,7 @@ vec3 traceTransparentLowCostGI(
             // conservative here; recursive transparent GI is deferred
             // to the later multi-layer stage.
             incomingRadiance =
-                payload.albedo *
+                unpackAlbedoUnorm(payload.albedoPacked) *
                 ambientRadiance;
         }
     }
@@ -15657,7 +15645,7 @@ vec3 tracePrimarySimpleGlassRadiance(
 
     if(payload.hitDistance < 0.0)
     {
-        return blockTransmission * payload.albedo;
+        return blockTransmission * unpackAlbedoUnorm(payload.albedoPacked);
     }
 
     vec3 hitPos =
@@ -15719,7 +15707,7 @@ vec3 tracePrimarySimpleGlassRadiance(
     }
 
     vec3 hitNormal = payload.normal;
-    vec3 hitAlbedo = payload.albedo;
+    vec3 hitAlbedo = unpackAlbedoUnorm(payload.albedoPacked);
     transmissionInfo.receiverWorldPos = hitPos;
     transmissionInfo.receiverNormal = hitNormal;
     transmissionInfo.receiverViewDirection = -straightDirection;
@@ -16073,8 +16061,6 @@ vec3 tracePrimaryGenericTransparentRadiance(
 
         if(chainGeomExitDistance > chainStartDistance + 0.02)
         {
-            hit.glassInside = 1.0;
-            hit.glassEntryT = 0.0;
         }
     }
 #else
@@ -16139,11 +16125,11 @@ vec3 tracePrimaryGenericTransparentRadiance(
     // 必须在这里取走：下面 evaluateDirectSunLighting / RIS 都会复用同一个 payload。
     // 第一片玻璃不在这里（由 main 的 glassTransmission 负责），所以只含 2..N 片。
     vec3 paneChainTransmittance =
-        clamp(hit.transmittanceAccum, vec3(0.0), vec3(1.0));
+        clamp(vec3(1.0), vec3(0.0), vec3(1.0));
     // 2026-10-26：链内各层自己的 alpha blend 贡献（见 hit_payload.glsl）。
     // 与上面同一处取走 —— 后面任何 traceRay 都会覆盖 payload。
     vec3 paneChainSurfaceWeight =
-        max(hit.glassSurfaceWeightAccum, vec3(0.0));
+        max(vec3(0.0), vec3(0.0));
 #else
     vec3 paneChainTransmittance = vec3(1.0);
     vec3 paneChainSurfaceWeight = vec3(0.0);
@@ -16154,7 +16140,7 @@ vec3 tracePrimaryGenericTransparentRadiance(
     {
         // Dedicated -4 miss path returns real sky radiance.
         behindRadiance =
-            payload.albedo;
+            unpackAlbedoUnorm(payload.albedoPacked);
         behindReachedSky = true;
     }
     else
@@ -16208,7 +16194,7 @@ vec3 tracePrimaryGenericTransparentRadiance(
 
 
         vec3 hitAlbedo =
-            payload.albedo;
+            unpackAlbedoUnorm(payload.albedoPacked);
 
 
         float hitMaterialId =
@@ -16290,7 +16276,7 @@ vptTransparentSurfaceNormal =
 #define GLASS_ALPHA_BLEND_MAX_ALPHA 0.3
 #endif
 // 2026-10-27：判据必须用**钳制后**的 alpha，与两个 rahit 的 chainAlpha 同口径。
-//   payload.glassBlendAlpha 是贴图原始值，边框 texel 为 1.0；而侧面掠射时
+//   0.0 是贴图原始值，边框 texel 为 1.0；而侧面掠射时
 //   边框铺满整个投影 ⇒ 整个侧面都被判成"不透明表面"走完整着色 ⇒ 侧面实。
 //   钳制后（<= MAX_ALPHA < 254/255）任何玻璃面都不会再走这条分支。
 #ifndef GLASS_BEHIND_MIN_RADIANCE
@@ -17430,7 +17416,7 @@ const float WATER_EXTINCTION_DISTANCE =
 
         if(payload.hitDistance < 0.0)
         {
-            return throughput * payload.albedo * 1.8 * lodWeight;
+            return throughput * unpackAlbedoUnorm(payload.albedoPacked) * 1.8 * lodWeight;
         }
 
         float hitDistance = payload.hitDistance;
@@ -17460,7 +17446,7 @@ float scatterAmount = 0.0;
         if(hitMaterialId <= 0.5)
         {
             vec3 hitNormal = payload.normal;
-            vec3 hitAlbedo = payload.albedo;
+            vec3 hitAlbedo = unpackAlbedoUnorm(payload.albedoPacked);
             vec3 incomingRadiance = evaluateOpaqueSurfaceRadiance(
                 hitPos,
                 hitNormal,
@@ -17495,7 +17481,7 @@ float scatterAmount = 0.0;
             if(hitMaterialId < 3.5)
             {
                 throughput *= glassSheetTransmission(
-                    payload.albedo,
+                    unpackAlbedoUnorm(payload.albedoPacked),
                     payload.normal,
                     currentDirection
                 );
@@ -17647,13 +17633,13 @@ vec3 tracePrimaryWaterReceiverIndirect(
 
         if(payload.hitDistance < 0.0)
         {
-            return pathThroughput * payload.albedo * 1.8 * lodWeight;
+            return pathThroughput * unpackAlbedoUnorm(payload.albedoPacked) * 1.8 * lodWeight;
         }
 
         float hitDistance = payload.hitDistance;
         vec3 hitPos = currentOrigin + currentDirection * hitDistance;
         vec3 hitNormal = payload.normal;
-        vec3 hitAlbedo = payload.albedo;
+        vec3 hitAlbedo = unpackAlbedoUnorm(payload.albedoPacked);
         vec3 hitEmission = payload.emission;
         float hitMaterialId = getLegacyMaterialId(payload.state);
         float hitRoughness = max(payload.roughness, 0.05);
@@ -18017,7 +18003,7 @@ const vec3 WATER_SCATTER_COLOR = waterScatterColor();
         // =============================================
         // Miss
         //
-        // miss shader 的 payload.albedo 在这里代表天空结果，
+        // miss shader 的 unpackAlbedoUnorm(payload.albedoPacked) 在这里代表天空结果，
         // 这种情况下它才是 Radiance，可以直接使用。
         // =============================================
 if(payload.hitDistance < 0.0)
@@ -18084,7 +18070,7 @@ if(payload.hitDistance < 0.0)
             transmissionInfo.receiverWorldPos = fallbackHitPos;
             transmissionInfo.receiverNormal = fallbackHitNormal;
             transmissionInfo.receiverViewDirection = -waterEntryDirection;
-            transmissionInfo.receiverAlbedo = payload.albedo;
+            transmissionInfo.receiverAlbedo = unpackAlbedoUnorm(payload.albedoPacked);
             transmissionInfo.receiverRoughness = payload.roughness;
             transmissionInfo.receiverF0Metal = payload.f0Metal;
             transmissionInfo.reachedUnderwaterReceiver = 1.0;
@@ -18101,7 +18087,7 @@ if(payload.hitDistance < 0.0)
                         fallbackHitPos, waterEntryDirection),
                     fallbackHitPos,
                     fallbackHitNormal,
-                    payload.albedo,
+                    unpackAlbedoUnorm(payload.albedoPacked),
                     0x57424F54u
                     );
 
@@ -18110,14 +18096,14 @@ if(payload.hitDistance < 0.0)
                     fallbackHitPos,
                     fallbackHitNormal,
                     -waterEntryDirection,
-                    payload.albedo,
+                    unpackAlbedoUnorm(payload.albedoPacked),
                     payload.roughness,
                     payload.f0Metal,
                     payload.emission +
                         evaluateVLIEmitterRadianceAtHit(
                             fallbackHitPos,
                             fallbackHitNormal,
-                            payload.albedo
+                            unpackAlbedoUnorm(payload.albedoPacked)
                         ),
                     payload.pomSelfShadow,
                     sunDirection
@@ -18137,7 +18123,7 @@ if(payload.hitDistance < 0.0)
 return
     accumulatedWaterScattering +
     throughput *
-    payload.albedo;
+    unpackAlbedoUnorm(payload.albedoPacked);
 }
 
 
@@ -18158,7 +18144,7 @@ return
 
 
         vec3 hitAlbedo =
-            payload.albedo;
+            unpackAlbedoUnorm(payload.albedoPacked);
 
 
         float hitMaterialId =
@@ -18925,7 +18911,7 @@ for(
     return
         accumulatedRadiance +
         throughput *
-        payload.albedo;
+        unpackAlbedoUnorm(payload.albedoPacked);
 }
 
 
@@ -18942,7 +18928,7 @@ for(
 
 
         vec3 hitAlbedo =
-            payload.albedo;
+            unpackAlbedoUnorm(payload.albedoPacked);
 
 
         float hitMaterialId =
@@ -20647,14 +20633,14 @@ vec2 inUV =
         // 不透明/水体/玻璃/实体/粒子实例保留 FACING_CULL_DISABLE，不受影响。
 
         // 2026-10-21「静止时玻璃上慢慢积累彩色噪点」修复：
-        // Any-Hit 用 `payload.albedo *= 透射色` 累积玻璃染色（见 rt_test.rahit 的
+        // Any-Hit 用 `unpackAlbedoUnorm(payload.albedoPacked) *= 透射色` 累积玻璃染色（见 rt_test.rahit 的
         // "T1/T9/T3 colored visibility through glass" 段），这个累乘的初值**必须是
         // 1.0**。主射线此前只播种 state ⇒ 累乘起点是**上一条射线**留在 payload 里的
         // albedo（反射 / AO / GI 的命中色），而每个像素每帧跑的射线条数还随 RR 的
         // 采样变化 ⇒ 玻璃透射色逐帧不同；静止时 DLSS-RR 把它当信号累积，于是
         // 无色玻璃出白色噪点、染色玻璃出彩色噪点，相机一移动历史被拒就干净。
         // 玻璃可见性射线早就在 6410 这样播种，主射线是漏掉的那一处。
-        hit.albedo = vec3(1.0);
+        hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
 hit.state = makeTraceState(RT_PURPOSE_PRIMARY_SKY);
 
 #ifdef RT_ENABLE_SER
@@ -20706,9 +20692,9 @@ float primaryHitDistance =
 // 补好了，见 rt_test.rchit 里那段说明 —— rgen **不要**再补一次。
 vec3 primaryHitWorldOffset =
     vec3(
-        payload.prevOffsetX,
-        payload.prevOffsetY,
-        payload.prevOffsetZ
+        0.0,
+        0.0,
+        0.0
     );
 
 // 2026-10-24：主射线是否命中了粒子。必须与 hitDistance/prevOffset **同一时刻**
@@ -20950,7 +20936,7 @@ float primaryGlassAlpha =
 // alpha blend 的源 alpha（texture x vertex），与覆盖率字段分离。
 float primaryGlassBlendAlpha =
     clamp(
-        payload.glassBlendAlpha,
+        0.0,
         0.0,
         1.0
     );
@@ -21100,7 +21086,7 @@ if(
 )
 {
     vec3 guideAlbedo =
-        payload.albedo;
+        unpackAlbedoUnorm(payload.albedoPacked);
 
     vec3 guideNormal =
         normalize(
@@ -21476,14 +21462,14 @@ if (primaryHitDistance < 0.0) {
 #endif
 
     sampleColor =
-        payload.albedo;
+        unpackAlbedoUnorm(payload.albedoPacked);
 
 } else {
     vec3 hitPos =
         origin.xyz +
         worldDir.xyz *
         primaryHitDistance;
-            vec3 albedo = payload.albedo;
+            vec3 albedo = unpackAlbedoUnorm(payload.albedoPacked);
             vec3 normal = payload.normal;
             float matId = getLegacyMaterialId(payload.state);
 
@@ -22807,7 +22793,7 @@ vec3 brdfWeight =
 //
 // 判断依据不是"哪个看起来更物理"，而是**看循环里真实的数据流**：
 // 本文件每一处 GI 贡献的形态都是 `currentThroughput × 辐射度`，例如未命中那一支
-//     indirectLight += currentThroughput * hit.albedo * 0.6;
+//     indirectLight += currentThroughput * unpackAlbedoUnorm(hit.albedoPacked) * 0.6;
 // 也就是说 brdfWeight 承载的是**全部估计量权重**（材质 BSDF × cos/pdf × 提议混合
 // 权重），而真正"物理"的是它右边那个被乘的量。
 // ⇒ indirectLight / brdfWeight 就是一个**物理辐射度 R**（该顶点沿首个采样方向来的
@@ -22929,7 +22915,7 @@ bool farShadowActive =
 // T1/T9/T3 COMBINED - colored transparent sun shadows
 //
 // Visibility rays start with white transmittance.
-// Any-Hit multiplies glass color into hit.albedo and ignores
+// Any-Hit multiplies glass color into unpackAlbedoUnorm(hit.albedoPacked) and ignores
 // that glass intersection. Opaque geometry still terminates the ray.
 // =====================================================
 
@@ -22987,8 +22973,8 @@ for (int si = 0;
     hit.hitDistance =
         1.0;
 
-    hit.albedo =
-        vec3(1.0);
+    hit.albedoPacked = packAlbedoUnorm(
+        vec3(1.0));
 
     hit.parallaxRayTravel =
         0.0;
@@ -22996,10 +22982,6 @@ for (int si = 0;
     hit.glassAlpha =
         0.0;
 
-    hit.lastGlassFaceT = -1.0;
-    hit.glassFaceBudget = 0.0;
-    hit.glassInside = 0.0;
-    hit.glassEntryT = -1.0;
     hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
     // [13] 太阳软影射线：循环体每根计一次（SER / 非 SER 两条分支共用同一口径，
     // 所以放在分支之前，而不是各自的 trace 调用旁）。
@@ -23007,7 +22989,7 @@ for (int si = 0;
     // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
     // 见 HANDOFF-2026-10-21-VERTEX-32B-TERRAIN.md §8。否则累乘起点是
     // 上一条射线的残留 albedo，逐帧不同 ⇒ 静止时被 DLSS-RR 当信号累积。
-    hit.albedo = vec3(1.0);
+    hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
 
 
 #ifdef RT_ENABLE_SER
@@ -23053,7 +23035,7 @@ for (int si = 0;
     {
         shadowTransmittance +=
             clamp(
-                hit.albedo,
+                unpackAlbedoUnorm(hit.albedoPacked),
                 vec3(0.0),
                 vec3(1.0)
             );
@@ -23145,8 +23127,8 @@ if(
     hit.hitDistance =
         1.0;
 
-    hit.albedo =
-        vec3(1.0);
+    hit.albedoPacked = packAlbedoUnorm(
+        vec3(1.0));
 
     hit.parallaxRayTravel =
         0.0;
@@ -23154,16 +23136,12 @@ if(
     hit.glassAlpha =
         0.0;
 
-    hit.lastGlassFaceT = -1.0;
-    hit.glassFaceBudget = 0.0;
-    hit.glassInside = 0.0;
-    hit.glassEntryT = -1.0;
     hit.state =
         makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
     // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
     // 见 HANDOFF-2026-10-21-VERTEX-32B-TERRAIN.md §8。否则累乘起点是
     // 上一条射线的残留 albedo，逐帧不同 ⇒ 静止时被 DLSS-RR 当信号累积。
-    hit.albedo = vec3(1.0);
+    hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
 
 #ifdef RT_ENABLE_SER
     // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
@@ -23258,8 +23236,8 @@ if(
             hit.hitDistance =
                 1.0;
 
-            hit.albedo =
-                vec3(1.0);
+            hit.albedoPacked = packAlbedoUnorm(
+                vec3(1.0));
 
             hit.parallaxRayTravel =
                 0.0;
@@ -23267,16 +23245,12 @@ if(
             hit.glassAlpha =
                 0.0;
 
-            hit.lastGlassFaceT = -1.0;
-            hit.glassFaceBudget = 0.0;
-            hit.glassInside = 0.0;
-            hit.glassEntryT = -1.0;
             hit.state =
                 makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
             // 2026-10-23：可见性射线必须从 albedo = vec3(1.0) 起算 ——
             // 见 HANDOFF-2026-10-21-VERTEX-32B-TERRAIN.md §8。否则累乘起点是
             // 上一条射线的残留 albedo，逐帧不同 ⇒ 静止时被 DLSS-RR 当信号累积。
-            hit.albedo = vec3(1.0);
+            hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
 
 #ifdef RT_ENABLE_SER
             if(cam.perfSerAb.y != 0u)
@@ -23882,7 +23856,7 @@ if(matId > 0.2 && matId < 0.45)
         {
             directLight +=
                 albedo *
-                hit.albedo *
+                unpackAlbedoUnorm(hit.albedoPacked) *
                 GI_FOLIAGE_SSS_SKY_STRENGTH;
         }
     }
@@ -24872,9 +24846,9 @@ if (payload.hitDistance < 0.0) {
 #if SHARC_UPDATE
     // 参考 Pathtracer.hlsl:470-483：未命中 ⇒ 把天空辐射度交给 SharcUpdateMiss，
     // 由它按每个**已记录顶点**的 sampleWeights 回填（这就是"到该顶点的入射辐射度"
-    // 的来源）。天空值用本工程 miss 支自己那一份（payload.albedo * 0.6），
+    // 的来源）。天空值用本工程 miss 支自己那一份（unpackAlbedoUnorm(payload.albedoPacked) * 0.6），
     // 与紧接着的累加完全同一个量。
-    vec3 sharcMissRadiance = payload.albedo * 0.6;
+    vec3 sharcMissRadiance = unpackAlbedoUnorm(payload.albedoPacked) * 0.6;
     if(sharcState.pathLength > 0)
     {
         sharcMissRadiance = sharcClampUpdateRadiance(
@@ -24886,7 +24860,7 @@ if (payload.hitDistance < 0.0) {
 #endif
     indirectLight +=
         currentThroughput *
-        payload.albedo *
+        unpackAlbedoUnorm(payload.albedoPacked) *
         0.6;
     break;
 } else {
@@ -24901,7 +24875,7 @@ vec3 nextNormal =
     );
 
 vec3 nextAlbedo =
-    payload.albedo;
+    unpackAlbedoUnorm(payload.albedoPacked);
 
 vec3 nextEmission =
     payload.emission;
@@ -25234,7 +25208,7 @@ if(nextMaterialId >= 2.5)
     float paneFresnel =
         fresnelSchlickScalar(paneCosTheta, 0.04);
 
-    // transmission_color: the pure dye.  payload.albedo for a pane is already
+    // transmission_color: the pure dye.  unpackAlbedoUnorm(payload.albedoPacked) for a pane is already
     // the single-application colour (glassPaneTransmissionColor), and a profile
     // only attenuates energy -- never the dye -- so nothing else may be folded
     // in here.
@@ -27194,7 +27168,7 @@ if (cam.dhFarFieldParams.x > 0.5
             //            ⚠ sunRadiance 里**没有**阴影透过率 —— 远场不投地形阴影，
             //              理由与实测证据写在下面那条注释里（死黑硬阴影）。
             //   间接   = 1 条余弦 GI 射线，与 GI 循环同一套约定：
-            //            miss ⇒ payload.albedo（rmiss 写的物理天空）× 0.6
+            //            miss ⇒ unpackAlbedoUnorm(payload.albedoPacked)（rmiss 写的物理天空）× 0.6
             //            命中 ⇒ payload.emission + evaluateDirectSunLighting(...)
             //            （逐字对照 17490 的 miss 项与 17933 的 bounceDirect）
             //            ← 这一项是低太阳下远场的**主要亮度来源**，也是"远场不再
@@ -27331,8 +27305,8 @@ if (cam.dhFarFieldParams.x > 0.5
 
                     if (payload.hitDistance < 0.0) {
                         // 与 GI 循环的 miss 项逐字一致（17490）：rmiss 已经把
-                        // 物理天空（含云、日轮）写进 payload.albedo。
-                        dhFarGi = dhFarAlbedo * payload.albedo * 0.6;
+                        // 物理天空（含云、日轮）写进 unpackAlbedoUnorm(payload.albedoPacked)。
+                        dhFarGi = dhFarAlbedo * unpackAlbedoUnorm(payload.albedoPacked) * 0.6;
                     } else {
                         vec3 dhFarGiPos =
                             dhFarGiOrigin + dhFarGiDir * payload.hitDistance;
@@ -27344,7 +27318,7 @@ if (cam.dhFarFieldParams.x > 0.5
                                 dhFarGiPos,
                                 dhFarGiNormal,
                                 -dhFarGiDir,
-                                payload.albedo,
+                                unpackAlbedoUnorm(payload.albedoPacked),
                                 max(payload.roughness, 0.05),
                                 payload.f0Metal,
                                 clamp(payload.pomSelfShadow, 0.0, 1.0),

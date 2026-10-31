@@ -1,29 +1,18 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-// ===========================================================================
-// 体积云 v4 噪声烘焙（evroon/bevy-volumetric-clouds, MIT 的 init 入口）
-//
-// 参考是同一个 compute shader 里的 `init` 入口，跑一次把两组噪声写进纹理：
-//   · 2D 图集（R 底色 / G 覆盖率阈值 / B 高度因子）  → 1024²
-//   · 32³ worley（三级叠加）                          → 细节侵蚀
-// 这里拆成 push constant 的两种模式，启动时各派发一次，之后只读。
-// ===========================================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(rgba16f, set = 0, binding = 0) uniform writeonly image2D atlasImage;
 layout(rgba16f, set = 0, binding = 1) uniform writeonly image3D worleyImage;
-// 3D base 体积（替代 2D 图集；与预览端的 baseVolume 同一生成器）
 layout(rgba16f, set = 0, binding = 2) uniform writeonly image3D baseVolume;
-// 3D Perlin-Worley 基础形状体
 layout(rgba16f, set = 0, binding = 3) uniform writeonly image3D shapeVolume;
 
 layout(push_constant) uniform BakePush
 {
-    vec4 params;   // x = mode(0=atlas, 1=worley), y = 图集边长, z = worley 边长
+    vec4 params;
 } pc;
-
 #include "cloud_bevy_core.glsl"
 
 void main()
@@ -32,7 +21,6 @@ void main()
 
     if(int(pc.params.x + 0.5) == 3)
     {
- // 2026-10-18：密度模型的 base 体积（r=Perlin-Worley，g/b/a=worley 三级）
         ivec3 ssize = imageSize(shapeVolume);
         if(any(greaterThanEqual(id, ssize))) return;
         imageStore(shapeVolume, id, bevyShapeVolume((vec3(id) + vec3(0.5)) / vec3(ssize)));
@@ -41,10 +29,6 @@ void main()
 
     if(int(pc.params.x + 0.5) == 2)
     {
-        // 2026-10-18：mode 2 改为烘 **Perlin-Worley**（原 bevyRenderBase3D 的 voronoi）。
-        // 原因：binding 1（cloudShapeNoise）是**共享**的 —— high_cloud_field / tyndall_cloud_field
-        // 也在读它，替换全局纹理会把平面云和云影一起换掉（画面：天空全黑）。
- // 改用 v4 专用的 binding 9（baseTex）承载 base，互不影响。
         ivec3 bsize = imageSize(baseVolume);
         if(any(greaterThanEqual(id, bsize))) return;
         imageStore(baseVolume, id, bevyShapeVolume((vec3(id) + vec3(0.5)) / vec3(bsize)));
@@ -55,10 +39,6 @@ void main()
     {
         ivec2 size = imageSize(atlasImage);
         if(any(greaterThanEqual(id.xy, size))) return;
-        // 参考对图集用 frag_coord + 0.5 采样（等价于 texel 中心），
-        // 但 bevyRenderAtlas() 收的是**归一化 uv**（参考在函数内部做 frag_coord/resolution）。
-        // 2026-10-18 修：原来这里直接传纹素坐标（0..1024），等于把噪声按 1024 倍频求值，
-        // 烤出来是噪声而不是云图 —— 游戏里那张图集和预览根本不是一回事。
         vec2 coord = (vec2(id.xy) + vec2(0.5)) / vec2(size);
         imageStore(atlasImage, id.xy, bevyRenderAtlas(coord));
     }
@@ -66,8 +46,6 @@ void main()
     {
         ivec3 size = imageSize(worleyImage);
         if(any(greaterThanEqual(id, size))) return;
-        // worley：coord = (x,y,z)/边长（参考 init 里就是 xyz / WORLEY_RESOLUTION）；
-        // 同样修掉漏除：原来的 vec3(id) 会把 16 格的 voronoi 变成逐体素的随机噪声。
         vec3 coord = (vec3(id) + vec3(0.5)) / vec3(size);
         imageStore(worleyImage, id, bevyRenderWorley(coord));
     }

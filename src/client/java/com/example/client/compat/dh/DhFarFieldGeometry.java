@@ -41,126 +41,30 @@ import java.util.Locale;
 final class DhFarFieldGeometry {
     private static final String TAG = "[DH-MAT]";
 
-    /**
-     * 与 C++ {@code Java_com_example_vulkan_NativeVulkan_updateDhFarField} 约定的载荷长度。
-     *
-     * <p>布局：{@code [0..15]} DH 逆 MVP、{@code [16..19]} mode/strength/gain/variant、
-     * {@code [20..21]} near/far（格）、{@code [22..23]} 保留、{@code [24..39]} DH 的
-     * <b>正向</b> MVM（方向采样用，mode 13）。</p>
-     *
-     * <p>C++ 侧对 {@code [24..39]} 是<b>可选</b>的：只收 24 个 float 的旧宿主会让
-     * 正向矩阵保持全零，rgen 靠 {@code m00 == 0} 自证无效并退回屏幕直通 —— 两侧
-     * 版本不匹配时是降级，不是崩。</p>
-     */
+    
+
     private static final int PAYLOAD_LENGTH = 40;
 
     private static final float[] PAYLOAD = new float[PAYLOAD_LENGTH];
 
-    /**
-     * {@link DhApiMat4f#putValuesInArray(float[])} 要求长度严格 16，所以先落到这个
-     * 中间数组，检查完整性之后再拷进载荷。
-     */
+    
+
     private static final float[] MATRIX_SCRATCH = new float[16];
 
-    /**
-     * 远场阶段模式，来自 {@code -Dorion.dh.farLight.mode}：
-     * <ul>
-     *   <li><b>-1 —— 总开关关闭</b>：整个合成块一次都不执行，远场像素保持我们自己的
-     *       颜色。回答"画面里某个现象是不是 DH 合成引入的"的<b>唯一干净判据</b>：
-     *       关掉它现象消失 = 我们涂的；还在 = DH 自己画的或与 DH 无关</li>
-     *   <li>0 —— 回到 stage-1 的 DH 直通（不做任何重打光）</li>
-     *   <li>1 —— 误差图（红=矩阵重建落不上主射线，绿=落上了）：矩阵可信度的定量读数</li>
-     *   <li>2 —— 显示重建出来的法线（N*0.5+0.5）：看一眼就知道法线是不是连贯的坡面</li>
-     *   <li>3 —— 用我们的太阳/天空重打光</li>
-     *   <li>4 —— 重打光之后再叠我们的晴空大气透视（<b>默认</b>，理由见下）</li>
-     *   <li>5 —— 距离来源图：蓝=解析 reverse-Z（<b>首选</b>）、红=逆 MVP、
-     *       绿=z 取镜像、黄=长度兜底</li>
-     *   <li>6 —— 距离灰度（distance/far）：深度语义搞反的话地形会压成一片</li>
-     *   <li>7 —— <b>四联诊断</b>：屏幕按 x 四等分，从左到右依次是 1 / 2 / 5 / 6
-     *       ⇒ 一局就能同时读出"矩阵可信度 / 法线是否连贯 / 距离来自哪一级 / 深度语义"</li>
-     *   <li>9 —— <b>左右分屏对照</b>：左半 = 0（DH 原图直通，我们一点不碰）、
-     *       右半 = 4（默认档）。用来一次回答"某个现象是我们引入的，还是 DH 自己的"</li>
-     *   <li>10 —— <b>覆盖掩码</b>：白 = 我们用 DH 内容接管；<b>品红 = 接管了但重建点
-     *       在云层高度（&gt;480 格）</b> ⇒ 我们在往天空/云里涂；<b>红 = DH 在这个像素
-     *       没有几何</b>（即 DH 挖的那个洞本身，含 overdrawPrevention 近裁剪与
-     *       "高度覆盖"圆洞）。其余像素压暗 25% 作参照底</li>
-     *   <li>11 —— <b>光照诊断</b>：R = NdotL（平地不该明显超过太阳高度角）、
-     *       G = 光照因子（应与近场同量级）、B = 云透过率</li>
-     *   <li>12 —— <b>DH 原图直通 + 我们的晴空大气透视（当前默认）</b>。
-     *       不重打光：远场拿不到 GI（它不在 TLAS 里），硬重打光会在黄昏把远场
-     *       压成极暗绿（实测 (11,13,8)），就是用户报的"一大坨黑影"。详见 rgen
-     *       里 mode 12 分支的注释。</li>
-     *   <li>13 —— <b>方向采样</b>（09-24 新增，治"远场整体缩小 / 与几何重叠错位"）。
-     *       与 12 唯一的差别是"DH 图怎么采样"：12 按<b>屏幕 UV 1:1 直通</b>（隐含
-     *       假设"DH 用的就是我们这台相机"），13 把本像素的<b>主射线方向</b>穿 DH
-     *       自己的投影矩阵（{@code dhMvmProjectionMatrix}，w=0）再取纹素。
-     *       实测两相机夹角 55~77° ⇒ 直通必然错尺度，13 对该差异免疫。
-     *       矩阵缺失时自动退回直通（rgen 靠 {@code m00 == 0} 自证）。
-     *       ⚠ 若 13 下远场大面积缺失，说明 DH 的视锥比我们的窄很多（那些方向在
-     *       DH 图外）—— 那是"DH 只渲染了它自己那圈"的真实边界，不是 bug。</li>
-     * </ul>
-     *
-     * <p><b>默认值的变迁（09-23 第五次定案）</b>：4 → 12。4 档（重打光 + 大气）
-     * 建立在"远场能和近场用同一条光照模型"这个前提上，但实测证明**这个前提不成立**：
-     * 近场 litColor 里最大的项之一是 {@code indirectLight * 1.8 * rtaoFactor}（GI），
-     * 而远场不在 TLAS 里 ⇒ 拿不到 GI，只剩直射近似 + 环境底。黄昏太阳低、直射弱时
-     * 这个缺口被放大到肉眼级别。要让远场和近场真正同源，必须走 C 阶段（远场代理几何
-     * 入 TLAS），在那之前把默认退回"直通"更安全。</p>
-     *
-     * <p>⭐⭐ <b>默认值的变迁（09-24 第六次定案）：12 → -1。</b>
-     * 上面那句"必须走 C 阶段"已经落地：{@link DhFlags#LOD_MESH} 于同日转正为默认开，
-     * 远场几何现在真的在 TLAS 里、真的参与 GI / 阴影 / 反射。于是本开关（以及它背后
-     * rgen 里约 4300 行的远场特例：反投影、near/far 解析式、三步回退、镜像点、邻居
-     * 法线重建）已经<b>没有存在必要</b> —— 留着只会让两套远场互相叠加、各自半对。</p>
-     *
-     * <p>本档现在只剩一个职责：<b>回退开关</b>。要退回"采样 DH 成品图"的旧形态，
-     * 传 {@code -Dorion.dh.farLight.mode=12}（或 13）即可，<b>不用重编 DLL 与 spv</b>。
-     * 代码路径全部保留、只是不再默认走它；等实机确认统一路径无误之后再删。</p>
-     * <p>（以上是 09-24 的历史；09-25 的方案 c 又把它接回来了，见下面这段。）</p>
-     */
-    /**
-     * 远场合成模式。<b>当前默认 -1（关）</b>：09-25 首次打开方案 c（mode 13 + 发布纹理 +
-     * 矩阵）时<b>进世界崩溃</b> —— {@code rtx_backend.dll} 抛出未捕获 C++ 异常
-     * （{@code recordFrameCommand} 处冒出），同一时刻 DH 的纹理还是"回落图集"
-     * （真句柄没到）⇒ 描述符/采样在句柄未就绪时就跑了。修好发布时序之前不要默认开。</p>
-     *
-     * <ul>
-     *   <li>{@code -1}（默认）＝合成块不执行，远场保持我们自己的颜色（我们的几何照旧可见）；</li>
-     *   <li>{@code 13} ＝ <b>方向采样</b>：主射线方向穿 DH 投影取 UV（对 FOV/朝向免疫）；</li>
-     *   <li>{@code 12} ＝ 屏幕 UV 直通（要求两台相机角尺度一致，历史用法）。</li>
-     * </ul>
-     *
-     * <p>⚠ 打开它必须同时满足：DH 在渲染（{@code disableRendering=false}）、
-     * {@code publishTextures=true} 且 {@code [DH TEX]} 显示真句柄（不是"回落图集"）、
-     * {@code matrices=true}。C++ 侧还会据此把 DH 远场实例的 mask 改成 0xfe（相机不可见），
-     * 所以 mode=-1 时几何照旧可见、绝不会出现"远场空白"。</p>
-     */
+    
+
+    
+
     static final int MODE = (int) number("orion.dh.farLight.mode", -1.0f);
 
-    /**
-     * 重打光强度。0 = DH 原图直通（stage-1 那套），1 = 完全用我们的光点灯。
-     *
-     * <p><b>默认 1.0（09-23 第三次定案）</b>。旧默认 0.65 是为了"别把 DH 烘焙进去的
-     * 明暗二次计一次"——那个顾虑属于**旧的相对调制**实现（把我们的光当成乘在 DH 已受光
-     * 颜色上的比值）。现在 rgen 把 DH 的图当 <b>albedo</b>、再用与近场**同一条**光照模型
-     * 重新点灯（直射用 {@code getTimeDrivenSkyLightRadianceScale()} 的绝对尺度 + 环境底
-     * 用近场同一个函数），所以：
-     * <ul>
-     *   <li>不存在二次计光：DH 的烘焙光照被**替换**掉，而不是叠上去；</li>
-     *   <li>0.65 反而有害：它会把 DH 那张"日间亮度"的烘焙色混回 35%，夜里比我们的
-     *       近场亮出一大截，交接处（我们数据的边缘）就会出现那条明显圆弧。</li>
-     * </ul>
-     * 只在"想刻意保留 DH 原图观感"时才往下调。</p>
-     */
+    
+
     static final float STRENGTH = number("orion.dh.farLight.strength", 1.0f);
 
-    /** 重打光后整体亮度增益。两侧都偏暗/偏亮时先动它，而不是动 strength。 */
     static final float GAIN = number("orion.dh.farLight.gain", 1.0f);
 
-    /**
-     * 矩阵变体：0 = 自动（默认），1..4 = 强制第 N 个变体。
-     * 只有自动选择明显失效时才需要动它。
-     */
+    
+
     static final float VARIANT = number("orion.dh.farLight.variant", 0.0f);
 
     private static int pushes;
@@ -169,18 +73,12 @@ final class DhFarFieldGeometry {
     private static boolean configLogged;
     private static float lastLoggedNear = Float.NaN;
     private static int nearLogCount;
-    /** 正向 MVM（mode 13 用）的下发结果是否已经报告过（只报一次，避免刷屏）。 */
     private static boolean mvpLogged;
 
-    /**
-     * 免重编微调旋钮：{@code -Dorion.dh.farLight.nearOverride=方块值}。
-     * &gt;0 时强制用它当 near lane（诊断"DH 真实投影 near 与 RenderUtil 不一致"用）。
-     */
+    
+
     private static final float NEAR_OVERRIDE = number("orion.dh.farLight.nearOverride", 0.0f);
 
-    //=====================================================================
-    // DH RenderUtil 的反射调用（core 包不在编译类路径上，只能运行时取）
-    //=====================================================================
     private static volatile boolean renderUtilResolved;
     private static volatile java.lang.reflect.Method nearClipMethod;
     private static volatile java.lang.reflect.Method farClipMethod;
@@ -227,11 +125,9 @@ final class DhFarFieldGeometry {
             return null;
         }
 
-        // far = m23 / m22 ；near = m22 * far / (1 + m22)
         float far = m23 / m22;
         float near = m22 * far / (1.0f + m22);
 
-        // 合理性护栏：near/far 必须有限且为正、far 明显大于 near。
         if (!Float.isFinite(near) || !Float.isFinite(far)
                 || near <= 0.0f || far <= 0.0f
                 || far <= near) {
@@ -257,9 +153,6 @@ final class DhFarFieldGeometry {
         if (NEAR_OVERRIDE > 0.0f) {
             return NEAR_OVERRIDE;
         }
-        // ⭐ 反解出的 near 是 DH 渲染深度图的真实值，可能 < 1（实测 0.891 格）。
-        // 不能再套 `>= 1.0` 护栏 —— 那个护栏的本意是挡"占比 0..1 被误当方块"，
-        // 但反解值直接来自投影矩阵 m22/m23，就是真实 near/far 编码，无歧义。
         float[] clip = resolveClipFromProjection(param);
         if (clip != null && clip[0] > 0.0f) {
             return clip[0];
@@ -273,11 +166,8 @@ final class DhFarFieldGeometry {
                     return value;
                 }
             } catch (Throwable ignored) {
-                // 反射失败退到占比换算，不影响推送。
             }
         }
-        // 占比 × 视距格数（getNearClipPlaneDistanceInBlocks 的主体就是这个乘积，
-        // 差一个 FOV/aspect 修正因子，量级仍正确）。
         try {
             int renderDistance = net.minecraft.client.Minecraft.getInstance()
                     .options.renderDistance().get();
@@ -286,7 +176,6 @@ final class DhFarFieldGeometry {
                 return blocks;
             }
         } catch (Throwable ignored) {
-            // 选项不可读时放弃。
         }
         return 0.0f;
     }
@@ -306,7 +195,6 @@ final class DhFarFieldGeometry {
                     return value;
                 }
             } catch (Throwable ignored) {
-                // 反射失败退到 param 原值。
             }
         }
         return param.farClipPlane;
@@ -346,12 +234,8 @@ final class DhFarFieldGeometry {
         return true;
     }
 
-    /**
-     * 合法矩阵元素的量级上限。
-     *
-     * <p>实测正常帧 {@code v0≈-33.5 v5≈17.3 v15≈0.002}（这台相机下 DH 的逆 MVP 明显是
-     * 相对相机的、平移为 0），上限取 1e4 留了三个数量级余量。</p>
-     */
+    
+
     private static final float MAX_MATRIX_MAGNITUDE = 1.0e4f;
 
     /**
@@ -394,20 +278,8 @@ final class DhFarFieldGeometry {
         }
 
         try {
-            // =====================================================
-            // 0) 先做在线验证（只读 + 打日志，不改矩阵）
-            // =====================================================
-            // 验证明两件事：16 个 float 的填充顺序（用 dhModelViewMatrix 是刚体变换
-            // 这一结构事实判定）、以及 DH 与 MC 的视锥是否同源。结论在
-            // run/logs/latest.log 的 [DH-MAT] 段；画面侧另有 rgen 的独立自检。
             DhFarFieldSolver.inspect(param);
 
-            // =====================================================
-            // 1) 取逆矩阵。**不再经过任何改写**（09-23 第二次定案）
-            // =====================================================
-            // 上一版把解算器"补偿平移"后的矩阵推下去；那条路已废：rgen 现在把位置
-            // 锚定在自己的主射线上，矩阵只负责给一个标量距离，所以矩阵需要的只有
-            // "别是垃圾"。改写反而会让"矩阵到底对不对"更难判读。
             DhApiMat4f inverse = param.dhInverseMvmProjectionMatrix;
 
             if (inverse == null) {
@@ -417,15 +289,6 @@ final class DhFarFieldGeometry {
 
             inverse.putValuesInArray(MATRIX_SCRATCH);
 
-            // =====================================================
-            // 2) 非有限值直接丢帧（不推零，也不置无效）
-            // =====================================================
-            // DH 每帧首个回调给的矩阵实测是 NaN（rt_debug.log `v0=-nan(ind)`）。推送
-            // 侧必须挡住它：NaN 会让 rgen 的距离三级回落的比较全部为假（NaN 比较恒假），
-            // 只剩解析兜底可用 —— 那虽然不会出垃圾，但白白丢掉了最精确的那一级。
-            //
-            // ⚠ 丢帧而不是推零：推零会被 C++ 判成"换世界/卸载"⇒ 远场退回直通，
-            //    比"用上一帧的矩阵"更糟（矩阵一帧之内几乎不变）。
             boolean finite = allFinite(MATRIX_SCRATCH);
             boolean plausible = plausibleMagnitude(MATRIX_SCRATCH);
 
@@ -452,18 +315,6 @@ final class DhFarFieldGeometry {
             PAYLOAD[17] = STRENGTH;
             PAYLOAD[18] = GAIN;
             PAYLOAD[19] = VARIANT;
-            // =====================================================
-            // near/far lane —— ⭐⭐ 09-23 晚定案："微缩模型"的根因
-            // =====================================================
-            // param.nearClipPlane 实测是【视距占比】（0..1，今晚 0.891323；跨会话
-            // 同值复现 ⇒ 是配置占比，不是方块）。旧版直接下发，rgen 的解析式
-            // z = n·f/(n + d·(f−n)) 用它当方块 ⇒ 真实 200~3000 格的地形全部被压到
-            // 相机周围 6~107 格 = 用户报的"每个地图都有一个微缩模型、永远无法到达"。
-            //
-            // 正确值 = DH 自己对同一张深度缓冲线性化时用的那两个函数（javap 已核：
-            // BlazeDhSsaoRenderer 把 RenderUtil.getNearClipPlaneInBlocks() /
-            // getFarClipPlaneDistanceInBlocks() 原样作为 SSAO 的 uniform），
-            // 这里用同样的函数 ⇒ 约定逐字一致。
             final float nearBlocks = resolveNearClipBlocks(param);
             final float farBlocks = resolveFarClipBlocks(param);
             PAYLOAD[20] = nearBlocks;
@@ -471,21 +322,6 @@ final class DhFarFieldGeometry {
             PAYLOAD[22] = 0.0f;
             PAYLOAD[23] = 0.0f;
 
-            // =====================================================
-            // [24..39] 正向 MVM —— mode 13（方向采样）用
-            // =====================================================
-            // 与上面那个逆矩阵不同，这里要的是**正向**（world → DH clip）。
-            // rgen 用它变换主射线的**方向**（w = 0.0），于是平移列天然被消掉 ⇒
-            // 不需要 DH 的相机位置 —— 而那个位置根本拿不到（DH 把相机放在原点
-            // 渲染，dhModelViewMatrix 的平移实测为 0）。
-            //
-            // ⭐ 这是"远场整体缩小 / 与几何重叠错位"的正解 —— 屏幕
-            // UV 直通隐含假设"DH 用的就是我们这台相机"，实测两相机夹角 55~77°
-            // ⇒ 直通必然错尺度。方向采样换用 DH 自己的投影，对该差异免疫。
-            //
-            // 非有限值照挡：NaN 会让 clip.xy / clip.w 变 NaN、texelFetch 的坐标
-            // 未定义。挡法同样是"置零"而不是丢帧 —— 全零让 rgen 的 `m00 == 0`
-            // 判无效并退回直通（距离路径仍在，不受影响）。
             boolean mvpUsable = false;
             if (param.dhMvmProjMatrix != null) {
                 param.dhMvmProjMatrix.putValuesInArray(MATRIX_SCRATCH);
@@ -504,9 +340,6 @@ final class DhFarFieldGeometry {
                         + " m11=" + PAYLOAD[29]
                         : "⚠ 正向 MVM 不可用（非有限 / 量级荒谬）⇒ mode 13 会退回屏幕直通");
             }
-            // 换算失败（near 无效）时把 far 置 0 ⇒ rgen 的 lanesUsable 判假 ⇒
-            // 退回矩阵路径，绝不能让垃圾值溜进解析式。
-            // ⭐ near 反解值可 < 1（DH 实测 0.891 格），只要求 > 0 且 far 显著更大。
             if (!(nearBlocks > 0.0f) || !(nearBlocks < farBlocks * 0.25f)) {
                 PAYLOAD[21] = 0.0f;
             }
@@ -548,7 +381,6 @@ final class DhFarFieldGeometry {
         try {
             NativeVulkan.updateDhFarField(PAYLOAD);
         } catch (Throwable ignored) {
-            // native 没加载也无需处理：那时本来就不会有矩阵到达 C++。
         }
         pushes = 0;
         rejected = 0;

@@ -243,9 +243,6 @@ public abstract class VulkanGpuSurfaceMixin {
             }
 
 
-            // HDR-2.3: the swapchain format and colour space are only read when
-            // the swapchain is (re)built, so a mid-game toggle has to ask for a
-            // rebuild instead of waiting for the next resize.
             if (NativeVulkan.hdrSwapchainDirty) {
                 NativeVulkan.hdrSwapchainDirty = false;
 
@@ -273,15 +270,6 @@ public abstract class VulkanGpuSurfaceMixin {
             );
 
 
-            // RT 已经写进 Minecraft main target，
-            // GUI 随后也已经画在它上面。
-            // 此处必须让 Minecraft 自己正常 blit 到 swapchain。
-// RT 已经写进 Minecraft main target，
-// GUI 随后已经画在它上面。
-//
-// Minecraft mainTarget -> swapchain 的最终 blit
-// 此刻刚刚完成。
-// 因此这里正好取得带完整 GUI 的 Final snapshot。
             if (NativeVulkan.rtInjectedToMainTarget) {
 
                 if (
@@ -312,12 +300,6 @@ public abstract class VulkanGpuSurfaceMixin {
             }
 
 
-            // 2026-10-04 回退：这里曾改为复用 acquire 钩子缓存的交换链图像以省掉
-            // 四次反射读。但 acquire 与 blit 之间一旦发生交换链重建（窗口缩放 /
-            // 全屏切换 / VK_ERROR_OUT_OF_DATE 处理），缓存值就会指向已销毁的图像，
-            // RT 命令被记录到错误图像 ⇒ GPU 挂起 ⇒ 正是本项目 8 月起反复出现的
-            // 「5s timeout waiting for VK semaphore」。收益（每帧省几次反射）与风险
-            // 不对等，故恢复逐帧读取 surface 自身字段的原始实现。
             LongList images = (LongList) swapchainImagesField.get(surface);
             int index = currentImageIndexField.getInt(surface);
 
@@ -355,13 +337,6 @@ public abstract class VulkanGpuSurfaceMixin {
         }
     }
 
-    // VK_FORMAT_A2B10G10R10_UNORM_PACK32 / VK_COLOR_SPACE_HDR10_ST2084_EXT.
-    // Spelled out because the colour space lives in an extension header
-    // (VK_EXT_swapchain_colorspace) that is not worth importing for two ints.
-    // 1000104008 is the value vulkan_core.h gives HDR10_ST2084_EXT; the
-    // 1000101000 this used to hold is a structure type, not a colour space, so
-    // the candidate match never fired and HDR10 was reported unavailable on
-    // surfaces that advertised it.
     private static final int HDR10_PACK32_FORMAT = 64;
     private static final int HDR10_ST2084_COLOR_SPACE = 1000104008;
 
@@ -377,9 +352,6 @@ public abstract class VulkanGpuSurfaceMixin {
         hdrSurfaceFormatPickCount++;
 
 
-        // The surface is created before the swapchain is, so this is the last
-        // point that runs before the create info is built: native needs both
-        // the committed switch and the capability by then.
         if(NativeVulkan.isLoaded()) {
             NativeVulkan.setHDREnabledNative(
                     RTXSettingsConfig.isHDREnabled()
@@ -455,10 +427,6 @@ public abstract class VulkanGpuSurfaceMixin {
                         + available
         );
     }
-    // ============================================================
-// FG-4.1
-// Capture the real Vulkan backbuffer format
-// ============================================================
 
     @Inject(
             method = "<init>",
@@ -474,10 +442,6 @@ public abstract class VulkanGpuSurfaceMixin {
                 this.swapchainImageFormat
         );
     }
-    // ============================================================
-// FG-3
-// Streamline Vulkan Manual Hooking
-// ============================================================
 
     @Redirect(
             method = "<init>",
@@ -757,4 +721,3 @@ public abstract class VulkanGpuSurfaceMixin {
     }
 
 }
-

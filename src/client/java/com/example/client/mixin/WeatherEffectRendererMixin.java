@@ -23,11 +23,6 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  */
 @Mixin(targets = "net.minecraft.client.renderer.WeatherEffectRenderer")
 public abstract class WeatherEffectRendererMixin {
-    // The draw itself is the cheap part.  extractRenderState walks the
-    // precipitation columns around the player, probes getPrecipitationAt and
-    // rebuilds the ColumnInstance lists every frame; cancelling it leaves
-    // WeatherRenderState empty, so prepare and both submit paths below have
-    // nothing left to instance, upload or draw.
     @Inject(method = "extractRenderState", at = @At("HEAD"), cancellable = true, require = 0)
     private void rtx$skipVanillaPrecipitationExtraction(
             ClientLevel level, float partialTick, Vec3 cameraPos, WeatherRenderState state, CallbackInfo ci) {

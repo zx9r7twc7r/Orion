@@ -1,22 +1,5 @@
 #version 460
 
-// 云 à-trous 空间降噪（仅「远云脱离 RR」模式派发，见 VulkanCore.cpp 录制处）。
-//
-// 为什么需要它：云脱离 RR 后，RR 原来替云做的 9-tap 空间平均没了 —— resolve 只剩
-// 时域累积一层。实测把时域从 ≈2 帧加到 ≈10 帧（cloudParams2.w = 0.90）仍压不住
-// march 的逐帧抖动噪声，因为丢掉的那一半是空间平均，时域补不回来。
-//
-// 形状：5×5 B3-spline 核、步长 1/2/4/8 四次迭代（多尺度 à-trous，Dammertz 2008）。
-// 三个边缘权：
-//   · 深度项   —— 云距离差，挡住云与天空/远景的深度断裂；
-//   · 透射率项 —— a 差，云轮廓的主要停边依据（云没有法线可用）；
-//   · 亮度项   —— 用 3×3 局部标准差归一（SVGF 的 σ_l）：噪声大的区域自动放宽，
-//                 滤波才真的起作用；平坦区域收紧，不糊掉真实结构。
-// 上一版单趟 5×5 双边之所以"糊了但没降"，就是少了多尺度与方差引导这两件事。
-//
-// ping-pong：主机用 resolved ↔ 原始 march 图（cloudCurrent）交替。resolve 之后
-// cloudCurrent 已无读者（composite 读的是 resolved）⇒ 不需要额外分配图像；
-// 偶数次迭代后结果落回 resolved，下游 history 拷贝/composite 一行都不用改。
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -26,12 +9,11 @@ layout(rgba16f, set = 0, binding = 2) uniform writeonly image2D cloudOut;
 
 layout(push_constant) uniform AtrousPush
 {
-    int   stride;       // 本次迭代的步长（1/2/4/8）
-    float phiDepthRel;  // 深度容差 = max(32, 中心距离 × 本值)
-    float phiAlpha;     // 透射率差尺度
-    float phiLum;       // 亮度差尺度 = 局部标准差 × 本值
+    int   stride;
+    float phiDepthRel;
+    float phiAlpha;
+    float phiLum;
 } pc;
-
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
 void main()
@@ -48,7 +30,6 @@ void main()
     float centerDistance = texelFetch(cloudDepthIn, pixel, 0).r;
     float centerLuminance = dot(center.rgb, LUMA);
 
-    // 3×3 局部标准差：噪声区 σ_l 大 ⇒ 亮度项放宽，真降噪；平坦区收紧，保结构。
     float luminanceSum = 0.0;
     float luminanceSquareSum = 0.0;
     for(int y = -1; y <= 1; ++y)
@@ -76,7 +57,6 @@ void main()
         vec4 sampleCloud = texelFetch(cloudIn, samplePixel, 0);
         float sampleDistance = texelFetch(cloudDepthIn, samplePixel, 0).r;
 
-        // B3-spline 核 exp(-(x²+y²)/2)：归一化时公共系数约掉，直接这么算即可。
         float weight = exp(-float(x * x + y * y) * 0.5);
         weight *= exp(-abs(sampleDistance - centerDistance) / depthScale);
         weight *= exp(-abs(sampleCloud.a - center.a) / alphaScale);

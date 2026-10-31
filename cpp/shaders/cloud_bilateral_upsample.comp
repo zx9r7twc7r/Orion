@@ -1,40 +1,17 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-// ===========================================================================
-// 云图双边上采样 / 重建（2026-10-22）
-//
-// 补的是 UE Mode 0 三段式里"低分辨率追踪 → 全分辨率重建"的那一级。
-// 游戏端原本是：march(降采样) → resolve → à-trous ×4 → composite(全屏，双线性)。
-// composite 的双线性不看深度，云缘会跨过地形边界糊过去；这个 pass 用云自身
-// 的首个命中距离做权重，云缘不会被邻居的天空/远景拉稀。
-//
-// 算法照 jiaozi158/UnityVolumetricCloudsURP（MIT, 2024）
-// VolumetricCloudsUpscale.hlsl:16-45 的 BilateralUpscale：
-//   权重 = exp(-dist²) × 1/(colorDiff + ε)
-// 在其基础上多一项**相对深度权重**（我们的云图带首个命中距离）。
-//
-// 与预览器 viewer_upsample.comp 的差别，只有 I/O 口径：
-//   · 游戏端云深度是 **rg32f**（r = 合成后首个距离, g = 重投影用的代表距离），
-//     预览器是 r32f；
-//   · 输出是全分辨率云图，composite 之后按 1:1 取。
-// 算法本体保持同一份，免得两边观感不一致。
-// ===========================================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(set = 0, binding = 0) uniform sampler2D srcColor;   // 低分辨率云图 rgba16f
-layout(set = 0, binding = 1) uniform sampler2D srcDepth;   // 低分辨率云深度 rg32f
+layout(set = 0, binding = 0) uniform sampler2D srcColor;
+layout(set = 0, binding = 1) uniform sampler2D srcDepth;
 layout(rgba16f, set = 0, binding = 2) uniform writeonly image2D dstColor;
-
-// x = 上采样倍率（2/4），用来把空间核按放大倍数缩放
 layout(push_constant) uniform Push
 {
-    vec4 params;   // x = 倍率
+    vec4 params;
 } pc;
-
-const int KERNEL = 2;   // 5x5：放大倍数越大核相对越大，2 倍/4 倍都用它
-
+const int KERNEL = 2;
 void main()
 {
     const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -60,12 +37,9 @@ void main()
 
             const float wSpatial = exp(-float(i * i + j * j) * 0.35);
 
-            // 颜色核：RGB 散射 + A 透射率一起比（透射率跳变才是云缘的真正标志）
             const float colorDiff = length(c.rgb - center.rgb) + abs(c.a - center.a);
             const float wColor = 1.0 / (colorDiff + 1.0e-3);
 
-            // 深度核：相对深度差。云是薄壳，跨云缘的深度跳变很大。
-            // 1e30 那种"无云"距离要比相对值更稳，所以先夹到一个有限上限。
             const float zc = min(centerZ, 1.0e6);
             const float zn = min(z, 1.0e6);
             const float zDiff = abs(zn - zc) / max(zc, 1.0);

@@ -1,74 +1,11 @@
-// ===========================================================================
-// vendored from takram-design-engineering/three-geospatial (MIT):
-//   packages/atmosphere/src/shaders/bruneton/{file}
-// 上游基于 Eric Bruneton "Precomputed Atmospheric Scattering" (BSD-2)。
-// 本文件为原样入库（本移植仅做 include guard / 精度声明 / 坐标注入适配，
-// 数学与常量未动）。授权全文保留在文件头部原注释中。
-// 消费者须已声明 #extension GL_GOOGLE_include_directive : require。
-// ===========================================================================
 #ifndef BRUNETON_PRECOMPUTE
 #define BRUNETON_PRECOMPUTE
 precision highp float;
 precision highp sampler3D;
 
-// Based on: https://github.com/ebruneton/precomputed_atmospheric_scattering/blob/master/atmosphere/functions.glsl
 
-/**
- * Copyright (c) 2017 Eric Bruneton
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the copyright holders nor the names of its
- *    contributors may be used to endorse or promote products derived from
- *    this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
- * THE POSSIBILITY OF SUCH DAMAGE.
- *
- * Precomputed Atmospheric Scattering
- * Copyright (c) 2008 INRIA
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the copyright holders nor the names of its
- *    contributors may be used to endorse or promote products derived from
- *    this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
- * THE POSSIBILITY OF SUCH DAMAGE.
- */
+
+
 
 Number GetLayerDensity(const DensityProfileLayer layer, const Length altitude) {
   Number density = layer.exp_term * exp(layer.exp_scale * altitude) +
@@ -88,21 +25,14 @@ Length ComputeOpticalLengthToTopAtmosphereBoundary(
     const Length r, const Number mu) {
   assert(r >= atmosphere.bottom_radius && r <= atmosphere.top_radius);
   assert(mu >= -1.0 && mu <= 1.0);
-  // Number of intervals for the numerical integration.
   const int SAMPLE_COUNT = 500;
-  // The integration step, i.e. the length of each integration interval.
   Length dx =
       DistanceToTopAtmosphereBoundary(atmosphere, r, mu) / Number(SAMPLE_COUNT);
-  // Integration loop.
   Length result = 0.0 * m;
   for (int i = 0; i <= SAMPLE_COUNT; ++i) {
     Length d_i = Number(i) * dx;
-    // Distance between the current sample point and the planet center.
     Length r_i = sqrt(d_i * d_i + 2.0 * r * mu * d_i + r * r);
-    // Number density at the current sample point (divided by the number density
-    // at the bottom of the atmosphere, yielding a dimensionless number).
     Number y_i = GetProfileDensity(profile, r_i - atmosphere.bottom_radius);
-    // Sample weight (from the trapezoidal rule).
     Number weight_i = i == 0 || i == SAMPLE_COUNT ? 0.5 : 1.0;
     result += y_i * weight_i * dx;
   }
@@ -123,14 +53,12 @@ DimensionlessSpectrum ComputeTransmittanceToTopAtmosphereBoundary(
       atmosphere.absorption_extinction *
           ComputeOpticalLengthToTopAtmosphereBoundary(
               atmosphere, atmosphere.absorption_density, r, mu));
-  // @shotamatsuda: Added for the precomputation stage in half-float precision.
   #ifdef TRANSMITTANCE_PRECISION_LOG
   return optical_depth;
-  #else // TRANSMITTANCE_PRECISION_LOG
+  #else
   return exp(-optical_depth);
-  #endif // TRANSMITTANCE_PRECISION_LOG
+  #endif
 }
-
 Number GetUnitRangeFromTextureCoord(const Number u, const int texture_size) {
   return (u - 0.5 / Number(texture_size)) / (1.0 - 1.0 / Number(texture_size));
 }
@@ -141,15 +69,10 @@ void GetRMuFromTransmittanceTextureUv(const AtmosphereParameters atmosphere,
   assert(uv.y >= 0.0 && uv.y <= 1.0);
   Number x_mu = GetUnitRangeFromTextureCoord(uv.x, TRANSMITTANCE_TEXTURE_WIDTH);
   Number x_r = GetUnitRangeFromTextureCoord(uv.y, TRANSMITTANCE_TEXTURE_HEIGHT);
-  // Distance to top atmosphere boundary for a horizontal ray at ground level.
   Length H = sqrt(atmosphere.top_radius * atmosphere.top_radius -
       atmosphere.bottom_radius * atmosphere.bottom_radius);
-  // Distance to the horizon, from which we can compute r:
   Length rho = H * x_r;
   r = sqrt(rho * rho + atmosphere.bottom_radius * atmosphere.bottom_radius);
-  // Distance to the top atmosphere boundary for the ray (r,mu), and its minimum
-  // and maximum values over all mu - obtained for (r,1) and (r,mu_horizon) -
-  // from which we can recover mu:
   Length d_min = atmosphere.top_radius - r;
   Length d_max = rho + H;
   Length d = d_min + x_mu * (d_max - d_min);
@@ -208,23 +131,18 @@ void ComputeSingleScattering(
   assert(mu_s >= -1.0 && mu_s <= 1.0);
   assert(nu >= -1.0 && nu <= 1.0);
 
-  // Number of intervals for the numerical integration.
   const int SAMPLE_COUNT = 50;
-  // The integration step, i.e. the length of each integration interval.
   Length dx =
       DistanceToNearestAtmosphereBoundary(atmosphere, r, mu,
           ray_r_mu_intersects_ground) / Number(SAMPLE_COUNT);
-  // Integration loop.
   DimensionlessSpectrum rayleigh_sum = DimensionlessSpectrum(0.0);
   DimensionlessSpectrum mie_sum = DimensionlessSpectrum(0.0);
   for (int i = 0; i <= SAMPLE_COUNT; ++i) {
     Length d_i = Number(i) * dx;
-    // The Rayleigh and Mie single scattering at the current sample point.
     DimensionlessSpectrum rayleigh_i;
     DimensionlessSpectrum mie_i;
     ComputeSingleScatteringIntegrand(atmosphere, transmittance_texture,
         r, mu, mu_s, nu, d_i, ray_r_mu_intersects_ground, rayleigh_i, mie_i);
-    // Sample weight (from the trapezoidal rule).
     Number weight_i = (i == 0 || i == SAMPLE_COUNT) ? 0.5 : 1.0;
     rayleigh_sum += rayleigh_i * weight_i;
     mie_sum += mie_i * weight_i;
@@ -242,18 +160,13 @@ void GetRMuMuSNuFromScatteringTextureUvwz(const AtmosphereParameters atmosphere,
   assert(uvwz.z >= 0.0 && uvwz.z <= 1.0);
   assert(uvwz.w >= 0.0 && uvwz.w <= 1.0);
 
-  // Distance to top atmosphere boundary for a horizontal ray at ground level.
   Length H = sqrt(atmosphere.top_radius * atmosphere.top_radius -
       atmosphere.bottom_radius * atmosphere.bottom_radius);
-  // Distance to the horizon.
   Length rho =
       H * GetUnitRangeFromTextureCoord(uvwz.w, SCATTERING_TEXTURE_R_SIZE);
   r = sqrt(rho * rho + atmosphere.bottom_radius * atmosphere.bottom_radius);
 
   if (uvwz.z < 0.5) {
-    // Distance to the ground for the ray (r,mu), and its minimum and maximum
-    // values over all mu - obtained for (r,-1) and (r,mu_horizon) - from which
-    // we can recover mu:
     Length d_min = r - atmosphere.bottom_radius;
     Length d_max = rho;
     Length d = d_min + (d_max - d_min) * GetUnitRangeFromTextureCoord(
@@ -262,9 +175,6 @@ void GetRMuMuSNuFromScatteringTextureUvwz(const AtmosphereParameters atmosphere,
         ClampCosine(-(rho * rho + d * d) / (2.0 * r * d));
     ray_r_mu_intersects_ground = true;
   } else {
-    // Distance to the top atmosphere boundary for the ray (r,mu), and its
-    // minimum and maximum values over all mu - obtained for (r,1) and
-    // (r,mu_horizon) - from which we can recover mu:
     Length d_min = atmosphere.top_radius - r;
     Length d_max = rho + H;
     Length d = d_min + (d_max - d_min) * GetUnitRangeFromTextureCoord(
@@ -307,7 +217,6 @@ void GetRMuMuSNuFromScatteringTextureFragCoord(
           SCATTERING_TEXTURE_SIZE;
   GetRMuMuSNuFromScatteringTextureUvwz(
       atmosphere, uvwz, r, mu, mu_s, nu, ray_r_mu_intersects_ground);
-  // Clamp nu to its valid range of values, given mu and mu_s.
   nu = clamp(nu, mu * mu_s - sqrt((1.0 - mu * mu) * (1.0 - mu_s * mu_s)),
       mu * mu_s + sqrt((1.0 - mu * mu) * (1.0 - mu_s * mu_s)));
 }
@@ -388,10 +297,6 @@ RadianceDensitySpectrum ComputeScatteringDensity(
   assert(nu >= -1.0 && nu <= 1.0);
   assert(scattering_order >= 2);
 
-  // Compute unit direction vectors for the zenith, the view direction omega and
-  // and the sun direction omega_s, such that the cosine of the view-zenith
-  // angle is mu, the cosine of the sun-zenith angle is mu_s, and the cosine of
-  // the view-sun angle is nu. The goal is to simplify computations below.
   vec3 zenith_direction = vec3(0.0, 0.0, 1.0);
   vec3 omega = vec3(sqrt(1.0 - mu * mu), 0.0, mu);
   Number sun_dir_x = omega.x == 0.0 ? 0.0 : (nu - mu * mu_s) / omega.x;
@@ -404,7 +309,6 @@ RadianceDensitySpectrum ComputeScatteringDensity(
   RadianceDensitySpectrum rayleigh_mie =
       RadianceDensitySpectrum(0.0 * watt_per_cubic_meter_per_sr_per_nm);
 
-  // Nested loops for the integral over all the incident directions omega_i.
   for (int l = 0; l < SAMPLE_COUNT; ++l) {
     Angle theta = (Number(l) + 0.5) * dtheta;
     Number cos_theta = cos(theta);
@@ -412,8 +316,6 @@ RadianceDensitySpectrum ComputeScatteringDensity(
     bool ray_r_theta_intersects_ground =
         RayIntersectsGround(atmosphere, r, cos_theta);
 
-    // The distance and transmittance to the ground only depend on theta, so we
-    // can compute them in the outer loop for efficiency.
     Length distance_to_ground = 0.0 * m;
     DimensionlessSpectrum transmittance_to_ground = DimensionlessSpectrum(0.0);
     DimensionlessSpectrum ground_albedo = DimensionlessSpectrum(0.0);
@@ -422,7 +324,7 @@ RadianceDensitySpectrum ComputeScatteringDensity(
           DistanceToBottomAtmosphereBoundary(atmosphere, r, cos_theta);
       transmittance_to_ground =
           GetTransmittance(atmosphere, transmittance_texture, r, cos_theta,
-              distance_to_ground, true /* ray_intersects_ground */);
+              distance_to_ground, true );
       ground_albedo = atmosphere.ground_albedo;
     }
 
@@ -432,19 +334,12 @@ RadianceDensitySpectrum ComputeScatteringDensity(
           vec3(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
       SolidAngle domega_i = (dtheta / rad) * (dphi / rad) * sin(theta) * sr;
 
-      // The radiance L_i arriving from direction omega_i after n-1 bounces is
-      // the sum of a term given by the precomputed scattering texture for the
-      // (n-1)-th order:
       Number nu1 = dot(omega_s, omega_i);
       RadianceSpectrum incident_radiance = GetScattering(atmosphere,
           single_rayleigh_scattering_texture, single_mie_scattering_texture,
           multiple_scattering_texture, r, omega_i.z, mu_s, nu1,
           ray_r_theta_intersects_ground, scattering_order - 1);
 
-      // and of the contribution from the light paths with n-1 bounces and whose
-      // last bounce is on the ground. This contribution is the product of the
-      // transmittance to the ground, the ground albedo, the ground BRDF, and
-      // the irradiance received on the ground after n-2 bounces.
       vec3 ground_normal =
           normalize(zenith_direction * r + omega_i * distance_to_ground);
       IrradianceSpectrum ground_irradiance = GetIrradiance(
@@ -453,10 +348,6 @@ RadianceDensitySpectrum ComputeScatteringDensity(
       incident_radiance += transmittance_to_ground *
           ground_albedo * (1.0 / (PI * sr)) * ground_irradiance;
 
-      // The radiance finally scattered from direction omega_i towards direction
-      // -omega is the product of the incident radiance, the scattering
-      // coefficient, and the phase function for directions omega and omega_i
-      // (all this summed over all particle types, i.e. Rayleigh and Mie).
       Number nu2 = dot(omega, omega_i);
       Number rayleigh_density = GetProfileDensity(
           atmosphere.rayleigh_density, r - atmosphere.bottom_radius);
@@ -484,27 +375,21 @@ RadianceSpectrum ComputeMultipleScattering(
   assert(mu_s >= -1.0 && mu_s <= 1.0);
   assert(nu >= -1.0 && nu <= 1.0);
 
-  // Number of intervals for the numerical integration.
   const int SAMPLE_COUNT = 50;
-  // The integration step, i.e. the length of each integration interval.
   Length dx =
       DistanceToNearestAtmosphereBoundary(
           atmosphere, r, mu, ray_r_mu_intersects_ground) /
               Number(SAMPLE_COUNT);
-  // Integration loop.
   RadianceSpectrum rayleigh_mie_sum =
       RadianceSpectrum(0.0 * watt_per_square_meter_per_sr_per_nm);
   for (int i = 0; i <= SAMPLE_COUNT; ++i) {
     Length d_i = Number(i) * dx;
 
-    // The r, mu and mu_s parameters at the current integration point (see the
-    // single scattering section for a detailed explanation).
     Length r_i =
         ClampRadius(atmosphere, sqrt(d_i * d_i + 2.0 * r * mu * d_i + r * r));
     Number mu_i = ClampCosine((r * mu + d_i) / r_i);
     Number mu_s_i = ClampCosine((r * mu_s + d_i * nu) / r_i);
 
-    // The Rayleigh and Mie multiple scattering at the current sample point.
     RadianceSpectrum rayleigh_mie_i =
         GetScattering(
             atmosphere, scattering_density_texture, r_i, mu_i, mu_s_i, nu,
@@ -513,7 +398,6 @@ RadianceSpectrum ComputeMultipleScattering(
             atmosphere, transmittance_texture, r, mu, d_i,
             ray_r_mu_intersects_ground) *
         dx;
-    // Sample weight (from the trapezoidal rule).
     Number weight_i = (i == 0 || i == SAMPLE_COUNT) ? 0.5 : 1.0;
     rayleigh_mie_sum += rayleigh_mie_i * weight_i;
   }
@@ -565,8 +449,6 @@ IrradianceSpectrum ComputeDirectIrradiance(
   assert(mu_s >= -1.0 && mu_s <= 1.0);
 
   Number alpha_s = atmosphere.sun_angular_radius / rad;
-  // Approximate average of the cosine factor mu_s over the visible fraction of
-  // the Sun disc.
   Number average_cosine_factor =
     mu_s < -alpha_s ? 0.0 : (mu_s > alpha_s ? mu_s :
         (mu_s + alpha_s) * (mu_s + alpha_s) / (4.0 * alpha_s));
@@ -605,7 +487,7 @@ IrradianceSpectrum ComputeIndirectIrradiance(
       Number nu = dot(omega, omega_s);
       result += GetScattering(atmosphere, single_rayleigh_scattering_texture,
           single_mie_scattering_texture, multiple_scattering_texture,
-          r, omega.z, mu_s, nu, false /* ray_r_theta_intersects_ground */,
+          r, omega.z, mu_s, nu, false ,
           scattering_order) *
               omega.z * domega;
     }
@@ -653,4 +535,4 @@ IrradianceSpectrum ComputeIndirectIrradianceTexture(
       multiple_scattering_texture, r, mu_s, scattering_order);
 }
 
-#endif // BRUNETON_PRECOMPUTE
+#endif

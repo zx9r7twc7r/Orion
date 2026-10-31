@@ -45,9 +45,6 @@ public abstract class DhLodBufferHookMixin {
                                                    ArrayList<ByteBuffer> transparent,
                                                    CallbackInfoReturnable<?> cir) {
         try {
-            // minHeight 是 DH 顶点 y 的基准：LodBufferContainer 用
-            // `clientLevelWrapper.getMinHeight()` 当 minCornerBlockPos.y，
-            // 所以 worldY = minHeight + vy。必须和顶点一起交给 sink，否则整片远场会整体错位。
             DhLodMeshSink.onBuilt(pos,
                     DhSectionPos.getBlockWidth(pos),
                     DhSectionPos.getMinCornerBlockX(pos),
@@ -55,7 +52,6 @@ public abstract class DhLodBufferHookMixin {
                     level == null ? 0 : level.getMinHeight(),
                     opaque, transparent);
         } catch (Throwable ignored) {
-            // 接管绝不允许影响 DH 的构建流程。
         }
     }
 }

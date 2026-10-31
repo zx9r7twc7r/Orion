@@ -20,8 +20,6 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(BlockModelLighter.class)
 public class BlockModelLighterMixin {
 
-    // Per-quad hot path: System.getProperty would walk the properties table on
-    // every glass quad; resolve the flag once instead.
     @Unique
     private static final boolean RTX_DEBUG =
             Boolean.getBoolean("rtx.debug");
@@ -39,15 +37,6 @@ public class BlockModelLighterMixin {
     }
 
 
-    // 2026-10-09 修（用户："除了普通玻璃以外全量恢复成原来有折射有反射的样子"）：
-    // 这里以前对**所有**玻璃都写 marker 2 —— 包括染色玻璃块。于是 native 的
-    // applyStainedGlassDyeToRTVertex()（要求 marker 3..18）不会注入染料，RT 顶点色
-    // 仍是原版灰面明暗 ⇒ rchit 的 glassVertexFactorIsFaceShade() 把它判成"普通玻璃"
-    // ⇒ 置 RT_STATE_CLEAR_GLASS_BIT ⇒ rgen 的 isClearGlassHit() 把它**当空气**
-    // （没有折射、没有反射、没有那条 F0=0.04 的镜面射线）。
-    // 染色玻璃板不走这里（它们由 SectionCompilerMixin 标记 3+dyeId），所以症状一直是
-    // "只有彩色玻璃板被恢复了"。映射与 SectionCompilerMixin.resolveTrackedGlassMarker()
-    // 逐字同一份。
     @Unique
     private static int vulkan$glassMarker(
             BlockState state

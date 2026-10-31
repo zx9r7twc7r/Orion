@@ -33,8 +33,6 @@
 // 本文件只保证"类型与宏齐备、能编译"，本身不含任何行为。
 // ============================================================================
 
-// 必需的扩展。清单与顺序取自 NVIDIA 的 SharcGlslHelpers.h 头部注释（那边是注释掉的，
-// 要消费者自己声明）。int64 在 rt_test.rgen 里已经 require 过，重复声明同一扩展是合法的。
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -43,11 +41,8 @@
 #extension GL_EXT_shader_16bit_storage : enable
 #extension GL_EXT_control_flow_attributes : require
 
-// SharcGlslHelpers.h 与 SharcCommon.h 的入口判据（那边写的是 #if 而不是 #ifdef）。
 #define SHARC_ENABLE_GLSL 1
 
-// Update pass 口径：默认 0 = Query/Resolve（SharcState 退化成占位 uint，update 系列函数
-// 不参与编译）。将来那个做稀疏更新的 rgen 必须在 #include 本文件**之前**定义成 1。
 #ifndef SHARC_UPDATE
 #define SHARC_UPDATE 0
 #endif
@@ -55,9 +50,6 @@
 #include "sharc/SharcGlslHelpers.h"
 #include "sharc/SharcCommon.h"
 
-// ---------------------------------------------------------------------------
-// 撤掉 Helpers 的 HLSL 别名宏（理由见文件头"宏泄漏"段）
-// ---------------------------------------------------------------------------
 #undef float2
 #undef float3
 #undef float4

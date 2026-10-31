@@ -1,36 +1,6 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-// ===========================================================================
-// vol_restir_temporal.comp —— 体积光 ReSTIR（S3：时间重投影）
-//
-// 5 个 dispatch 的第 2 个：
-//
-//   initial(RIS) → temporal → spatial → integrate
-//                   ^^^^^^^^ 本文件
-//
-// 职责：把本帧 INITIAL 抽到的样本与**上一帧同位置**的样本合并，让每个 froxel
-// 的有效样本数随时间增长（M 上限 2），从而把"32 样本/帧"的噪声压下去。
-//
-// 重投影口径与 rt_test.rgen:19782 的 MV 构造逐字一致：
-//   prevClip = inverse(prevViewInverse * prevProjInverse) * vec4(worldPos, 1)
-// restir froxel 的世界位置由当前帧相机基算出（vol_restir_common.glsl 的
-// volRestirFroxelCenter），投影到上一帧的屏幕网格取整 ⇒ 上一帧的 restir 坐标。
-// 深度层**直接沿用**本帧 z：restir 网格的 z 是"距离切片序号"而不是几何深度，
-// 相机前移时同一序号对应的世界距离会变，但相邻切片的距离差远小于灯的衰减尺度，
-// 用错一层的代价可以忽略；反过来按世界距离反解层号既慢又要处理越界。
-//
-// 为什么原地读写 R0（binding 1 既读又写）：
-//   每个线程只碰**自己那个 texel**（history 在另一张图上，只读），没有跨线程
-//   竞争，所以不需要 ping-pong 第二张输出图。这样 reservoir 只需两张：
-//     R0 = 当前帧（initial 写 → temporal 原地合并）
-//     R1 = 上一帧最终结果（spatial 写，本 pass 只读）
-//
-// 绑定（set 0）———————————————————————————————————————————————
-//   0 CameraProperties           （camera_ubo.glsl）
-//   1 reservoir 当前帧           rgba32ui image3D，读写
-//   2 reservoir 上一帧           rgba32ui image3D，只读
-// ===========================================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -46,9 +16,7 @@ layout(rgba32ui, set = 0, binding = 2) uniform readonly uimage3D volReservoirHis
 
 layout(push_constant) uniform VolRestirTemporalPush
 {
-    // x = froxel 宽, y = froxel 高, z = 层数, w = restir 下采样比
     ivec4 froxelSize;
-    // x = 最远距离(格), y = 深度指数, z = M 上限, w = 帧种子
     vec4 temporalParams;
 } pc;
 
@@ -64,7 +32,6 @@ void main()
 
     VolReservoir current = volRestirUnpack(imageLoad(volReservoirInOut, restirCoord));
 
-    // ---- 重投影到上一帧的 restir 网格 ----
     vec2 froxelExtent = vec2(pc.froxelSize.xy);
     int restirDownscale = max(pc.froxelSize.w, 1);
 
@@ -98,7 +65,6 @@ void main()
         ivec3 prevCoord = ivec3(floor(prevUV * vec2(restirSize.xy)), restirCoord.z);
         VolReservoir history = volRestirUnpack(imageLoad(volReservoirHistory, prevCoord));
 
-        // 历史可用条件：上一帧确实有样本、没有过期、灯身份有效（0 = 太阳，本阶段无）。
         const bool historyUsable =
             history.sampleCount > 0u &&
             history.age < ageLimit &&
@@ -112,7 +78,6 @@ void main()
 
             if(totalWeight > 1.0e-6)
             {
-                // 两边都是 M 个样本的 WRS 全和，合并权重就是各自的 weightSum。
                 uint randomState = volRestirSeed(restirCoord,
                     cam.frameCount + uint(pc.temporalParams.w));
 
@@ -123,7 +88,6 @@ void main()
                     merged.age = history.age;
                 }
 
-                // M 累加后钳到上限：无上限时权重会无限增长，一动就拖影。
                 newSampleCount = min(current.sampleCount + history.sampleCount,
                     maxSampleCount);
                 newWeightSum = totalWeight;
@@ -133,7 +97,6 @@ void main()
 
     if(merged.lightIndex == 0u || newSampleCount == 0u)
     {
-        // 两边都空：保持空 reservoir（别把 age/weight 越滚越大）。
         imageStore(volReservoirInOut, restirCoord, uvec4(0u, 0u, 0u, 0u));
         return;
     }

@@ -42,7 +42,6 @@ public class MinecraftLevelLifecycleMixin {
     ) {
         Minecraft minecraft = Minecraft.getInstance();
 
-        // 同一等级被重复设置时不必触发一次全量重建。
         if (minecraft.level == newLevel) {
             return;
         }
@@ -52,20 +51,10 @@ public class MinecraftLevelLifecycleMixin {
         }
 
         NativeVulkan.clearWorldGeometry();
-        // 2026-10-24：整世界几何已清 ⇒ 上传内容哈希整表失效。
         SectionUploadDedup.invalidateAll();
 
-        // DH 远场网格也住在 g_chunkMeshes 里，已被上面一并清掉，但 Java 侧的
-        // 上传指纹仍认为它在线：同一原点重进世界时指纹命中就不会再上传，远场
-        // 会静默缺失直到玩家移动。重置两侧状态，让远场按新世界的快照重铺。
         DhBridge.reset();
 
-        // 2026-10-09 修「依次进多个存档后越来越卡」：FarFieldGate 的覆盖表
-        // （section 坐标 → 接管状态）**从不清**，表内容于是变成"所有进过的存档的
-        // section 并集"，而它每帧都要整表遍历一次 ⇒ 每帧成本随存档数线性上涨。
-        // 这里显式清一次（不依赖 DhBridge/Voxy 那两条路是否走到），清掉是安全的：
-        // 上面刚把 native 几何全清，覆盖表描述的正是那批几何的接管状态。
-        // 打印的那行就是"变卡"的量化指标：换世界后应归零。
         FarFieldGate.onLodHardReset();
     }
 }

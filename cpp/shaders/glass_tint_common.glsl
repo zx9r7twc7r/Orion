@@ -37,8 +37,6 @@
 //     ray handed back.
 // =============================================================================
 
-// Java writes this bit (SectionCompilerMixin: VLI_STAINED_GLASS_BIT = 1 << 24)
-// on the same voxel word whose bits 9..23 carry the quantized RGB555 dye.
 const uint VPT_STAINED_GLASS_BIT = 1u << 24u;
 
 bool vptReadSourceVoxel(ivec3 worldBlock, out uint source);
@@ -138,13 +136,6 @@ vec3 glassDecodeVoxelAlbedo(uint source)
     ) * (1.0 / 31.0);
 }
 
-// =============================================================================
-// Peak-preserving saturation boost of the stained-glass RGB filter
-//
-// 3.0 matches the confirmed rt_vpt_irradiance.comp bake filter: the maximum
-// channel is kept and only the channel differences are amplified, so dye
-// concentration rises without changing local-light energy or range.
-// =============================================================================
 const float STAINED_GLASS_TRANSMISSION_SATURATION = 3.0;
 
 vec3 vptSaturateGlassTransmission(vec3 transmission)
@@ -159,20 +150,6 @@ vec3 vptSaturateGlassTransmission(vec3 transmission)
     );
 }
 
-// =============================================================================
-// LOCAL-LIGHT stained-glass tint strengthening
-//
-// The visibility path is a plain multiplicative transmittance, so a bright
-// local emitter washes its own colour out: the dominant channel is pushed past
-// the tone curve and the illuminated pool reads as white even through saturated
-// stained glass.  This boost re-saturates the transmittance while restoring its
-// luminance, so a coloured pool keeps the exact brightness it had and only
-// gains colour.
-//
-// Scope is deliberately local-light only.  Sun / sky shadow transmittance is
-// accumulated by the separate RT_PURPOSE_GLASS_VISIBILITY block in main() and
-// is never passed through this function.
-// =============================================================================
 const float LOCAL_GLASS_TINT_SATURATION = 1.55;
 const vec3 LOCAL_GLASS_TINT_LUMA = vec3(0.2126, 0.7152, 0.0722);
 
@@ -186,7 +163,6 @@ vec3 strengthenLocalGlassTint(
     float peak =
         max(t.r, max(t.g, t.b));
 
-    // Achromatic (clear glass) transmittance is already its own boost result.
     if(peak <= 1.0e-4)
     {
         return t;
@@ -203,9 +179,6 @@ vec3 strengthenLocalGlassTint(
             vec3(1.0)
         );
 
-    // Restore the original luminance so the boost never brightens or darkens
-    // the pool, it only moves the hue.  The final clamp keeps a saturated
-    // channel inside the valid transmittance range.
     float targetLuminance =
         dot(t, LOCAL_GLASS_TINT_LUMA);
 
@@ -221,34 +194,8 @@ vec3 strengthenLocalGlassTint(
         );
 }
 
-// =============================================================================
-// Hue-preserving exposure guard for the local-light glass tint
-//
-// The local-light terms are HDR by construction.  rr_sdr_post.comp ends with a
-// bare pow(color, 1/2.2) and has no tone curve, so it clamps every channel on
-// its own: a red-glass sample of (2.3, 0.6, 0.6) has its strongest channel
-// pinned at 1.0 and washes out to white -- the channel ratios, i.e. the glass
-// colour, collapse exactly at the clip point.  That is why the local-light pool
-// behind stained glass reads white and gets whiter the closer (hence brighter)
-// the receiver is, while the sun paths, whose energy stays below 1.0, never
-// clip and look correct.
-//
-// Re-saturating the *transmittance* cannot recover that: the product is already
-// out of range by the time the sink sees it.  Folding the peak back with ONE
-// shared scalar keeps every channel ratio - and therefore the hue - identical,
-// and values at or below 1.0 are returned untouched, so mid-tones and overall
-// exposure do not move and the sun paths are not affected at all.
-// =============================================================================
 const float LOCAL_GLASS_TINT_NEUTRAL_SPREAD = 0.08;
 
-// Extra absorption exponent applied ON TOP of strengthenLocalGlassTint's own
-// luminance restoration.  1.0 double-counts the pane's absorption and leaves
-// the coloured pool at ~1/15 the energy of the white pool, which is exactly
-// what made the tint look invisible.  0.0 keeps the two paths at the same order
-// of magnitude; raise it toward 1.0 only if a darker, more physical pool is
-// wanted.  Measured 2026-09-22: this is the single knob that decided whether
-// the two consumers of this model agreed, so it deliberately lives in exactly
-// one place.
 const float LOCAL_GLASS_TINT_ABSORPTION = 0.0;
 
 vec3 glassTintExposureFold(vec3 value)
@@ -277,17 +224,6 @@ vec3 glassStainedPoolRadiance(vec3 radiance, vec3 transmittance)
         return max(radiance, vec3(0.0)) * tint;
     }
 
-    // A stained pane absorbs energy as well as rotating hue.  Without this the
-    // hue guard alone leaves a bright local emitter's pool at, or above, the
-    // white point - which is exactly the wash-out this filter exists to stop,
-    // because the sink clips per channel and the ratios collapse.
-    //
-    // 2026-09-22 fix: strengthenLocalGlassTint() already calibrated the tint
-    // back to the original transmittance luminance, i.e. "how much energy the
-    // pane ate" is already inside `tint`.  Multiplying a second absorption on
-    // top of it counted the same absorption twice and dropped the coloured pool
-    // to ~1/15 of the white pool, which buried the colour.  The two paths are
-    // level again because this exponent is 0.0 (see the constant above).
     return
         max(radiance, vec3(0.0)) *
         tint *
@@ -307,10 +243,6 @@ vec3 glassApplyStainedTint(vec3 radiance, vec3 transmittance)
     );
 }
 
-// The march below calls vptReadSourceVoxel(), which only the raygen-family
-// shaders define.  Hit shaders include this file (for the pane filter above)
-// with GLASS_TINT_NO_DDA defined, so the march and its unresolved callee stay
-// out of their translation unit entirely.
 #ifndef GLASS_TINT_NO_DDA
 
 // =============================================================================
@@ -369,9 +301,6 @@ vec3 glassTraceTransmissionToEmitter(
         return vec3(1.0);
     }
 
-    // The selected light is represented by a voxel but sampled as a virtual
-    // area emitter.  Stop just before entering that source voxel so its own
-    // opaque mesh cannot shadow its emitted sample.
     float rayMaxDistance = min(
         distanceToTarget - 0.03,
         targetVoxelEntryDistance - 0.03
@@ -444,4 +373,4 @@ vec3 glassTraceTransmissionToEmitter(
     );
 }
 
-#endif // GLASS_TINT_NO_DDA
+#endif

@@ -13,7 +13,6 @@ public class VulkanRenderPassMixin {
 
     @Inject(method = "setPipeline", at = @At("HEAD"))
     private void onSetPipelineCaptureCmd(CallbackInfo ci) {
-        // 利用你写好的 Accessor 盗取真实指令缓冲
         VkCommandBuffer cmd = ((VulkanRenderPassAccessor) this).getCommandBuffer();
         if (cmd != null) {
             NativeVulkan.currentCommandBuffer = cmd.address();

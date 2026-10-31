@@ -23,7 +23,6 @@ import net.minecraft.client.Minecraft;
  * 可以安全共用。</p>
  */
 public final class FarFieldWindow {
-    /** LOD1 section 宽（格）。近场窗口与 LOD ring 边界都对齐这个网格。 */
     public static final int LOD_SECTION_BLOCKS = 64;
 
     private FarFieldWindow() {

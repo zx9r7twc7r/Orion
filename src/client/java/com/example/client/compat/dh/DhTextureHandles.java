@@ -43,15 +43,6 @@ import java.util.concurrent.ConcurrentHashMap;
 final class DhTextureHandles {
     private static final String TAG = "[DH-TEX]";
 
-    //=====================================================================//
-    // 反射元数据缓存                                                       //
-    //                                                                     //
-    // Class/Field/Method 解析结果在会话内是稳定的（DH 版本不变），此前每次     //
-    // tick（每 2 秒）都重新 Class.forName + getMethod + getDeclaredField，    //
-    // readField 还把 NoSuchFieldException 当控制流用。缓存后取到的对象与       //
-    // 之前完全一致，只是不再重复解析。键数量级 = 会话中涉及的 (类, 成员) 对，    //
-    // 十几个封顶，无需淘汰。                                                //
-    //=====================================================================//
     private static final ConcurrentHashMap<String, Field> FIELD_CACHE =
             new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, Method> METHOD_CACHE =
@@ -90,12 +81,10 @@ final class DhTextureHandles {
     }
 
 
-    /** 句柄发现失败时的重试间隔（≈2 秒 @60fps）。DH 重建纹理后由这里重新推送。 */
     static final long RETRY_INTERVAL_FRAMES = 120L;
 
     private static long nextCheckFrame;
 
-    /** 上一次成功推送的 view 句柄，用来判断 DH 是否重建了纹理（换世界/改渲染距离）。 */
     private static long publishedColorView;
     private static long publishedDepthView;
     private static long publishedAtlasView;
@@ -104,13 +93,8 @@ final class DhTextureHandles {
     private static int pushes;
     private static int failures;
 
-    /**
-     * 上一次"没拿到句柄"的完整原因串。
-     *
-     * <p>用来去重：DH 在它自己不渲染时永远建不出 block ratio atlas，那是<b>预期内</b>的
-     * 缺失（我们接管几何时必然如此），每 2 秒刷一行只会淹掉日志。只有原因<b>变了</b>
-     * 才打一行，于是"从'未就绪'变成反射失败"这类真故障仍然一眼可见。</p>
-     */
+    
+
     private static String lastMissReason;
 
     private DhTextureHandles() {
@@ -147,8 +131,6 @@ final class DhTextureHandles {
         if (frame < nextCheckFrame) return;
         nextCheckFrame = frame + RETRY_INTERVAL_FRAMES;
 
-        // 方案 c 的成套句柄。color/depth 只在 DH 自己渲染时才存在（见类注释），
-        // 拿不到就走下面的 atlas 直取。
         Fetch color = fetch("color", () -> proxy.getDhColorTextureBlazeWrapper());
         Fetch depth = fetch("depth", () -> proxy.getDhDepthTextureBlazeWrapper());
 
@@ -164,8 +146,6 @@ final class DhTextureHandles {
             return;
         }
 
-        // 常态（rendererMode=DISABLED）：DH 自己不渲染 ⇒ 上面两个 API getter 永远失败，
-        // atlas 也不能靠 API 拿。改由我们直接调 DH 的 uploadPendingTiles() 把图集建出来。
         Fetch atlas = fetchAtlasDirect();
         if (atlas.handle == null) {
             miss("color[" + color.reason + "] depth[" + depth.reason
@@ -207,9 +187,6 @@ final class DhTextureHandles {
             return;
         }
 
-        // ⚠ 必须看 native 的返回值：C++ 侧可能因为"句柄不全 / 设备不同源"而拒绝，
-        // 那时如果这里仍记成已发布，顶点会带上真 tileId 而 binding 49 还指着回落图集
-        // ⇒ 满屏错色（09-25 就是这么崩过一次，见 DhFlags.PUBLISH_TEXTURES 的注释）。
         published = accepted;
         publishedColorView = color.handle.view;
         publishedDepthView = depth.handle.view;
@@ -223,9 +200,6 @@ final class DhTextureHandles {
     }
 
     private static void publishAtlasOnly(Fetch atlas) {
-        // view 没变就不用重推（内容增长但尺寸不变时描述符也无需改）。每 2 秒仍会走到
-        // 这里一次——那是为了让 fetchAtlasDirect 里的 uploadPendingTiles() 持续把
-        // 新注册的 tile 刷进图集，不是为了重推句柄。
         if (published && atlas.handle.view == publishedAtlasView) return;
 
         boolean accepted;
@@ -257,9 +231,6 @@ final class DhTextureHandles {
         nextCheckFrame = 0L;
     }
 
-    //=====================================================================//
-    // 句柄抽取                                                            //
-    //=====================================================================//
 
     /** 一次抽取的结果。都是原始 long —— 不持有任何 renderpearl 对象，避免跨帧留引用。 */
     private static final class Handle {
@@ -301,13 +272,10 @@ final class DhTextureHandles {
         try {
             Object result = supplier.get();
             if (result == null) return new Fetch(null, "接口返回 null");
-            // DhApiResult<IDhApiBlazeTextureWrapper>：success/message/payload 都是公开字段。
             Field success = cachedPublicField(result.getClass(), "success");
             Field payloadField = cachedPublicField(result.getClass(), "payload");
             Object ok = success.get(result);
             if (!Boolean.TRUE.equals(ok)) {
-                // "纹理还没创建/绑定"是常态（DH 不自己渲染时它永远不建），
-                // 但要把 DH 自己给的理由带出来，好和"反射失败"区分开。
                 return new Fetch(null, "未就绪：" + readString(result, "message"));
             }
             payload = payloadField.get(result);
@@ -355,8 +323,6 @@ final class DhTextureHandles {
             return new Fetch(null, "BlazeBlockTextureAtlas.INSTANCE 为 null");
         }
 
-        // 刷图集。首次调用会在这里建出 GPU 纹理（DH 自己渲染时由它的渲染器做），
-        // 之后每次只上传新注册的 tile；尺寸变化时视图会换新，调用方据此重推句柄。
         try {
             cachedMethod(atlas.getClass(), "uploadPendingTiles").invoke(atlas);
         } catch (Throwable failure) {
@@ -389,12 +355,10 @@ final class DhTextureHandles {
         int width = 0;
         int height = 0;
 
-        // 主路径：wrapper 自己的字段（BlazeTextureWrapper.texture / .textureView / .textureSampler）。
         Object texture = readField(wrapper, "texture");
         Object textureView = readField(wrapper, "textureView");
         Object textureSampler = readField(wrapper, "textureSampler");
 
-        // 兜底：wrapped 是 Object[3]{texture, view, sampler}，按类名归位。
         Object wrapped = safeWrapped(wrapper);
         if (wrapped != null && wrapped.getClass().isArray()) {
             int length = Array.getLength(wrapped);
@@ -412,8 +376,6 @@ final class DhTextureHandles {
         if (textureSampler != null) sampler = readLong(textureSampler, "vkSampler");
         if (texture != null) {
             image = readLong(texture, "vkImage");
-            // renderpearl 的 VulkanDevice.vkDevice 是 LWJGL 的 VkDevice 对象，
-            // 所以这里要两步：先取到设备对象，再取它的裸指针。
             Object deviceObject = readField(texture, "device");
             if (deviceObject != null) device = readLong(deviceObject, "vkDevice");
         }
@@ -421,7 +383,6 @@ final class DhTextureHandles {
             width = wrapper.getWidth();
             height = wrapper.getHeight();
         } catch (Throwable ignored) {
-            // 尺寸拿不到不影响句柄本身的使用。
         }
 
         if (view == 0L) {
@@ -430,7 +391,6 @@ final class DhTextureHandles {
                     + " sampler=" + (textureSampler == null ? "null" : textureSampler.getClass().getName()) + "）");
         }
         if (device == 0L) {
-            // 设备指针解析失败时，"不同源"的结论不可信，必须显式说明，否则会误导排查方向。
             log("[" + label + "] 警告：VkDevice 指针未解析成功（device=0）⇒"
                     + " C++ 侧会报「设备尚未打入」或「不同源」，那个结论此时无效。");
         }
@@ -458,8 +418,6 @@ final class DhTextureHandles {
 
     private static Object readField(Object target, String name) {
         try {
-            // 缓存后 getDeclaredField 的 NoSuchFieldException 只在首次解析发生；
-            // 查找语义与之前完全一致（仍只查本类声明字段，不上溯父类）。
             Field field = cachedDeclaredField(target.getClass(), name);
             return field.get(target);
         } catch (Throwable ignored) {
@@ -487,7 +445,6 @@ final class DhTextureHandles {
             Object result = address.invoke(value);
             if (result instanceof Number number) return number.longValue();
         } catch (Throwable ignored) {
-            // 不是 LWJGL 句柄也不是数字 ⇒ 拿不到指针，返回 0（调用方会据此报"未解析"）。
         }
         return 0L;
     }

@@ -39,7 +39,6 @@ public class SpriteLoaderMixin {
                     NativeImage img = NativeImage.read(is);
                     ((SpriteContentsExtension) sprite).fabric_setNormalImage(img);
                 } catch (Exception e) {
-                    // 静默处理，避免控制台刷屏
                 }
             }
 
@@ -49,7 +48,6 @@ public class SpriteLoaderMixin {
                     NativeImage img = NativeImage.read(is);
                     ((SpriteContentsExtension) sprite).fabric_setSpecularImage(img);
                 } catch (Exception e) {
-                    // 静默处理
                 }
             }
         }

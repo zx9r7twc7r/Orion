@@ -66,51 +66,33 @@ final class DhApiImpl {
     private static final boolean PROBE_ENABLED = DhFlags.PROBE;
     private static final boolean DISABLE_DH_RENDERING = DhFlags.DISABLE_DH_RENDERING;
 
-    /** 句柄重探间隔与上限（≈30 秒 @60fps 内应能拿到）。 */
     private static final long HANDLE_PROBE_INTERVAL_FRAMES = 30L;
     private static final int MAX_HANDLE_PROBES = 60;
 
-    /** DH 近裁剪半径（含"高度覆盖"）的定期读数间隔，≈2 秒 @60fps。 */
     private static final long NEAR_CLIP_PROBE_INTERVAL_FRAMES = 120L;
 
-    /** 渲染事件只记前几次，够判定顺序即可。 */
     private static final int MAX_RENDER_EVENT_LOGS = 8;
 
-    /** 句柄下沉扫描的深度/宽度上限（Q7：句柄元组只有一两层，不需要更深）。 */
     private static final int MAX_DUMP_DEPTH = 3;
     private static final int MAX_DUMP_MEMBERS = 16;
 
     private static boolean ready;
-    /** 本类是否正持有 DH 近裁剪半径的运行时覆盖；只清自己设的那个值。 */
     private static boolean ownsNearClipOverride;
-    /** 本类是否正持有 DH 雾 / 云 的运行时覆盖；只清自己设的那些值。 */
     private static boolean ownsAtmosphereOverride;
-    /**
-     * 本世界内是否已经<b>尝试过</b>申请大气所有权。
-     *
-     * <p>⚠ 这个门闩是必需的：{@link #overrideBoolean} 在"配置已被别的 API 使用者覆盖"或
-     * "被用户锁定"时会打一行日志并返回 false，而它每帧都被调用 ⇒ 没有门闩就是每帧一行，
-     * 一秒刷 60 行。配置的可用性在一次世界加载内是稳定的，所以只试一次。</p>
-     */
+    
+
     private static boolean atmosphereAttempted;
-    /**
-     * 本类是否正持有 {@code graphics().renderingEnabled()}（DH 自己的 LOD 绘制）的运行时覆盖、
-     * 我们写进去的那个值，以及本世界内是否已经尝试过申请它。门闩的理由与
-     * {@link #atmosphereAttempted} 相同：申请函数每帧都会被调用，没有门闩就会在
-     * "已是我们想要的值 / 被锁定"时每帧刷一行日志。
-     */
+    
+
     private static boolean ownsRendering;
     private static Boolean ownsRenderingValue;
     private static boolean renderingOwnershipAttempted;
-    /** 上一次观察到的 level 对象身份，用来识别"换世界"（与远场通路同一手法）。 */
     private static Object lastLevelIdentity;
 
     private static boolean handlesReady;
     private static int handleProbes;
     private static long nextHandleProbeFrame;
-    /** 下次打印 DH 近裁剪读数的帧号。 */
     private static long nextNearClipProbeFrame;
-    /** 上一次读到的近裁剪面（格），用来只在值变化时打印（否则每 2 秒刷一行）。 */
     private static float lastNearClipBlocks = Float.NaN;
 
     private static int beforeRenderLogs;
@@ -119,9 +101,6 @@ final class DhApiImpl {
     private DhApiImpl() {
     }
 
-    //=====================================================================//
-    // 版本信息（供 DhBridge 做接入判定的门）                                //
-    //=====================================================================//
 
     static int apiMajor() {
         return DhApi.getApiMajorVersion();
@@ -135,9 +114,6 @@ final class DhApiImpl {
         return DhApi.getModVersion();
     }
 
-    //=====================================================================//
-    // 生命周期                                                            //
-    //=====================================================================//
 
     static void install() {
         try {
@@ -154,16 +130,11 @@ final class DhApiImpl {
             log("注册 DhApiAfterDhInitEvent 失败：" + failure);
         }
 
-        // Q8：DH 的渲染事件里带 DhApiRenderParam（两套矩阵 + near/far），既是顺序探针，
-        // 也是"把 DH 的 depth 重投影进我们管线"所必需的输入。注意此处**不 cancel**：
-        // P0 阶段要让 DH 照常渲染，才能拿到它的 color/depth 句柄。
         try {
             DhApiResult<Void> before = DhApiEventRegister.on(DhApiBeforeRenderEvent.class,
                     new DhApiBeforeRenderEvent() {
                         @Override
                         public void beforeRender(DhApiCancelableEventParam<DhApiRenderParam> event) {
-                            // stage B：矩阵推送必须在日志节流之前——它每帧都要走，
-                            // 与"只记前 8 条日志"无关。
                             DhFarFieldGeometry.push(event.value);
 
                             if (beforeRenderLogs++ >= MAX_RENDER_EVENT_LOGS) return;
@@ -231,24 +202,12 @@ final class DhApiImpl {
             dumpCapabilities();
         }
 
-        // ⭐⭐ 远场绘制所有权（09-25）：把 DH <b>自己的光栅 LOD 绘制</b>关掉。
-        //    它是 Stage C 的前提：我们的几何已经在 TLAS 里画了同一条远场，DH 再画一遍
-        //    就是两套壳互相穿插（实机症状：块状/阶梯、接缝闪烁错位、DH 那侧的空洞与
-        //    低分辨率纯色，以及用户点名的"DH 渲染的原版无光追画面还在"）。
-        //    与雾/云同一套规矩：进世界时用官方 API 覆盖、退出世界撤回、别人占了就不抢。
-        //    ⚠ 必须在 worldLoaded 分支里调：DH 的图形配置要有世界才可写（旧的写法在
-        //      ready 翻转那一刻就调，那时往往还没进世界，setValue 会静默失败）。
-        // ⚠ 两种架构下都要调：DISABLE_DH_RENDERING=false 时它是"确保 DH 在画"
-        //   （修正被历史会话持久化成 false 的配置），true 时它是"确保 DH 不画"。
         if (worldLoaded) {
             applyFarFieldRenderingOwnership();
         } else {
             releaseFarFieldRenderingOwnership();
         }
 
-        // RT 近景优先于 DH 远景。DH 自身的 overdraw 近裁剪会在 RT 未命中的区域
-        // 挖出以相机为中心的圆洞；这里只在"世界内 + 正在用 DH 图像做远场合成"时
-        // 关掉这层裁剪。若别的 API 使用者已经覆盖过该配置，保留对方的，不抢控制权。
         if (worldLoaded && !DISABLE_DH_RENDERING && DhFlags.PUBLISH_TEXTURES) {
             ensureNearClipCoverage();
             probeNearClip(frame);
@@ -256,21 +215,14 @@ final class DhApiImpl {
             releaseNearClipCoverage();
         }
 
-        // 远场大气的所有权：我们在 rgen 里自己算晴空大气透视，所以把 DH 的雾与云关掉。
-        // 走官方 setValue/clearValue 而不是"让用户改 DistantHorizons.toml"——后者换机器、
-        // 重装、删配置都会丢，而运行时覆盖可逆、带归属名、退出世界自动撤回。
         if (worldLoaded && DhFlags.OWN_ATMOSPHERE) {
             applyAtmosphereOwnership();
         } else {
             releaseAtmosphereOwnership();
         }
 
-        // Q7：句柄要等世界里真的渲染过才存在。这里持续重探直到拿到，与地形读取解耦
-        // —— 即使玩家一直没进世界，这条也只是空转。
         probeHandles(frame);
 
-        // P1：把句柄推进 C++（默认关闭，见 DhFlags.PUBLISH_TEXTURES）。它自带
-        // 节流与"句柄变了才推"的记账，所以逐帧调用是安全的。
         DhTextureHandles.tick(DhApi.Delayed.renderProxy, frame);
     }
 
@@ -296,10 +248,7 @@ final class DhApiImpl {
         releaseNearClipCoverage();
         releaseAtmosphereOwnership();
         DhTextureHandles.reset();
-        // 换世界后 DH 会重建纹理与相机矩阵，先把旧矩阵标成无效（全零载荷），
-        // 免得 C++ 拿上一个世界的矩阵去反投影 DH 的 depth。
         DhFarFieldGeometry.invalidate();
-        // 换世界后 DH 会重建纹理，句柄必须重新探测。
         handlesReady = false;
         handleProbes = 0;
         nextHandleProbeFrame = 0L;
@@ -348,7 +297,6 @@ final class DhApiImpl {
         }
         if (!Float.isFinite(nearBlocks)) return;
 
-        // 值没变化就不重复刷屏；变化了立刻打。
         if (Float.compare(nearBlocks, lastNearClipBlocks) == 0) return;
         lastNearClipBlocks = nearBlocks;
 
@@ -444,7 +392,6 @@ final class DhApiImpl {
         try {
             IDhApiConfigValue<Float> radius =
                     DhApi.Delayed.configs.graphics().overdrawPreventionRadius();
-            // 只清自己写的 0：别的模组后来改过值就留着它的。
             if (Float.valueOf(0.0f).equals(radius.getApiValue())) {
                 radius.clearValue();
             }
@@ -485,9 +432,8 @@ final class DhApiImpl {
         if (atmosphereAttempted) return;
         try {
             IDhApiGraphicsConfig graphics = DhApi.Delayed.configs.graphics();
-            if (graphics == null) return;   // 尚未就绪：不打日志（否则每帧一行），下一帧再试
-            atmosphereAttempted = true;     // 只尝试一次，见字段注释
-
+            if (graphics == null) return;
+            atmosphereAttempted = true;
             boolean fogOff = overrideBoolean("远场雾",
                     graphics.fog() == null ? null : graphics.fog().enableDhFog(), Boolean.FALSE);
             boolean cloudOff = overrideBoolean("DH 云",
@@ -507,7 +453,7 @@ final class DhApiImpl {
 
     /** 撤回 {@link #applyAtmosphereOwnership()} 写进去的值；只清自己写的那些。 */
     private static void releaseAtmosphereOwnership() {
-        atmosphereAttempted = false;   // 下次进世界允许重新申请
+        atmosphereAttempted = false;
         if (!ownsAtmosphereOverride) return;
         ownsAtmosphereOverride = false;
         try {
@@ -520,7 +466,6 @@ final class DhApiImpl {
             log("远场大气所有权撤回失败：" + failure);
         }
     }
-
     /**
      * 写一个布尔配置的运行时覆盖。
      *
@@ -530,7 +475,6 @@ final class DhApiImpl {
         if (value == null) return false;
         try {
             if (value.getApiValue() != null) {
-                // 已经有 API 使用者（可能是别的模组）设过了 ⇒ 不抢，只记录。
                 log("  远场大气：" + label + " 已被别的 API 使用者覆盖（" + value.getApiValue() + "），不抢");
                 return false;
             }
@@ -582,7 +526,7 @@ final class DhApiImpl {
         if (renderingOwnershipAttempted) return;
         try {
             IDhApiGraphicsConfig graphics = DhApi.Delayed.configs.graphics();
-            if (graphics == null) return;      // 尚未就绪：不打日志（否则每帧一行），下一帧再试
+            if (graphics == null) return;
             IDhApiConfigValue<Boolean> rendering = graphics.renderingEnabled();
             if (rendering == null) {
                 renderingOwnershipAttempted = true;
@@ -590,13 +534,6 @@ final class DhApiImpl {
                 return;
             }
             renderingOwnershipAttempted = true;
-            // ⭐⭐ 09-25 起这条开关的<b>最终状态由我们的架构决定</b>，而且是双向的：
-            //   DISABLE_DH_RENDERING=false（当前架构：DH 自己画远场）⇒ 确保它是 true；
-            //   true（旧架构：我方 TLAS 画远场）⇒ 确保它是 false。
-            //   为什么必须"确保"而不是"只在需要时关一次"：旧实现只单向写 false，而 DH 会把
-            //   API 覆盖<b>连同来源一起持久化</b>到自己的配置里（实机日志：
-            //   `renderingEnabled = false [文件值=false …]`）⇒ 之后即使我们把开关默认值改回
-            //   false，DH 仍然不渲染，用户看到的就是"远场还是你的（自建）垃圾几何"。
             final boolean want = !DISABLE_DH_RENDERING;
             final Object current = rendering.getValue();
             final Object apiValue = rendering.getApiValue();
@@ -623,13 +560,12 @@ final class DhApiImpl {
 
     /** 撤回 {@link #applyFarFieldRenderingOwnership()} 写进去的值（只清自己写的那个）。 */
     private static void releaseFarFieldRenderingOwnership() {
-        renderingOwnershipAttempted = false;   // 下次进世界允许重新申请
+        renderingOwnershipAttempted = false;
         if (!ownsRendering) return;
         ownsRendering = false;
         try {
             IDhApiGraphicsConfig graphics = DhApi.Delayed.configs.graphics();
             if (graphics == null) return;
-            // 只清"我们写进去的那个值"（true 或 false 都可能），别人的覆盖留着。
             clearIfOurs(graphics.renderingEnabled(), ownsRenderingValue);
             ownsRenderingValue = null;
         } catch (Throwable failure) {
@@ -637,9 +573,6 @@ final class DhApiImpl {
         }
     }
 
-    //=====================================================================//
-    // Q1/Q2/Q6/Q7：静态能力矩阵                                            //
-    //=====================================================================//
 
     private static void dumpCapabilities() {
         log("========== DH 能力矩阵（P0 探针） ==========");
@@ -671,8 +604,6 @@ final class DhApiImpl {
         EDhApiDepthRange range = call("renderProxy.getDepthRange()", proxy::getDepthRange);
         EDhApiDepthDirection direction = call("renderProxy.getDepthDirection()", proxy::getDepthDirection);
         log("depthRange = " + range + "  depthDirection = " + direction);
-        // ⭐ 09-24：这两个枚举不只是打印用 —— 它们是 rgen 那套闭式 reverse-Z 逆变换的
-        //    前提。对一次账，不一致就大声报警（shader 自己发现不了这件事）。
         checkDepthConvention(range, direction);
         Float nearClip = call("renderProxy.getNearClipPlaneDistanceInBlocks(0)",
                 () -> proxy.getNearClipPlaneDistanceInBlocks(0.0f));
@@ -702,7 +633,6 @@ final class DhApiImpl {
                 call("getDhColorTextureBlazeWrapper()", proxy::getDhColorTextureBlazeWrapper));
         boolean depth = describeHandle("depth",
                 call("getDhDepthTextureBlazeWrapper()", proxy::getDhDepthTextureBlazeWrapper));
-        // block-ratio 图集是"DH 基色 → 该面应有颜色"的比值表；官方 Iris 路径也用它。
         boolean atlas = describeHandle("blockRatioAtlas",
                 call("getDhBlockRatioAtlasTextureBlazeWrapper()",
                         proxy::getDhBlockRatioAtlasTextureBlazeWrapper));
@@ -746,9 +676,6 @@ final class DhApiImpl {
         log("  [" + label + "] wrapper=" + wrapper.getClass().getName()
                 + "  wrapped=" + (wrapped == null ? "null" : wrapped.getClass().getName()));
 
-        // Q7 的关键：getWrappedMcObject() 实测返回的是 Object[]（一个句柄元组），
-        // 光看数组自己的类层次只会得到 "Object[] < Object" —— 必须下沉到元素里，
-        // 才可能看到真正的 VkImage / GpuTexture。顺带扫一层 wrapper 自己的字段。
         try {
             log("  [" + label + "] ---- 下沉扫描（只读反射，不触碰 GPU）----");
             dumpObject("  [" + label + "]   ", wrapper, 0, new IdentityHashMap<>());
@@ -906,9 +833,6 @@ final class DhApiImpl {
         }
     }
 
-    //=====================================================================//
-    // 工具                                                                //
-    //=====================================================================//
 
     /** 打印一个配置项的当前值 / 文件值 / 默认值 / 是否可被 API 覆盖。 */
     private static void cfg(String name, IDhApiConfigValue<?> value) {

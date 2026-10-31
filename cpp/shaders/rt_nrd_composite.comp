@@ -1,28 +1,6 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-// =====================================================
-// NRD-1  local direct-light composite
-//
-// The NRD counterpart of rt_restir_reconstruct.comp.  That pass temporally
-// filtered the raw local DI itself; here NRD's REBLUR_DIFFUSE has already done
-// the denoising, so this pass only has to put the result back into the image.
-//
-// It reproduces the tail of the pass it replaces EXACTLY, so the only thing
-// that changes in the final frame is HOW the term was filtered:
-//   * the demodulation is unchanged -- the reservoir's packed receiver albedo
-//     multiplies the filtered IRRADIANCE, which is what the old pass did too
-//     ("max(filteredLighting, 0.0) * unpackReceiverAlbedo(packedAlbedo)")
-//   * the 6.0 luminance guard is unchanged
-//   * the alpha channel is preserved from the colour image
-//
-// Bindings:
-//   1  colour image (read/write; the denoised local DI is added into it)
-//   41 the ReSTIR DI spatial reservoir.  Read only for metadata.w, which holds
-//      the receiver albedo that rt_test.rgen packed there; the RayGen that runs
-//      before this pass rewrites only sampleAndAreaPdf.
-//   53 NRD's OUT_DIFF_RADIANCE_HITDIST
-// =====================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -46,47 +24,18 @@ layout(std430, binding = 41, set = 0) readonly buffer ReSTIRDISpatialBuffer
 layout(binding = 53, set = 0, rgba16f)
 uniform readonly image2D nrdOutDiffRadianceHitDistImage;
 
-// ★ 2026-09-29 16:xx：NRD 的**输入**（我们喂进去的原始 DI 信号）。
-// 之前只有输出（53），所以"信号塌没塌"和"NRD 拒没拒史"分不开。
-// 格式是 REBLUR 的 YCoCg(radiance)+normHitDist，取 .x 即亮度 Y。
 layout(binding = 52, set = 0, rgba16f)
 uniform readonly image2D nrdInDiffRadianceHitDistImage;
 
-// ★ 2026-09-29 16:xx：NRD 的 IN_VIEWZ（我们写、NRD 读）。
-// 用途：区分「NRD 跳过了这个像素」（写的是超范围哨兵 65504）与
-// 「NRD 跑了但历史为 0」。此前用 receiverValid 做过同一件事但失败了
-// （见交接文档 14:20），直接读 NRD 自己看到的那个数才是判据本身。
 layout(binding = 50, set = 0, r32f)
 uniform readonly image2D nrdInViewZImage;
 
-// ★ 2026-09-29 16:xx：NRD 的 IN_NORMAL_ROUGHNESS（我们写、NRD 读）。
-// 与 50/52 同属 updateNRDDescriptors 那一批 image，且值必然非零
-// （法线编码后不可能三个通道全 0）——用作「这一批描述符有没有内容」的对照。
 layout(binding = 51, set = 0, rgb10_a2)
 uniform readonly image2D nrdInNormalRoughnessImage;
 
-// 2026-09-28：NRD 自带的调试层（binding 56，RGBA8，渲染分辨率）。
-//
-// 由 NRD 自己的 Validation pass 写，前提是宿主打开了
-// CommonSettings::enableValidation（见 VulkanCore.cpp 的 NRD_LOCAL_DI_VALIDATION）。
-// 打开 NRD_COMPOSITE_DEBUG==5 即把它整张涂到屏幕上。
-//
-// 屏幕被切成 4x4 共 16 个视口（NRD README "VALIDATION LAYER"）：
-//   视口 2  = 线性 viewZ（绿=正、蓝=负、红=超出 denoisingRange）
-//   视口 3  = IN_MV 与「假设场景静止时的期望 MV」之差（洋红=疑似带抖动、
-//             蓝=出屏、非 0=有运动物体）
-//   视口 8  = 漫反累积帧数（棋盘红 = 历史被重置）
-// 判读要点：视口 3 在**移动相机时**若整片非 0，说明我们写的 IN_MV 与 NRD 用
-// 自己的矩阵算出的期望位置不一致 —— 这正是"移动时历史被拒"的直接定位。
 layout(binding = 56, set = 0, rgba8)
 uniform readonly image2D nrdValidationImage;
 
-// 2026-09-28：DEBUG==6 要看 cameraUBO 的 historyValid 与我们自己写的 IN_MV，
-// 所以这里声明 UBO（binding 2）和 MV 图（binding 55）。两者与 rt_restir_final.rgen
-// 共用同一套描述符，只是那一边把 55 当 writeonly、这边当 readonly。
-//
-// std140 不能跳字段：要读到 historyValid 就必须把前面的 lane 全部具名。这里只列到
-// historyValid 为止，后面的不再需要（规则同 rt_restir_final.rgen 顶部那段说明）。
 layout(binding = 2, set = 0) uniform CameraProperties {
     #include "camera_ubo.glsl"
 } camUboForMotionDebug;
@@ -94,18 +43,6 @@ layout(binding = 2, set = 0) uniform CameraProperties {
 layout(binding = 55, set = 0, rg16f)
 uniform readonly image2D nrdMotionDebugImage;
 
-// =====================================================
-// binding 57：rgen 自算 MV 的**私有读回**图（2026-09-29 MV 探针）。
-//
-// 与 binding 55 的关键区别：55 是 NRD 的 IN_MV，而 NRD 会把它**自己跟踪出来的
-// 运动**写回同一张图，所以读 55（或 validation 视口 3）量到的不是我们喂进去的
-// MV。57 是 NRD 的 descriptor set 里根本没有的图，写进去什么就读出什么。
-//
-// 用途：转动视角时看这张图是「光滑正确的旋转流场」还是「零/翻转/乱」，
-// 一步判定 MV 到底有没有算对。
-// 编码见 rt_restir_final.rgen binding 57：RG = mv.xy（渲染像素）、B = mv.z、
-// A = 取得方式（0=天空/无效、0.25=内层门失败、0.5=外闸失败、1=完整）。
-// =====================================================
 layout(binding = 57, set = 0, rgba16f)
 uniform readonly image2D nrdMvProbeImage;
 
@@ -115,7 +52,6 @@ layout(push_constant) uniform NRDCompositePushConstants
     uint height;
 } nrdCompositePush;
 
-// The same guard the replaced pass applied to the combined colour.
 const float LOCAL_DI_COMPOSITE_LUMINANCE_CLAMP = 6.0;
 
 float luminance(vec3 value)
@@ -184,21 +120,10 @@ void main()
 
     const uint index = uint(pixel.y * renderSize.x + pixel.x);
 
-    // REBLUR 的 OUT_DIFF_RADIANCE_HITDIST：.xyz = YCoCg，.w = 归一化命中距离
-    // （AO，无消费者）。必须先做逆变换才能拿到线性 radiance。
     const vec4 packedRadiance = imageLoad(
         nrdOutDiffRadianceHitDistImage, pixel
     );
 
-    // =====================================================
-    // 2026-09-29 第三步：REBLUR / RELAX 解码切换。两者打包口径不同（NRD.hlsli:915+）：
-    //   REBLUR：YCoCg 打包 → 这里做逆变换
-    //   RELAX ：线性 radiance（RELAX_FrontEnd_PackRadianceAndHitDist = float4(radiance, hitDist)）
-    // 必须与 rt_restir_final.rgen 的 LOCAL_DI_DENOISER_RELAX 与宿主的
-    // NRD_LOCAL_DI_USE_RELAX **三者同步**，只改一处会用错误口径解读（画面偏色/发黑）。
-    // =====================================================
-    // ★★ 2026-09-29 第 3 项（方案 C）：RELAX_DIFFUSE 已回退，宏改回 0 = REBLUR。★★
-    // 三处同步见 rt_restir_final.rgen 同名宏处的注释。
 #ifndef LOCAL_DI_DENOISER_RELAX
 #define LOCAL_DI_DENOISER_RELAX 0
 #endif
@@ -208,46 +133,6 @@ void main()
     vec3 denoisedIrradiance = nrdYCoCgToLinear(packedRadiance.xyz);
 #endif
 
-    // =====================================================
-    // 2026-09-26：本地光走 NRD 还是 raw 直通的 A/B 开关。
-    //
-    // 单帧 RIS（8 个按发光功率加权的候选，提案 PDF 是「全局 alias + 3D 光栅格」的
-    // 精确混合）→ 在选中的那个采样点上
-    // 补一根阴影射线 → contrib * vis * W，然后**交给 DLSS-RR 去收敛**。
-    // 它既没有 ReSTIR（README 的 TODO 里还写着 "ReSTIR"），也没有 NRD
-    // （同样是 TODO，而且注明是给非 NVIDIA 卡准备的）。
-    //
-    // 也就是说：这条信号是可以只靠后处理链收敛的，而我们现在有两层（NRD +
-    // RR）都在动它，反而没法判断哪一层在出错。所以先把 NRD 从本地光这条链上
-    // 摘下来做一次对照：
-    //   NRD_LOCAL_DI_USE_RAW_TERM = true  → 直接用 RayGen 的原始项
-    //   NRD_LOCAL_DI_USE_RAW_TERM = false → 用 NRD 的输出，接近 0 时用原始项兜底
-    // NRD 这条路本身没有被删掉，改回 false 即可恢复；等本地光观感定位清楚再决定去留。
-    // 2026-09-26 深夜：NRD 从 REBLUR_DIFFUSE 换成 RELAX_DIFFUSE（NVIDIA 官方
-    // 为 RTXDI/直射光设计的家族），并按官方简化路径喂输入（MV=0 + 相机运动
-    // 内部跟踪）。USE_RAW_TERM 切回 false —— RELAX 的输出才是被测对象；
-    // FALLBACK_TO_RAW 保留，作为 RELAX 输出异常时的兜底对照。
-    // =====================================================
-    // 2026-09-27 定责实验：USE_RAW_TERM=true = raw 直通上屏（NRD 从 DI 链摘除）。
-    // 判据：上屏亮 ⇒ 根因在 RELAX 输出侧；仍暗 ⇒ raw 本身低，问题在 final rgen
-    // 估计量，与 NRD 无关。定案后改回 false 恢复被测对象 RELAX。
-    // 2026-09-27 20:1x 定案：萤石旁标尺实测 raw DI = 0.16-0.32（橙/黄档，
-    // 个别红档）——估计量健康不暗，RELAX 输入无问题；而四分屏探针实测 RELAX
-    // 输出 ~0.06 => RELAX 把健康信号衰减了数倍，这就是"本地光不亮"的直接根因。
-    //
-    // 2026-09-27 晚：还原为"消费 NRD 输出"。
-    //
-    // 链条本身成立——Orion 的降噪器在**下游**：indirect.rgen.slang 第 16 行
-    // 写明 "temporal convergence is the denoiser's job"，guides.slang 第 277 行
-    // 写明引导图 "consumed by the denoiser/DLSS-RR"，README 也列了
-    // "DLSS Ray Reconstruction support"。它的 RIS 之所以是单帧、不做 reservoir
-    // 时域复用，正是因为 DLSS-RR 在最后做时域收敛。
-    //
-    // 而在本项目里 DLSS-RR 已被实测证明无法去噪这个 1spp 时间不相干的信号
-    // （rrMode Performance/Quality/DLAA/Ultra-Performance 全试过，画面无变化）
-    // ——那正是当初引入 NRD 的原因。所以 raw 直通 = 回到最初的噪点问题。
-    //
-    // 回滚：编译时加 -DRESTIR_DI_CONSUME_RELAX=0 即恢复 raw 直通。
 #ifndef RESTIR_DI_CONSUME_RELAX
 #define RESTIR_DI_CONSUME_RELAX 1
 #endif
@@ -259,8 +144,6 @@ void main()
     const bool NRD_LOCAL_DI_FALLBACK_TO_RAW = false;
 #endif
 
-    // RayGen 交下来的、未经去噪的本地光 DI 项（binding 41 的 xyz 在最终
-    // ReSTIR RayGen 里被改写为「可见性过滤后的辐照度」，不再是采样点位置）。
     const vec3 rawLocalDI = max(
         restirDISpatialBuffer.entries[index].sampleAndAreaPdf.xyz,
         vec3(0.0)
@@ -294,28 +177,9 @@ void main()
 
     const vec4 baseColor = imageLoad(image, pixel);
 
-    // =====================================================
-    // 2026-09-27 亮度标尺探针：areaPdf 补丁后用户报告「完全没变化」。
-    // 把 DI 估计量的**反照率前**亮度量化成 0.05 一档的色带，全屏输出，
-    // 一次进游戏同时回答两件事：① 重载链路是否还活着（画面必然变样）；
-    // ② raw DI 的真实量级落在哪一档。
-    //
-    // 读法（准星对准灯照亮的墙面）：
-    //   深灰 <0.05 | 深蓝 0.05-0.10 | 蓝 0.10-0.15 | 青 0.15-0.20
-    //   深绿 0.20-0.25 | 绿 0.25-0.30 | 黄 0.30-0.35 | 橙 0.35-0.40
-    //   红 0.40-0.50 | 品红 0.50-0.75 | 白 >0.75 | 暗红 = 负/NaN
-    //
-    //   深灰/深蓝 => ×4 没生效，估计量数据流还有未发现环节
-    //   青~绿     => ×4 已生效，「没变化」是曝光/观感层的问题
-    //   全屏深灰  => DI 项根本没到 composite，查 reconstruct 加法路径
-    // 定位后改回 false 即恢复 raw 直通对照。
-    // =====================================================
     const bool DBG_LUMA_RULER = false;
     if(DBG_LUMA_RULER)
     {
-        // v3：8x8 块均值——1spp 散斑是孤立单像素，截图压缩下不可靠；
-        // 块均值 = 散斑密度 × 散斑值 = 收敛估计的期望，整块实色必可读。
-        // 64 次 buffer load 只在探针版存在，生产版不编进这行。
         float rulerSum = 0.0;
         const ivec2 tileBase = pixel - (pixel & 7);
         for(int tileDy = 0; tileDy < 8; ++tileDy)
@@ -338,8 +202,6 @@ void main()
             }
         }
         const float rulerLuma = rulerSum * (1.0 / 64.0);
-        // 对数档（×2）：黑 <0.005 | 暗蓝 <0.01 | 蓝 <0.02 | 青 <0.04
-        // 绿 <0.08 | 黄 <0.16 | 橙 <0.32 | 红 <0.64 | 白 ≥0.64 | 暗红 NaN/负
         vec3 rulerColor;
         if(rulerLuma != rulerLuma) rulerColor = vec3(0.25, 0.0, 0.0);
         else if(rulerLuma < 0.0)   rulerColor = vec3(0.25, 0.0, 0.0);
@@ -356,87 +218,16 @@ void main()
         return;
     }
 
-// Ablation for the static white specks on glass (2026-09-25 20:1x):
-//   0 = normal composite
-//   1 = skip the additive term entirely (white specks gone => they live here)
-//   2 = show ONLY the additive term (its spatial pattern = the speck pattern)
-//   3 = 四分屏定位「本地光全灭」(2026-09-26)。
-//
-//       三分屏那一版已经读出：M>=16（样本在）、RayGen 交下来的本地光项非零，
-//       而本 pass 实际加进画面的项**恒等于 0**。也就是说断点已经收窄到
-//       「NRD 输出」与「接收面反照率解调」这两个乘数之一，所以这一版把它
-//       拆成四个因数并排显示，一次重载定案：
-//
-//       左 1/4 = 本像素选中的光源样本数 M（binding 41 的 metadata.y）
-//                黑 = 0；暗红/黄/绿/青/白 = 1 / 2-3 / 4-7 / 8-15 / 16+
-//       2/4   = RayGen 交下来的**未去噪**本地光 DI 项（sampleAndAreaPdf.xyz）
-//       3/4   = NRD(RELAX) 输出的线性辐照度（binding 53）
-//               黑 = NRD 写出的是 0（或该 binding 读不到） -> 交接坏了
-//               品红 = NaN/Inf -> YCoCg 解码与 NRD 实际打包不一致
-//       右 1/4 = 接收面反照率（metadata.w 的 8..31 位）
-//               黑 = 反照率位是 0 -> 解调这个乘数被清零
-//
-//       2/3/4 三格先 ×4（反照率 ×1）再开方，1e-3 量级也看得见；0 仍是纯黑。
 #ifndef NRD_COMPOSITE_DEBUG
 #define NRD_COMPOSITE_DEBUG 0
 #endif
 
-// DEBUG==8（MV 探针）的色标：**离散色阶**，不用线性亮度。
-//
-// 为什么改成色阶：2026-09-29 20:07 的第一版用线性亮度（t = mv/32），实机截图证明
-// **色调映射把颜色改了**——shader 写的 G/R 比是 0.2，截图里读到 0.5，所以无法从
-// 亮度反推 mv 的数值；而且线性映射在 |mv| ≥ 32 处整片饱和，把"偏大"和"大得离谱"
-// 压成同一个颜色，等于没有量程。
-//
-// 色阶只用**饱和色相**，色调映射基本只改亮度/饱和度、不改色相，所以色相是可读的。
-// 每格是前两倍，一次截图就能判定量级落在哪一档（左半屏 = mv.x，右半屏 = mv.y）：
-//   黑    |v| <   4 px
-//   蓝    4  ~  16 px   ← 正常转动应该落在这一档
-//   绿   16  ~  64 px   ← 已经偏大
-//   黄   64  ~ 256 px   ← 明显不对
-//   红   >= 256 px      ← 量级崩坏
-// 无效/失败像素仍用纯色区分成因：白=天空/无效面、品红=内层门失败、青=外闸失败。
 
 #if NRD_COMPOSITE_DEBUG == 1
     imageStore(image, pixel, baseColor);
 #elif NRD_COMPOSITE_DEBUG == 2
     imageStore(image, pixel, vec4(localDIRadiance, baseColor.a));
 #elif NRD_COMPOSITE_DEBUG == 4
-    // 2026-09-28：直接读出 NRD 的**历史长度（帧）**。
-    //
-    // 前提：宿主把 ReblurSettings::returnHistoryLengthInsteadOfOcclusion 设为 true，
-    // 此时 OUT_DIFF_RADIANCE_HITDIST 的 .w 不再是归一化命中距离（AO），而是历史长度，
-    // 单位是帧，范围 [0, maxAccumulatedFrameNum]（NRDSettings.h 原文）。
-    //
-    // 这是唯一能直接回答「NRD 到底有没有在累积历史」的仪器。本链不消费 .w
-    // （见本文件上方 "无消费者" 的说明），所以打开它不影响正常画面。
-    //
-    // 读法（颜色经过 DLSS-RR 与色调映射会被冲淡，看色相为主）：
-    //   黑   = 0 帧    -> 历史**完全无效**，每帧都在丢，输出≈1spp
-    //   暗红 = 1-2 帧  -> 历史几乎不累积
-    //   橙   = 3-6 帧
-    //   绿   = 7-15 帧
-    //   青   = 16-31 帧
-    //   白   = >=32 帧 -> 累积正常
-    //   品红 = **NRD 没写这个像素**（天空 / 无效接收面），不是塌陷
-    //
-    // ★★ 2026-09-29 14:2x 补丁：把"没写"和"写了但 0 帧"分开 —— **本次判据失败，记录备查**
-    // 依据（本地 NRD 源码）：rgen 对无效接收面/天空写的是
-    // NRD_OUT_OF_RANGE_VIEW_Z=65504 哨兵，NRD 的早期 out
-    // （IsInDenoisingRange 失败）会让该像素**不被写出**，读回的是残留值；
-    // 而"写了但历史为 0"在同编码下也是黑 —— 两者不可分辨，会把天空占比
-    // 误读成"运动整屏塌陷"（14:13 录屏里黑占 62~87%，必须减掉天空才能判读）。
-    //
-    // ‼ 14:20 录屏结果：**品红全程 0.0%（66 帧）**，而黑仍占 0~30%。反汇编确认品红分支
-    // 在部署的 spv 里，所以是**判据选错**：`receiverValid` 这个谓词抓不到天空 ——
-    // 主射线未命中几何时 rt_test.rgen 的接收面字段（receiverPositionAndViewDepth /
-    // receiverNormalAndWeight）并不是被清零的，天空像素照样"看起来有效"，它被判为
-    // out-of-range 的是**另一条路**（rgen 把 hitPositionView.z 夹到 65504 哨兵）。
-    // ⇒ 想用本 pass 区分"没写/写了 0"，必须换一个真正由 rgen 写出的信号（例如让 rgen
-    //   把哨兵写进 composite 会读的通道，或直接读 NRD 自己的 validation 视口 2）。
-    // 现在这条分支保留但预期不触发（不改判读表：品红=天空 这条读法**作废**）。
-    // 接收面有效性判据与 rt_restir_final.rgen 的 receiverValid 逐字一致，
-    // 且该 pass 只改写 sampleAndAreaPdf，所以两边读到的是同一个判断。
     {
         const ReSTIRDIReservoir dbgHistoryReservoir =
             restirDISpatialBuffer.entries[index];
@@ -482,45 +273,8 @@ void main()
         imageStore(image, pixel, vec4(historyColor, baseColor.a));
     }
 #elif NRD_COMPOSITE_DEBUG == 5
-    // 2026-09-28：把 NRD 自己的调试层（binding 56）原样涂到屏幕上。
-    //
-    // 为什么需要这个：本地光"移动时历史只剩 1-2 帧"这件事，靠读代码已经排掉了
-    // 一整条假设链，剩下只能由 NRD 自己回答"是哪一道校验在拒"。与其在外面继续
-    // 猜，不如把它自带的 16 视口铺到屏幕上直接读。
-    //
-    // 布局是 4 列 x 4 行（NRD README "VALIDATION LAYER"，行从屏幕上方往下数）：
-    //   0 = 世界空间网格   1 = 线性粗糙度      2 = 线性 viewZ     3 = MV 误差
-    //   4 = 世界空间法线   7 = 虚拟历史量      8 = 漫反累积帧数  11 = 镜面积累帧数
-    //   12 = 漫反命中距离  15 = 镜面命中距离
-    // 其中只有 2 / 3 / 8 与本次问题相关，其余当参考。
-    //
-    // 读法要点：
-    //   视口 3 是 (IN_MV 推出的上一帧位置) 与 (NRD 用自身矩阵推出的期望位置) 之
-    //   差，单位是像素，画在 R/G 通道。静止时应当接近全黑；**相机移动时若整片
-    //   非 0 或出现洋红**，说明我们喂的 MV 与 NRD 的矩阵不自洽 —— 那就是拒史点。
-    //   视口 2 用小字标着 "UNITS"，绿=正/蓝=负；整屏红 = 全被判为超出
-    //   denoisingRange(60000)，说明 viewZ 的量纲或符号写错了。
-    //
-    // 注意本视口绕过了色调映射（RP-6.5 之后的 SDR post pass 会再处理一次），
-    // 所以颜色可能被压暗；判读色相即可。
     imageStore(image, pixel, vec4(imageLoad(nrdValidationImage, pixel).rgb, baseColor.a));
 #elif NRD_COMPOSITE_DEBUG == 7
-    // =====================================================
-    // 2026-09-29：把 NRD 调试层里的**单个视口放大**，左右分屏各放一个。
-    //
-    // 为什么不用 DEBUG==5 的整张 16 宫格：4x4 缩到 1/4 尺度后判读会失真 ——
-    // 视口 3「非 0 的占比」看不出量级，视口 8 的累积帧数色阶里 6-16 帧与 1-2 帧
-    // 几乎同色。而本次要判的恰恰就是这个差值（宿主注释记录：14:5x 时视口 8 实测
-    // 6~16 帧，现在顶部色带读到的却是 1-2 帧，两个仪器打架）。
-    // 这里每个视口按约 2 倍放大铺满半屏，色阶可读。
-    //
-    // 视口编号（行列都从屏幕左上起算）：index = row*4 + col
-    //   8 = 漫反累积帧数（row 2, col 0）—— 直接回答"历史到底停在几帧"
-    //   3 = IN_MV 与期望 MV 之差（row 0, col 3）—— 洋红=疑似带抖动、蓝=出屏
-    //   0 = 世界网格 + 两个 mini 视口（抖动样本是否落在 [-0.5,0.5] 像素内）
-    //   2 = 线性 viewZ（绿=正、蓝=负、红=超出 denoisingRange）
-    // 编译期选择：-DNRD_COMPOSITE_DEBUG_VP_LEFT / _RIGHT（默认 8 / 3）
-    // =====================================================
 #ifndef NRD_COMPOSITE_DEBUG_VP_LEFT
 #define NRD_COMPOSITE_DEBUG_VP_LEFT 8
 #endif
@@ -539,10 +293,8 @@ void main()
             ? NRD_COMPOSITE_DEBUG_VP_RIGHT
             : NRD_COMPOSITE_DEBUG_VP_LEFT;
 
-        // 4x4 宫格里该视口的左上角
         const ivec2 vpOrigin = ivec2((vp % 4) * vpW, (vp / 4) * vpH);
 
-        // 半屏像素 -> 该视口内的局部像素（半屏宽是视口宽的 2 倍）
         const ivec2 local = ivec2(
             (int(pixel.x) - (rightHalf ? halfW : 0)) * vpW / halfW,
             int(pixel.y) * vpH / screenH
@@ -558,27 +310,6 @@ void main()
         );
     }
 #elif NRD_COMPOSITE_DEBUG == 6
-    // 2026-09-28：看**我们自己写出去的 IN_MV**，以及 cameraUBO 的 historyValid。
-    //
-    // 为什么还需要这个：NRD 的视口 3 把结果压成"洋红=疑似带抖动 / 蓝=出屏"两档，
-    // 幅度信息丢了。而本轮已经把另外两道重投影闸门排除掉了（见宿主侧
-    // disocclusionThreshold 的注释）：
-    //   * 平面距离闸门：GetDisocclusionThreshold 里有 saturate()，阈值放到 0.5 时
-    //     对 NoV<0.5 的像素早已顶到上限 frustumSize —— 等于测了天花板，没变化。
-    //   * 法线闸门：REBLUR_ALMOST_ZERO_ANGLE = cos(89°) ≈ 0.017，要两根法线几乎
-    //     垂直才会失败，不可能是我们的瓶颈。
-    // 于是只剩一道二进制、且与阈值无关的闸门：IsInScreenBilinear(smbPixelUv) ——
-    // 重投影落点跑到上一帧矩形之外就直接拒历史。**这正好对得上"大幅度移动视角"**：
-    // 快速转视角时位移最大，一旦 IN_MV 偏差偏大或该帧被写成 0，落点就会整屏出界。
-    //
-    // 编码（刻意做成不可能误读的三态）：
-    //   整屏纯蓝 (0,0,1)      => 该帧 historyValid == 0，shader 把 IN_MV 写成了 0
-    //                             （即"根本没做重投影"，不是"没动"）
-    //   其余                  => R = |mv.x| 像素/20，G = |mv.y| 像素/20，B = 0.25
-    //                             黑色 = 无位移；亮红/黄 = 位移很大
-    // 判读：大幅度转视角时若出现大片纯蓝 => 根因是 historyValid 在快速移动时塌了；
-    //       若一直是黑/暗且无明显位移 => MV 本身没写出去，往上游查；
-    //       若有明显的红/黄但视口 3 报"出屏" => MV 数值对不上 NRD 的期望口径。
     {
         const vec2 mvValue = imageLoad(nrdMotionDebugImage, pixel).xy;
 
@@ -588,24 +319,10 @@ void main()
         }
         else if(any(isnan(mvValue)) || any(isinf(mvValue)))
         {
-            // 2026-09-28 23:1x 补丁：0 与 NaN 在原编码下显示相同（都是黑+蓝灰底），
-            // 而 reproject 侧的判决实验（v2 区1 无条件接受仍黑）要求把这两种
-            // 状态分开。NaN/Inf 显式涂洋红。
             imageStore(image, pixel, vec4(1.0, 0.0, 1.0, baseColor.a));
         }
         else
         {
-            // =====================================================
-            // 2026-09-28 23:3x 左右分屏矩阵差诊断：rgen 侧（RESTIR_MV_MATRIX_DIAG
-            // 诊断版把同一编码写进 mv 图）与 composite 侧（直接读 UBO）同屏对比。
-            //   左半屏 = rgen 时刻（mv 图直读，已是 x=角/30、y=位移/0.5）
-            //   右半屏 = composite 时刻（UBO 现算，同一编码）
-            // 判读：转动视角时左右不同 ⇒ UBO 在 GPU 执行期间被 CPU 二次覆写
-            // （持久映射无同步的时序竞态）；左右相同且 ≈0 而 mv 探针仍巨大
-            // ⇒ 另有来源。
-            //   R = 旋转角/30°，G = 位移/0.5 格，B = 0.25 底
-            //   纯蓝 = historyValid==0；左半屏洋红 = mv 是 NaN/Inf
-            // =====================================================
             const bool rgenSide = pixel.x < (renderSize.x / 2);
 
             if(rgenSide)
@@ -660,13 +377,6 @@ void main()
         }
     }
 #elif NRD_COMPOSITE_DEBUG == 8
-    // =====================================================
-    // 2026-09-29 MV 读回探针显示（binding 57）——离散色阶版。
-    //
-    // 左半屏 = mv.x，右半屏 = mv.y（渲染像素，见 rt_restir_final.rgen binding 57）。
-    // 色标含义见上方 DEBUG==8 的注释；核心是把"量级"编成**色相**，这样色调映射
-    // 只改明暗不改色相，读数是稳的。
-    // =====================================================
     {
         const vec4 mvProbe = imageLoad(nrdMvProbeImage, pixel);
         const float probeState = mvProbe.w;
@@ -716,35 +426,6 @@ void main()
         imageStore(image, pixel, vec4(probeColor, baseColor.a));
     }
 #elif NRD_COMPOSITE_DEBUG == 9
-    // =====================================================
-    // 2026-09-29 P0 仪器读数屏（本项目私有）。
-    //
-    // 前提：NRD 侧打开了 REBLUR_Config.hlsli 的 NRD_DIAG_DIFF_W（!= 0）。
-    // 此时 OUT_DIFF_RADIANCE_HITDIST 的 .w（binding 53）不再是历史长度，
-    // 而是 P0 诊断量。具体是哪一个由**运行时**环境变量 RTX_NRD_DIAG_DIFF_W 决定
-    // （宿主灌进 NRD 的 gDebug）：
-    //   1 = 4tap × sizeQuality（合成）   2 = sizeQuality（地板 0.1 那个）
-    //   3 = 仅 4tap 遮挡                 4 = 历史长度 / 63（归一化对照）
-    // 本 shader 分不出当前是哪一档，会话对应关系看 rt_debug.log 的 "[NRD-1 DIAG]"。
-    //
-    // 左半屏 = 诊断量的离散色阶（下）
-    // 右半屏 = NRD validation 视口 8（漫反累积帧数），放大到半屏，与左半屏同一套
-    //          映射 —— 一张截图同时给出「凶手是谁」和「这一片的帧数是多少」。
-    //
-    // 色阶（诊断量 ∈ [0,1]）：
-    //   红   < 0.105  ← ★ 就是它：撞在 sizeQuality 地板 0.1 上，或 4-tap ≈ 0
-    //   橙   0.105 ~ 0.2
-    //   黄   0.2 ~ 0.5
-    //   绿   0.5 ~ 0.95
-    //   白   > 0.95
-    //   品红 = 值不在 [0,1]（NaN 或 NRD 没写这个像素留下的残余），不是"塌陷"
-    //
-    // 判读（W=2 与 W=3 各截一张、同一姿态）：
-    //   W=2 大片红、W=3 不红  ⟹ 凶手是 sizeQuality 地板   ⟹ 进 P1
-    //   W=3 大片红、W=2 不红  ⟹ 凶手是 4-tap 遮挡拒史      ⟹ 进 P2
-    //   两者都红              ⟹ 两条都在压，先修更便宜的 P1
-    //   两者都不红而 W=1 红   ⟹ 只有乘性叠加才越线，按主导项修
-    // =====================================================
     {
         const int screenW = max(1, int(renderSize.x));
         const int screenH = max(1, int(renderSize.y));
@@ -756,7 +437,6 @@ void main()
 
         if(rightHalf)
         {
-            // 右半屏 = validation 视口 8。映射与 DEBUG==7 逐字相同（那里已上机验证过）。
             const int vp = 8;
             const ivec2 vpOrigin = ivec2((vp % 4) * vpW, (vp / 4) * vpH);
             const ivec2 local = ivec2(
@@ -884,50 +564,14 @@ void main()
         vec4(debugWrite, baseColor.a)
     );
 #else
-    // =====================================================
-    // 2026-09-29 诊断叠层：屏幕**顶部 8 行**画"本列平均历史长度"色带。
-    //
-    // 为什么加：之前"历史长度"与"真实画面"只能二选一（DEBUG==4/5 会把整屏换掉），
-    // 于是每轮都要牺牲一次重启。这条色带让两者同时可见：
-    //   黑 0 帧 | 暗红 1-2 | 橙 3-6 | 绿 7-15 | 青 16-31 | 白 >=32 帧
-    // 数据源：NRD 输出的 .w（宿主已开 returnHistoryLengthInsteadOfOcclusion，
-    // 见 VulkanCore.cpp 的 NRD_LOCAL_DI_RETURN_HISTORY_LENGTH 注释），每列在竖直
-    // 方向等距抽 32 个点求均值。
-    // 判读：整条偏青/白 = 历史按满量程跑；成片黄/红 = 历史被压短（噪点会留在画面上）。
-    // 关闭：-DNRD_COMPOSITE_HISTORY_STRIP=0。
-    // =====================================================
 #ifndef NRD_COMPOSITE_HISTORY_STRIP
 #define NRD_COMPOSITE_HISTORY_STRIP 1
 #endif
 #if NRD_COMPOSITE_HISTORY_STRIP
-    // ★ DEBUG==7 下**故意保留**顶部色带：左半屏是 NRD 视口 8（直读 gIn_Data1），
-    // 顶部 8 行是本色带（走 OUT_DIFF_RADIANCE_HITDIST.w）。两者读的是同一个
-    // data1.x 的两条不同路径，而它们此前给出了不一致的读数（视口 8 记录 6~16 帧、
-    // 色带读到 1-2 帧）——同一帧里并排看，就能判定是"路径差异"还是"时序差异"。
     if(pixel.y < 8)
     {
-        // ★ 2026-09-29 16:xx 第三版。用户实测："两条颜色一直没变，第一条灰第二条红"
-        // —— 该读数只有一个解释：喂给 NRD 的 IN_DIFF 全屏 ≈ 0。
-        //
-        // 但 binding 52 (IN_DIFF) 与 binding 41 (reservoir.sampleAndAreaPdf) 是
-        // **同一个 currentLighting 在同一个 pass 里**写出的
-        // （rt_restir_final.rgen:2558 写 41、2639+ 写 52），所以可以用 41 做交叉验证，
-        // 把「我这边的读/写坏了」和「DI 真的是 0」彻底分开：
-        //
-        //   第 1 条（Y 0..3）= 历史长度（**不加信号门**，恢复历史读数）
-        //                     品红 = 该列 IN_DIFF 全 0 **但** binding 41 有值
-        //                            ⇒ 是写/读 binding 52 的问题，DI 其实活着
-        //                     灰   = NRD 在该列没有处理过任何像素
-        //   第 2 条（Y 4..7）= R  IN_DIFF 为 0 的比例
-        //                      G  IN_DIFF 亮度均值（黑 = 无信号）
-        //                      B  binding 41 亮度均值（同一物理量的另一处读出）
-        //
-        // 判读：
-        //   G≈0 且 B>0  ⇒ binding 52 读不到（写/描述符问题），DI 其实活着
-        //   G≈0 且 B≈0  ⇒ 本地光 DI 真的是 0，整条链没在产出（上游问题）
         const int stripStep = max(1, renderSize.y / 128);
-        const float NRD_SKIP_VIEWZ = 60000.0; // == CommonSettings::denoisingRange
-
+        const float NRD_SKIP_VIEWZ = 60000.0;
         float historyAcc = 0.0;
         float historyTaps = 0.0;
         float inLumaAcc = 0.0;
@@ -946,8 +590,6 @@ void main()
                 stripTap
             ).x;
 
-            // 同批描述符、由同一个 rgen 写、值几乎不可能为 0 的两个对照量。
-            // 视深：有效面是真实深度，天空/无效面是 65504 哨兵 —— 两者都非 0。
             const float inViewZ = imageLoad(nrdInViewZImage, stripTap).r;
             const vec3 inNormalPacked = imageLoad(
                 nrdInNormalRoughnessImage,
@@ -979,9 +621,6 @@ void main()
         {
             if(viewZZero / safeTaps > 0.5)
             {
-                // ★ 青色 = 这一批 image（50/51/52）**整体读到空**。
-                // 视深在这条链里永不可能是 0（有效面=真实深度，天空=65504），
-                // 所以读到 0 只可能是描述符/写入通路出问题，与 currentLighting 无关。
                 imageStore(image, pixel, vec4(0.0, 0.85, 1.0, baseColor.a));
             }
             else if(historyTaps < 1.0)
@@ -1023,10 +662,6 @@ void main()
         }
         else
         {
-            // 第 2 条（下 4 行）：
-            //   R = IN_DIFF(52) 为 0 的比例        （红 = 那张图是空的）
-            //   G = IN_NORMAL_ROUGHNESS(51) 的均值 （绿 = 那张图有内容）
-            //   B = IN_VIEWZ(50) 读到 0 的比例      （蓝 = 那张图是空的）
             const vec3 signalColor = vec3(
                 inUnlit / safeTaps,
                 min(normalAvg * 2.0, 1.0),

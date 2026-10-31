@@ -1,14 +1,5 @@
 #version 460
 
-// RR-7 auto exposure: log2-luminance histogram.
-//
-// One invocation reduces one 8x8 tile of the DLSS output to a single log2
-// luminance sample and bins it.  Reducing inside the thread keeps the atomic
-// traffic at width*height/64 while every pixel still contributes, so the
-// histogram is stable across frames without a full-resolution atomic pass.
-//
-// The bin layout is shared with rr_ae_adapt.comp.  Both files must agree on
-// the EV range and the bin count or the exposure will be misread.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -21,7 +12,6 @@ buffer AeHistogram
     uint bins[256];
 };
 
-// 16 EV of log2(luminance), with 0 EV == SDR reference white.
 const float AE_LOG2_MIN = -10.0;
 const float AE_LOG2_MAX = 6.0;
 const uint AE_BIN_COUNT = 256u;
@@ -33,8 +23,6 @@ void main()
 {
     ivec2 size = imageSize(rrOutputImage);
 
-    // The tile stride is a compile-time constant, so express it as an int
-    // literal rather than round-tripping the float.
     ivec2 origin = ivec2(gl_GlobalInvocationID.xy) * 8;
 
     if(origin.x >= size.x || origin.y >= size.y)

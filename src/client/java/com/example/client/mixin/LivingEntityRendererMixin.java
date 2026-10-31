@@ -83,11 +83,6 @@ public abstract class LivingEntityRendererMixin {
         ci.cancel();
     }
 
-    // Orion semantics: the camera entity is captured like any other
-    // entity, but in first person it carries the self-instance mask so
-    // primary camera rays (0x01) never hit it while secondary rays
-    // (reflections/shadows/GI, 0xff) still do.  Third person keeps the
-    // ordinary entity path, where primary rays see the player normally.
     private static boolean rtx$isFirstPersonLocalPlayer(LivingEntityRenderState state) {
         boolean isAvatar = state instanceof AvatarRenderState;
         Minecraft minecraft = Minecraft.getInstance();

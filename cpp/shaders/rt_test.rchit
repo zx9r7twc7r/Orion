@@ -2154,7 +2154,7 @@ void main()
        (cam.perfAblationStage.x >= 28u &&
         cam.perfAblationStage.x <= 30u))
     {
-        payload.albedo = vec3(0.18);
+        payload.albedoPacked = packAlbedoUnorm(vec3(0.18));
         payload.normal = -normalize(gl_WorldRayDirectionEXT);
         payload.roughness = 0.5;
         payload.f0Metal = 0.0;
@@ -2163,16 +2163,6 @@ void main()
         payload.pomSelfShadow = 1.0;
         payload.pomMicroOcclusion = 1.0;
         payload.glassAlpha = 1.0;
-        payload.prevOffsetX = 0.0;
-        payload.prevOffsetY = 0.0;
-        payload.prevOffsetZ = 0.0;
-        payload.lastGlassFaceT = -1.0;
-        payload.glassFaceBudget = 0.0;
-        payload.glassInside = 0.0;
-        payload.glassEntryT = -1.0;
-        payload.transmittanceAccum = vec3(1.0);
-        payload.glassSurfaceWeightAccum = vec3(0.0);
-        payload.glassBlendAlpha = 1.0;
         payload.state = makeHitState(
             getRayPurpose(payload.state), RT_HIT_OPAQUE,
             RT_WATER_NONE, false, false, 0u);

@@ -192,13 +192,8 @@ bool glassChainIsTranslucentMaterial(float materialId)
 // =====================================================
 void glassChainBegin(inout HitPayload payload)
 {
-    payload.transmittanceAccum = vec3(1.0);
-    payload.glassInside = 0.0;
-    payload.glassEntryT = -1.0;
-    payload.glassFaceBudget = 0.0;
     // 加性口径的链内表面权重（见 hit_payload.glsl 与文件顶部）。
     // 每条透射链必须从这里起步，否则会读到上一条射线残留的权重。
-    payload.glassSurfaceWeightAccum = vec3(0.0);
 }
 
 // 单事件透射率：与 main 侧（rt_test.rgen 的物理薄片段）和
@@ -240,21 +235,17 @@ bool glassChainShouldAbort(vec3 accumulatedTransmittance, float faceBudget)
 // 出射面（同一体的第二个面）返回 false —— 一个体只乘一次。
 bool glassChainAcceptEntry(inout HitPayload payload, float hitT)
 {
-    bool wasInside = payload.glassInside > 0.5;
+    bool wasInside = 0.0 > 0.5;
     bool regionBreak =
-        payload.glassEntryT >= 0.0 &&
-        hitT - payload.glassEntryT > ORION_GLASS_CHAIN_REGION_BREAK;
+        -1.0 >= 0.0 &&
+        hitT - -1.0 > ORION_GLASS_CHAIN_REGION_BREAK;
 
     if(!wasInside || regionBreak)
     {
-        payload.glassInside = 1.0;
-        payload.glassEntryT = hitT;
         // 预算按"面"记：一次进入 = 进 + 出两面。
-        payload.glassFaceBudget = payload.glassFaceBudget + 2.0;
         return true;
     }
 
-    payload.glassInside = 0.0;
     return false;
 }
 

@@ -1,45 +1,16 @@
-// ============================================================================
-// spherical_harmonics.glsl —— RTX Remix 球谐辐照度的**逐行移植**
-//
-// 原文：_ref/dxvk-remix/src/dxvk/shaders/rtx/concept/light/spherical_harmonics.slangh
-//        （全文 177 行，2026-10-27 逐行对照翻译）
-//       颜色变换取自 utility/color.slangh:137-160（rgbToYCoCg / yCoCgToRGB 的矩阵）
-//
-// 为什么只有 4 个系数：Remix 的 volume radiance cache 用**亮度 L0+L1 的 2 阶 SH**
-// 加一个**标量色度**（CoCg），不是 9 阶全 SH。原文注释（:22-26）：
-//   "stores luminance as 2nd order SH, with average chrominance as scalar"
-//   shY = (L[1,1], L[1,-1], L[1,0], L[0,0])
-// 所以每 froxel 只占 6 个浮点（float4 + float2），两张 3D 纹理即可。
-//
-// 与原文的对应关系（函数名删去 Slang 的 struct 方法语法，公式逐字保留）：
-//   rgbToYCoCg / yCoCgToRGB      → shRgbToYCoCg / shYCoCgToRgb   (color.slangh:137,148)
-//   evalShBasis                  → shEvalBasis                   (:43-50)
-//   addRadiance                  → shAddRadiance                 (:66-74)
-//   getIrradiance                → shGetIrradiance               (:77-81)
-//   resolveColorToDiffuse        → shResolveColorToDiffuse       (:84-99, Frostbite p.49)
-//   scale / hanningFilter        → shScale / shHanningFilter      (:101-112)
-//   HarmonicsHelpers::lerp       → shLerp                        (:118-124)
-//   HarmonicsHelpers::load3D     → shLoad3D                      (:142-148)
-//   HarmonicsHelpers::loadFiltered3D → shLoadFiltered3D          (:158-164)
-//   HarmonicsHelpers::store3D    → shStore3D                     (:172-176)
-// ============================================================================
 #ifndef SPHERICAL_HARMONICS_GLSL
 #define SPHERICAL_HARMONICS_GLSL
 
-// 原文 :5-10。注释里的数值是原文自带的。
-#define SH_C0 (0.5 * sqrt(1.0 / 3.14159265359))   // ~0.282095
-#define SH_C1 (0.5 * sqrt(3.0 / 3.14159265359))   // ~0.488603
-// 仅用于带 m=0 的 zonal 系数（原文保留，本文件暂无消费者）。
-#define SH_C2 (0.25 * sqrt(5.0 / 3.14159265359))  // ~0.315392
-#define SH_C3 (0.25 * sqrt(7.0 / 3.14159265359))  // ~0.373176
-
+#define SH_C0 (0.5 * sqrt(1.0 / 3.14159265359))
+#define SH_C1 (0.5 * sqrt(3.0 / 3.14159265359))
+#define SH_C2 (0.25 * sqrt(5.0 / 3.14159265359))
+#define SH_C3 (0.25 * sqrt(7.0 / 3.14159265359))
 // 原文 :23-27。GLSL 没有 Slang 的 interface，直接一个结构体。
 struct SphericalHarmonic
 {
-    vec4 shY;    // 亮度： (L[1,1], L[1,-1], L[1,0], L[0,0])
-    vec2 cocg;   // 非方向性色度
+    vec4 shY;
+    vec2 cocg;
 };
-
 // 原文 utility/color.slangh:137-146
 //   matrix(0.25, 0.5, 0.25,   0.5, 0.0, -0.5,   -0.25, 0.5, -0.25) * color
 vec3 shRgbToYCoCg(vec3 color)
@@ -88,7 +59,6 @@ void shAddRadiance(inout SphericalHarmonic sh, vec3 color, vec3 dir)
     const vec3 YCoCg = shRgbToYCoCg(color);
     const float Y = YCoCg.x;
 
-    // 原文：if(any(isnan(dir))) dir = 0..xxx;
     if(any(isnan(dir)))
     {
         dir = vec3(0.0);
@@ -112,10 +82,8 @@ vec3 shResolveColorToDiffuse(SphericalHarmonic sh, vec3 N, float cosHalfAngle)
     float Y = 0.25 * sqrt(4.0 * 3.14159265359) * sh.shY.w +
               0.5 * sqrt(4.0 * 3.14159265359 / 3.0) * d;
 
-    // 弯折法线的修正
     Y *= (2.0 * 3.14159265359 * (1.0 - cosHalfAngle)) / 3.14159265359;
 
-    // 亮度被改过，色度按比例跟上去
     const float modifier =
         (sh.shY.w == 0.0 || Y == 0.0) ? 0.0 : (SH_C0 * Y / sh.shY.w);
     const vec2 adjCoCg = sh.cocg * modifier;
@@ -185,14 +153,5 @@ SphericalHarmonic shLoadFiltered3D(
     return result;
 }
 
-// 原文 HarmonicsHelpers::store3D（:172-176）
-//
-// ⚠ GLSL 与 Slang 的一处语法差异：image 参数不带格式限定符时，glslang 要求
-//   **同一个函数内所有 image 参数格式一致**（原文的 RWTexture3D<float4>/<float2>
-//   是两种格式，Slang 允许）。为不强迫两张 3D 纹理同格式，写端不进本头文件，
-//   由调用方直接写：
-//       imageStore(volumeShY,  coordinate, sh.shY);
-//       imageStore(volumeCoCg, coordinate, vec4(sh.cocg, 0.0, 0.0));
-//   读端（shLoad3D / shLoadFiltered3D）用 sampler3D，没有这个限制，保留在头里。
 
-#endif // SPHERICAL_HARMONICS_GLSL
+#endif

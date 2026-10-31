@@ -41,13 +41,10 @@ public class VulkanCameraMixin {
     private final Matrix4f tempProjInv = new Matrix4f();
     private final Matrix4f tempView = new Matrix4f();
     private final Matrix4f rotInv = new Matrix4f();
-    /** 视图旋转的逆（view → world），转交 EntityRtCapture 旋第一人称手部顶点。 */
     private final float[] handRotationArray = new float[16];
 
     private int frameCount = 0;
 
-    // 2026-10-17 实体交互波：掉落物入水沿 → 一次性脉冲；船 → 持续移动波源。
-    // 状态按实体 id 记"上一帧是否在水中"，跨世界用身份比较清空（id 会复用）。
     private static final int WATER_ENTITY_MAX_BOATS = 8;
     private static final double WATER_ENTITY_RANGE_SQR = 24.0 * 24.0;
     private final java.util.Map<Integer, Boolean> waterEntityWasInWater =
@@ -55,8 +52,6 @@ public class VulkanCameraMixin {
     private Level waterEntityLastLevel = null;
     private final float[] waterBoatData = new float[WATER_ENTITY_MAX_BOATS * 5];
 
-    // Per-frame hot path: resolve the debug flag once instead of walking the
-    // system property table up to five times per frame.
     private static final boolean RTX_DEBUG =
             Boolean.getBoolean("rtx.debug");
 
@@ -88,8 +83,6 @@ public class VulkanCameraMixin {
         BlockPos cursor = playerBlock;
         FluidState state = this.minecraft.level.getFluidState(cursor);
 
-        // A swimming player's feet can be on the boundary between two blocks.
-        // Search the immediately adjacent lower cells before giving up.
         if (!state.is(FluidTags.WATER)) {
             cursor = cursor.below();
             state = this.minecraft.level.getFluidState(cursor);
@@ -104,9 +97,6 @@ public class VulkanCameraMixin {
         BlockPos topWaterBlock = cursor;
         FluidState topWaterState = state;
 
-        // This is intentionally a world query rather than a camera estimate.
-        // 128 blocks covers normal ocean, river and cave columns while keeping
-        // the bounded client-side search safe for every render frame.
         for (int step = 0; step < 128; ++step) {
             BlockPos above = topWaterBlock.above();
             FluidState aboveState = this.minecraft.level.getFluidState(above);
@@ -220,11 +210,6 @@ public class VulkanCameraMixin {
         CameraRenderState cameraState =
                 this.gameRenderState.levelRenderState.cameraRenderState;
 
-        // 2026-10-24 相机路径（见 com.example.client.bench.CameraPathDriver）。
-        // 放在这里、而不是另开一个注入点，是因为这一刻的位姿就是 native 即将收到的
-        // 那一份（下面 306 行起的 viewInvArray / handRotationArray 全部由它派生），
-        // 录下来的路径因此与当时的画面严格对应；回放替换的也只是这一份，不碰玩家本体、
-        // 物理与区块加载。
         final com.example.client.bench.CameraPathDriver.Pose replayPose =
                 com.example.client.bench.CameraPathDriver.frame(
                         cameraState.pos,
@@ -244,8 +229,6 @@ public class VulkanCameraMixin {
             );
         }
 
-        // 回放帧用路径位姿重建视图旋转（公式与 Camera#getViewRotationMatrix 逐字一致，
-        // 见 CameraPathDriver.Pose#viewRotationMatrix）；非回放帧仍是相机自己的矩阵。
         Matrix4fc viewRotationMatrix =
                 replayPose == null
                         ? cameraState.viewRotationMatrix
@@ -255,18 +238,11 @@ public class VulkanCameraMixin {
                 cameraState.projectionMatrix;
 
 
-// =====================================================
-// RR-3.4
-// Minecraft 26.2 camera parameters for Streamline
-// =====================================================
 
-// Minecraft 26.2 world projection near plane.
         float cameraNear =
                 Camera.PROJECTION_Z_NEAR;
 
 
-// CameraRenderState already contains the real
-// world-render far plane.
         float cameraFar =
                 cameraState.depthFar;
 
@@ -321,16 +297,9 @@ public class VulkanCameraMixin {
 
         tempViewInv.get(viewInvArray);
 
-        // 2026-10-06：把相机视图旋转的逆交给实体捕获。第一人称手的顶点是**视图
-        // 空间**的（手臂相对眼睛的偏移，无相机旋转），而实体层是"世界朝向 + 相机
-        // 相对"，所以手上传前必须用这一步旋转把它旋到世界朝向（见
-        // EntityRtCapture.captureVertex）。rotInv 就是 viewRotationMatrix 的逆。
         rotInv.get(handRotationArray);
         EntityRtCapture.setHandRotation(handRotationArray);
 
-        // 2026-10-18：把本帧相机世界原点交给实体捕获，供末地门投影 UV 把顶点
-        // 从"世界减相机"还原到世界（否则贴图随相机滑动）。与上面喂 native 的
-        // viewInvArray 平移分量同源（都是 cameraState.pos）。
         EntityRtCapture.setCameraOrigin((float) pos.x, (float) pos.y, (float) pos.z);
 
         tempProjInv
@@ -342,7 +311,6 @@ public class VulkanCameraMixin {
 
         if ((frameCount % 60) == 0 && RTX_DEBUG) {
 
-            // 对应 RayGen 中屏幕中心 d=(0,0)
             org.joml.Vector4f target =
                     new org.joml.Vector4f(
                             0.0f,
@@ -399,8 +367,6 @@ public class VulkanCameraMixin {
             );
         }
 
-        // Minecraft 26.2 replaced Level#getDayTime with
-        // Level#getOverworldClockTime. Keep the phase in [0, 1).
         float overworldTimePhase =
                 this.minecraft.level == null
                         ? 0.0f
@@ -409,19 +375,12 @@ public class VulkanCameraMixin {
                         24000L
                 ) / 24000.0f;
 
-        // Debug-only probe: guard with RTX_DEBUG like every other log in this
-        // mixin.  System.err is a synchronized auto-flushing stream, so the
-        // unguarded write used to cost a frame spike every 64th frame even in
-        // normal play.
         if (RTX_DEBUG && (frameCount % 64) == 0) {
             System.err.println(
                     "[RTX-TIME] phase=" + overworldTimePhase
             );
         }
 
-        // These values are intentionally forwarded without any visual policy.
-        // The native UBO is the sole owner of the GPU representation, and the
-        // atmosphere stages that consume it will be added separately.
         float rainLevel = 0.0f;
         float thunderLevel = 0.0f;
         float dimensionCode = 0.0f;

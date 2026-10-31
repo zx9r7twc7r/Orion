@@ -1225,7 +1225,7 @@ void main() {
 #else
     // 2026-10-05 末地地球盘。位置：星空之后、日月盘之上 —— 地球是实体，会挡住
     // 它后面的日盘（全食正是这个几何）。
-    // 用 mix 而不是 return：main 末尾还要写 payload.albedo，早退会漏掉它。
+    // 用 mix 而不是 return：main 末尾还要写 unpackAlbedoUnorm(payload.albedoPacked)，早退会漏掉它。
     if(isEnd)
     {
         vec3 earthVec = rayDir;   // miss 射线的方向就是视线方向
@@ -1368,7 +1368,7 @@ void main() {
     // Ordinary sky/environment rays still receive the physical sky colour.
     if((payload.state & 0x7u) != 5u)
     {
-        payload.albedo = clamp(finalColor, 0.0, 2.5);
+        payload.albedoPacked = packAlbedoUnorm(clamp(finalColor, 0.0, 2.5));
     }
     // Deferred mode: these resets happen in the ray-generation dispatcher, which
     // owns the local HitPayload; the identity payload has no such fields.
@@ -1383,7 +1383,4 @@ void main() {
     // 位移留在里面。rgen 侧虽然用 `primaryHitDistance >= 0` 把 miss 排除在外
     // （rmiss 会把 hitDistance 设成 -1.0），但"靠下游判据兜住未初始化值"不该是
     // 唯一防线 —— 这里补齐是零成本的确定行为。
-    payload.prevOffsetX = 0.0;
-    payload.prevOffsetY = 0.0;
-    payload.prevOffsetZ = 0.0;
 }

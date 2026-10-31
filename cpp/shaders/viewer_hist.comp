@@ -1,17 +1,6 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-// ===========================================================================
-// 覆盖度标定用的直方图 pass（诊断工具，只在 --hist 时跑一次）
-//
-// 为什么需要它：覆盖度滑条 = m_norm 的阈值，而 m_norm 的分布取决于 base 体积 +
-// 高度剖面 + 归一化系数。前面靠"改系数→看图"盲拟合了三轮都失败（一次全白、
-// 一次一朵云都没有）。这里直接把 m_norm 分 256 档统计出来，用 CDF 反解滑条，
-// 一次到位，不再猜。
-//
-// 统计对象（与 bevyGetDensity 里**进入 smoothstep 之前**的 m 完全一致）：
-//   m = (bevyCloudMapBase(pos, h) * bevyCloudGradient(h) - OFFSET) * GAIN
-// ===========================================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -57,7 +46,6 @@ void main()
     cfg.bottomHeight = params.layer.x;
     cfg.topHeight = params.layer.y;
 
-    // 在 2×2×2 个 tile 的范围里采样，高度取 0..1 均匀
     float period = 1.0 / (0.00035 * cfg.baseScale);
     vec3 world = (vec3(id) + vec3(0.5)) / vec3(size);
     vec3 localPos = vec3(world.x * 2.0 * period, 0.0, world.z * 2.0 * period);
@@ -68,7 +56,6 @@ void main()
         cfg.topHeight, h), 0.0);
 
     float m = bevyCloudMapBase(pos, h, cfg, atlasTex, atlasSize, baseTex) * bevyCloudGradient(h);
-    // 与 bevyGetDensity 里的归一化保持同一组常数
     m = (m - 0.30) * 2.5;
 
     uint bin = uint(clamp(m, 0.0, 0.9999) * 256.0);

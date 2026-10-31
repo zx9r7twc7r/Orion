@@ -14,18 +14,6 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(value = VulkanInstance.class, remap = false)
 public abstract class VulkanInstanceMixin {
 
-    // =====================================================
-    // 2026-10-15 诊断闸门（默认开；=0 / false 关闭）
-    //
-    // 现场：进程提交量有一条与玩法无关的固定速率增长（约 30MB/s，标题界面就有、
-    // 把帧率限到 30fps 也一点不变、JVM 侧实测干净：Java 堆 committed 恒 536MB、
-    // NMT total 只 +0.2MB/s）。本闸门把"Streamline + NGX"这一块在 Vulkan 设备
-    // 创建之前就摘掉（不调 initStreamlineEarly ⇒ slInit 不跑 ⇒ sl.*/nvngx_* 根本
-    // 不会加载），用于判别那 30MB/s 属不属于这条链。
-    //
-    // **只用于诊断**：关掉之后 FG / DLSS-RR 整条不可用（画面与性能都会退化）。
-    // 写法照 DhFlags.flag()：先读 -D 属性，再读大写环境变量；"0" 与 "false" 都算关。
-    // =====================================================
     private static final String EARLY_INIT_PROPERTY =
             "orion.streamline.earlyInit";
 
@@ -78,9 +66,6 @@ public abstract class VulkanInstanceMixin {
                     "[Mixin] Calling Streamline early init before VulkanInstance body."
             );
 
-            // 2026-10-22（D3）：必须在 initStreamlineEarly 之前决定用哪套 DLL。
-            // 打开时 native 会从 <natives>\sl_debug_dev\ 加载 development 构建
-            // （带 sl.imgui）；目录缺失会自动回退生产构建并打日志。
             NativeVulkan.setStreamlineDevPluginsEnabled(
                     RTXSettingsConfig.isSLDevPluginsEnabled()
             );
@@ -144,10 +129,8 @@ public abstract class VulkanInstanceMixin {
         }
     }
 
-    /**
-     * 在 VulkanDebug.create 被调用前拦截，此时基础扩展已获取，且尚未生成指针缓冲区。
-     * 向 enabledExtensions 集合强制注入 Streamline 必需的实例扩展。
-     */
+    
+
     @Inject(
             method = "<init>(IZZ)V",
             at = @At(

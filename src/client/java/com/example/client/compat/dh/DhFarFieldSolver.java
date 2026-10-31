@@ -42,7 +42,6 @@ import java.util.Locale;
 final class DhFarFieldSolver {
     private static final String TAG = "[DH-MAT]";
 
-    /** 探针：NDC（y 向上）。铺开在中心、四象限与近边缘，覆盖整个视锥。 */
     private static final float[][] PROBES = {
             {0.0f, 0.0f},
             {0.55f, 0.55f},
@@ -53,7 +52,6 @@ final class DhFarFieldSolver {
             {0.0f, 0.88f},
     };
 
-    /** 结构判据两侧的分数差阈值：真正含那一列/行的一侧通常差 1 附近，0.01 足够分开。 */
     private static final float STRUCTURE_TOLERANCE = 0.01f;
 
     private static final float[] DH_INV = new float[16];
@@ -101,10 +99,6 @@ final class DhFarFieldSolver {
                 + " dhFar=" + fmt(param.farClipPlane)
                 + " partialTicks=" + fmt(param.partialTicks) + " ===");
 
-        // ---- 1) 填充顺序：用投影矩阵的结构事实（决定性）-----------------------
-        // 透视投影（reverse-Z，p_clip = P · p_eye）的数学第 4 列恒为 (0,0,-1,0)：
-        // w_clip = -z_eye。所以"哪一组元素长得像 (0,0,±1,0)"就说明数组是按哪一侧落位的。
-        // 分数小 = 那一侧真的存在于数组里。
         float projectColumnScore = max4(
                 Math.abs(DH_PROJ[12]), Math.abs(DH_PROJ[13]),
                 Math.abs(Math.abs(DH_PROJ[14]) - 1.0f), Math.abs(DH_PROJ[15]));
@@ -122,8 +116,6 @@ final class DhFarFieldSolver {
                 + " ⇒ GLSL 变体位 " + (rowMajor ? 2 : 0)
                 + "（" + (rowMajor ? "转置" : "不转置") + "）");
 
-        // 旁证：dhModelViewMatrix 的同一判据。DH 那份平移为 0 ⇒ 通常两边都是 0，
-        // 只用来描述"矩阵长什么样"，不参与判定。
         float mvRowScore = max4(Math.abs(DH_MV[12]), Math.abs(DH_MV[13]),
                 Math.abs(DH_MV[14]), Math.abs(DH_MV[15] - 1.0f));
         float mvColScore = max4(Math.abs(DH_MV[3]), Math.abs(DH_MV[7]),
@@ -134,11 +126,6 @@ final class DhFarFieldSolver {
                 + fmt(DH_PROJ[12]) + ", " + fmt(DH_PROJ[13]) + ", "
                 + fmt(DH_PROJ[14]) + ", " + fmt(DH_PROJ[15]) + ")");
 
-        // ---- 2) 视锥一致性：穷举 4 个变体，取夹角最小的 ------------------------
-        // 变体位与 rgen 的 dhFarNdc/dhFarWorldPoint 完全相同：
-        //   位 0 = NDC 的 y 取反（ySign = -1）
-        //   位 1 = 转置（按行序解释数组）
-        // 两边（DH 与 MC）用同一个解释，这样"哪个变体让两条射线重合"才有意义。
         float bestAgreement = -1.0f;
         int bestVariant = -1;
         float bestWorstAngle = 180.0f;
@@ -208,24 +195,6 @@ final class DhFarFieldSolver {
             return;
         }
 
-        // ---- 2b) 角尺度一致性：mode 12 的"屏幕 UV 直通"到底成不成立 ------------
-        // 09-24 新增。这是"远场内容整体缩放 / 与几何重叠错位（微缩模型）"那条历史的
-        // **量化判据**：mode 12 把 DH 的图按"屏幕 UV 1:1"贴到 miss 像素上，这隐含要求
-        // DH 与 MC 的**投影角尺度相同**（FOV + aspect 一致）。
-        //
-        // 透视投影矩阵里编码角尺度的就是 m00 与 m11：
-        //     m11 = 1 / tan(fovY/2)        （纵向）
-        //     m00 = m11 / aspect           （横向）
-        // 而它们都落在**对角线**上 ⇒ 数组按行序还是列序解释都取同一个元素，
-        // 不需要引入变体，比射线夹角那套更直接。
-        //
-        //   ratio ≈ 1 ⇒ 两套投影角尺度相同 ⇒ 屏幕 UV 直通是精确的；
-        //   ratio ≠ 1 ⇒ 贴出来的内容会整体缩放 ⇒ 必须改成按方向采样 DH 图。
-        //
-        // ⚠ m22/m33 则**允许不同**：DH 的 setDhProjectionMatrix 会改 near/far
-        //    （min(near, 7.5) + overdraw 修正），那是深度不是角尺度，不是错位。
-        // 用途：以后"远场看起来缩了/错了"先看这一行，一条日志就能分清是角尺度问题
-        //      还是几何坐标问题（后者看 [3] 的夹角）。
         final float dhM00 = DH_PROJ[0];
         final float dhM11 = DH_PROJ[5];
         final float mcM00 = MC_PROJ[0];

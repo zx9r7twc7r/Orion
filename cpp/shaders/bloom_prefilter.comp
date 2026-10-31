@@ -1,38 +1,13 @@
 #version 460
 
-// ===============================================================
-// 2026-10-07 泛光（bloom）第 1 步：预滤 + 首次降采样
-//
-// 输入 = g_dlssOutputImage（RR + 远云合成之后的**线性 HDR**，输出分辨率），
-// 输出 = 泛光 mip 链的第 0 级（输出分辨率的 1/2）。
-//
-// 做法是 Jimenez《Next Generation Post Processing in Call of Duty: Advanced
-// Warfare》那一套，四点理由：
-//   1. **13-tap 降采样**（中心 0.5 / 边 0.125×2 / 角 0.03125×4 / 对角 0.125×4 的
-//      加权盒）在只做双线性的情况下就等价于一个 4×4 箱式滤波，比"直接 textureLod
-//      取半分辨率"少一半以上的闪烁；
-//   2. 阈值用**软膝**（soft knee）而不是硬截断：硬截断会让亮度刚好在阈值附近抖动的
-//      高光逐帧"忽亮忽灭"，泛光跟着一跳一跳；
-//   3. 阈值作用在**线性 HDR** 上且此时画面**尚未曝光/尚未色调映射** —— 这是唯一
-//      正确的口径：已曝光值已经被自动曝光缩放，阈值会随 EV 漂移。
-//   4. 每级 mip 都是上一级的 1/2，到最小级时模糊半径足够覆盖整个屏幕（可调）。
-//
-// 阈值/软膝先做成编译期常量（= 1.0 / 0.5）。要暴露成旋钮的话，这里加一个
-// push constant 即可（对齐方式见 rr_sdr_post.comp 的 PostPush 先例）。
-// ===============================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-// 线性 HDR 场景（RR 输出，未曝光）。采样器必须是 linear + clamp，
-// 否则 13-tap 的偏移会跨到屏幕外并产生边缘拖影。
 layout(binding = 0, set = 0) uniform sampler2D bloomSceneImage;
 
-// 泛光 mip 链第 0 级（1/2 分辨率）。
 layout(binding = 1, set = 0, rgba16f) uniform image2D bloomMipImage;
 
-// 线性 HDR 域的阈值：1.0 = 只有超过"白点"的像素才发光。
 const float BLOOM_THRESHOLD = 1.0;
-// 软膝宽度：阈值附近的过渡带，避免高光在阈值上抖动导致泛光逐帧跳。
 const float BLOOM_SOFT_KNEE = 0.5;
 
 // Karis 加权平均用的亮度（避免单个极亮像素主导整块，那是泛光"爬行/颗粒"的主因）。
@@ -64,10 +39,8 @@ void main()
 
     ivec2 srcSize = textureSize(bloomSceneImage, 0);
     vec2 texel = 1.0 / vec2(srcSize);
-    // 目标纹素中心 → 源 uv。目标恰好是源的一半，所以这里落在源的 2×2 中心。
     vec2 uv = (vec2(pixel) + 0.5) / vec2(dstSize);
 
-    // ---- 13-tap（每个 tap 先过软膝阈值，再按盒权重累加）----
     vec3 a = applySoftThreshold(textureLod(bloomSceneImage, uv + texel * vec2(-2.0, -2.0), 0.0).rgb);
     vec3 b = applySoftThreshold(textureLod(bloomSceneImage, uv + texel * vec2( 0.0, -2.0), 0.0).rgb);
     vec3 c = applySoftThreshold(textureLod(bloomSceneImage, uv + texel * vec2( 2.0, -2.0), 0.0).rgb);

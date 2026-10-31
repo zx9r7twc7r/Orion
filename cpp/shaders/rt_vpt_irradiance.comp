@@ -1,20 +1,8 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-// VPT-3.3B.1: deterministic voxel local-light transport.
-// The active solve is emitter -> exact exposed 16^3 x 6 block-face direct
-// irradiance (binding 30).  RayGen reads that exact face directly; neither
-// 9^3 air-probe field participates in visible primary local lighting.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-// Camera UBO (set 0, binding 2).  This pass previously took no camera block at
-// all, but its pipeline layout is g_rayTracingDescriptorSetLayout, whose
-// binding 2 already carries VK_SHADER_STAGE_COMPUTE_BIT, so declaring it costs
-// nothing at bind time.  Only the two tail lanes are actually read.
-//
-// 只声明前缀：std140 的规则是"少声明安全、跳过再继续致命"。这里停在
-// historyPadding1（offset 172），它后面一个字段都不再声明，所以任何已读
-// 偏移都不会滑动。
 layout(binding = 2, set = 0) uniform CameraProperties {
     #include "camera_ubo.glsl"
 } cam;
@@ -32,16 +20,7 @@ const float MAX_LIGHT_DISTANCE = 30.0;
 const float LOCAL_RANGE_PER_EMISSION = 2.0;
 const float LOCAL_FADE_START_FRACTION = 0.60;
 const float INV_PI = 0.3183098861837907;
-// VLI source-word contract from SectionCompilerMixin: RGB555 contains the
-// exact DyeColor and this bit identifies it as a transmissive stained voxel.
 const uint SOURCE_STAINED_GLASS_BIT = 1u << 24u;
-// VLI-2.0 partial occluders.  Class 3 is a block that occludes without being a
-// full cube (slab / stairs / wall / fence / carpet ...).  SectionCompilerMixin
-// stores how much of the cell is free in bits 25..31 (7 bits, 127 = fully
-// transparent) and the DDA attenuates by it instead of treating the whole cell
-// as a solid wall -- otherwise a torch lit a slab's neighbour as if the slab
-// were a full 1x1x1 block.  Keep in lockstep with VLI_PARTIAL_SHIFT /
-// VLI_PARTIAL_MAX in SectionCompilerMixin.
 const uint SOURCE_PARTIAL_TRANSMISSION_SHIFT = 25u;
 const uint SOURCE_PARTIAL_TRANSMISSION_MAX = 127u;
 
@@ -57,9 +36,6 @@ bool vliVoxelOccupied(uint source)
     uint voxelClass = source & 3u;
     return voxelClass == 1u || voxelClass == 3u;
 }
-// Match the confirmed primary stained-glass filter.  Saturation is increased
-// while the strongest transmitted channel remains unchanged, so Binding 30
-// gains colour concentration without receiving extra light energy.
 const float STAINED_GLASS_TRANSMISSION_SATURATION = 3.0;
 
 // =====================================================
@@ -86,14 +62,11 @@ layout(std430, binding = 22, set = 0) readonly buffer PageTable
     uint words[];
 } pageTable;
 
-// Source words occupy [0, 4095]. Direct directional probes occupy the rest.
 layout(std430, binding = 23, set = 0) buffer Pages
 {
     uint words[];
 } pages;
 
-// Final secondary directional probes. RayGen reads this buffer, never the
-// full-resolution surface cache directly.
 layout(std430, binding = 24, set = 0) buffer SecondaryPages
 {
     uint words[];
@@ -104,13 +77,11 @@ layout(std430, binding = 25, set = 0) readonly buffer WorkList
     uint words[];
 } workList;
 
-// xyz = exact world block coordinate; w = emission bits 0..3, type bits 4..6.
 layout(std430, binding = 29, set = 0) readonly buffer CandidatePages
 {
     uvec4 entries[];
 } candidatePages;
 
-// One packed RGB direct irradiance value per exact exposed voxel face.
 layout(std430, binding = 30, set = 0) buffer SurfacePages
 {
     uint words[];
@@ -119,9 +90,8 @@ layout(std430, binding = 30, set = 0) buffer SurfacePages
 layout(push_constant) uniform Dispatch
 {
     uint eventSerial;
-    uint passIndex; // 0 = direct probes, 1 = surface faces, 2 = secondary probes
+    uint passIndex;
 } dispatchInfo;
-
 uint hash32(uint x)
 {
     x ^= x >> 16u;
@@ -181,11 +151,6 @@ uint localVoxelIndex(ivec3 local)
     return uint(local.x) + 16u * (uint(local.z) + 16u * uint(local.y));
 }
 
-// VPT-P2（2026-09-29）：面烘焙可见性 DDA 的单入口 section 页表缓存。
-// solveSurfaceFace 对每个暴露面最多 8 个候选各做一条 ≤96 步的 DDA，每步
-// readVoxel 都要做一次页表哈希；一条 DDA 最多跨 2~3 个 section，把上次查到
-// 的 (section → page) 留在本调用的寄存器里，绝大多数步只剩一次比较。
-// 页表在一次 dispatch 内不变，键值比对保证正确性；缺失的 section 不进缓存。
 bool g_memoPageValid = false;
 ivec3 g_memoSection = ivec3(0);
 uint g_memoPage = 0u;
@@ -256,8 +221,6 @@ vec3 emitterColor(uint typeCode)
     if(typeCode == 2u) return vec3(0.20, 0.75, 1.0);
     if(typeCode == 3u) return vec3(1.0, 0.12, 0.06);
     if(typeCode == 4u) return vec3(1.0, 0.27, 0.05);
-    // 6 = 地狱传送门（紫）。与 rt_test.rgen 的两处同值，见
-    // SectionCompilerMixin.classifyLocalLightType。
     if(typeCode == 6u) return vec3(0.70, 0.28, 1.0);
     return vec3(1.0, 0.82, 0.48);
 }
@@ -417,16 +380,10 @@ vec3 transmissionToEmitter(vec3 origin, ivec3 targetBlock)
         }
         if(voxelClass == 3u)
         {
-            // Slab / stairs / wall / fence: only the occupied part of the cell
-            // blocks.  Attenuate by the free fraction and keep marching, so a
-            // torch behind a half slab lights the far side instead of being
-            // cut off by a phantom full cube.
             transmission *= max(vliPartialTransmission(source), 1.0 / 127.0);
         }
         if((source & SOURCE_STAINED_GLASS_BIT) != 0u)
         {
-            // A lower bound avoids a quantized RGB555 zero turning a coloured
-            // glass path into a hard opaque shadow.
             transmission *= max(decodeVoxelAlbedo(source), vec3(1.0 / 31.0));
         }
     }
@@ -561,8 +518,6 @@ bool traceToSecondarySurface(
         {
             return false;
         }
-        // A partial occluder is a real surface too (the ray lands on the slab
-        // or on the fence bars), so it terminates the march as well.
         if(vliVoxelOccupied(source))
         {
             hitBlock = cell;
@@ -658,9 +613,6 @@ void solveSurfaceFace(uint invocation)
     uint surfaceAddress = page * SURFACE_FACE_WORDS + faceEntry;
     uint source = pages.words[page * PAGE_WORDS + voxelIndex];
     uint emission = (source >> 2u) & 15u;
-    // Partial occluders own a face too: if they were excluded here, a slab or a
-    // fence would bake to zero and then read as unlit by every local-light
-    // consumer, i.e. still "handled as a full block" from the outside.
     if(!vliVoxelOccupied(source) || emission != 0u)
     {
         surfacePages.words[surfaceAddress] = 0u;
@@ -674,10 +626,6 @@ void solveSurfaceFace(uint invocation)
     );
     ivec3 worldBlock = section * 16 + localBlock;
     vec3 faceNormal = cacheAxis(faceIndex);
-    // This cache is direct irradiance.  It must not depend on the optional
-    // Section RGB555 material average: a face with no mesh-albedo sample is
-    // still physically able to receive local light.  RayGen applies the
-    // current hit's real PBR/POM albedo after this lookup.
     if(!faceIsExposed(worldBlock, faceNormal))
     {
         surfacePages.words[surfaceAddress] = 0u;
@@ -685,27 +633,6 @@ void solveSurfaceFace(uint invocation)
     }
 
     vec3 facePosition = vec3(worldBlock) + vec3(0.5) + faceNormal * 0.501;
-    // VPT-P3（2026-09-29）：拐角面的多点烘焙（拐角光斑修复 B）。
-    // 面中心单点可见性在"切向邻居里有遮挡体"的拐角面处与面的大部分区域
-    // 严重不符 —— 半遮挡的面拿到整面亮或整面暗，弹射读取这份量化值时
-    // 表现为拐角处 1×1 的亮斑/暗斑。此类面改在面内 2×2 四个子点
-    // （±0.25，同一 0.501 外推高度）分别求直接辐照度再取平均，把面中心
-    // 采样变成面积分的近似；开阔面维持单点。
-    // 子点都在本面自己的外推气格里，transmissionToEmitter 的 DDA 起步干净。
-    // VPT-P5（2026-09-30 修复）：判据原本读的是**同一层**的切向邻居
-    // （worldBlock + lateralOffset）。在一整片平坦墙面/地面上，同一层的切向
-    // 邻居必然是同材质的实体方块（墙体/地板的延续），于是该判据在任何平坦
-    // 表面上恒真 —— 每一张面都走 4 子点烘焙，烘焙量 ×4，而
-    // solveDirectIrradiance 完全确定（无 RNG），无遮挡面的 4 个子点取值相同，
-    // 这一档纯属浪费。VPT-P3 注释里"开阔面维持单点、烘焙成本不变"从未成立。
-    //
-    // 真正的"半遮挡面"要求横向邻居在**本面所在平面之外**有实体，即
-    // worldBlock + lateralOffset + faceNormal 这一格。同一层的横向邻居
-    // 整体位于面平面之下（地面）或之内（墙面），封闭不了上半球，不是遮挡体；
-    // 而面平面之外那一格为实体时，说明有方块紧贴面侧立着（台阶、檐口、墙角），
-    // 该面的近侧半边半球确实被切掉，面心单点不再代表整面。
-    // 平坦表面此判据恒假，回到单点烘焙；子点仍落在本面自己的外推气格里，
-    // transmissionToEmitter 的 DDA 起步干净。
     ivec3 tangentA = abs(faceNormal.x) > 0.5 ? ivec3(0, 1, 0) : ivec3(1, 0, 0);
     ivec3 tangentB = abs(faceNormal.z) > 0.5 ? ivec3(0, 1, 0) : ivec3(0, 0, 1);
     bool lateralOccluder = false;
@@ -714,10 +641,6 @@ void solveSurfaceFace(uint invocation)
         ivec3 lateralOffset = (side & 1) == 0 ? tangentA : tangentB;
         lateralOffset = (side & 2) == 0 ? lateralOffset : -lateralOffset;
         uint lateralWord;
-        // Partial occluders count here as well: before this class existed a
-        // slab/stair/fence was encoded as class 1 and did trigger the 2x2
-        // sub-point bake, so leaving class 3 out would silently drop the
-        // corner handling for exactly the blocks this change is about.
         if(readVoxel(
             worldBlock + lateralOffset + ivec3(faceNormal),
             lateralWord
@@ -749,8 +672,6 @@ void solveSurfaceFace(uint invocation)
     {
         directIrradiance = solveDirectIrradiance(page, facePosition, faceNormal);
     }
-    // Store irradiance, not reflected radiance.  The primary shader applies
-    // its current PBR/POM albedo exactly once at the hardware-RT hit.
     surfacePages.words[surfaceAddress] = packRGB(directIrradiance);
 }
 
@@ -808,15 +729,10 @@ void solveSecondaryLobe(uint invocation)
                     hitPage * SURFACE_FACE_WORDS +
                     hitVoxelIndex * DIRECTION_COUNT + faceIndex
                 ];
-                // Binding 30 stores direct irradiance.  Convert the hit
-                // face to Lambertian outgoing radiance here only for the
-                // dormant secondary-probe path; VPT-3.3B.1 does not dispatch
-                // this pass or expose it to RayGen.
                 uint hitSource = pages.words[
                     hitPage * PAGE_WORDS + hitVoxelIndex
                 ];
                 vec3 hitAlbedo = decodeVoxelAlbedo(hitSource);
-                // The unit block face subtends approximately area / distance^2.
                 float solidAngleScale = 1.0 / max(hitDistance * hitDistance, 1.0);
                 secondaryRadiance = unpackRGB(packedSurface) *
                     hitAlbedo * INV_PI * solidAngleScale;

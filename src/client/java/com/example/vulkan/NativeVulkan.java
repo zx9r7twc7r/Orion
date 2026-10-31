@@ -15,9 +15,7 @@ import java.util.stream.Stream;
 
 
 
-public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓冲区的物理内存地址，以及顶点的总数量
-
-    // === 核心扩容：注入时序与抖动数据通道 ===
+public final class NativeVulkan {
     public static native void updateCamera(
             float[] viewInvArray,
             float[] projInvArray,
@@ -141,7 +139,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
     public static native boolean setAuroraFlowSpeed(float value);
     public static native boolean uploadVoxyLodAtlas(byte[] pixels, int size, int mipLevels);
 
-    // === 新增：物理句柄暂存区 ===
     public static native void updateAtlas(long imageView, long sampler);
     public static long pendingInstanceHandle = 0L;
 
@@ -367,13 +364,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
 
     public static native float getCloudViewDistance();
 
-    // =====================================================
-    // 2026-10-04 S2/S3：远云的"分辨率与步长"两个解耦旋钮。
-    // 云的 march 分辨率此前恒等于 RR 内部渲染分辨率（超高性能档 707x376 @
-    // 2120x1200），地平线掠射带只剩几个像素高 ⇒ 低档位下糊成一条带；只有平衡档
-    // （采样多 3 倍）才不糊。第二个成因是整段均匀步长（96 步摊到上百 km ≈ 2 km/步）
-    // 把那条带量化成板条。两个旋钮分别针对这两件事，且都与 RR 档位无关。
-    // =====================================================
 
     /** S2：云 march 分辨率下限 = 输出分辨率 × percent%（0 = 关 = 旧行为）。 */
     public static native boolean setCloudResFloorPercent(
@@ -382,11 +372,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
 
     public static native int getCloudResFloorPercent();
 
-    // =====================================================
-    // 2026-10-07 Perf-L10 交错 A/B 实测后的两项 RT 优化
-    //（见 VulkanCore.cpp 的 g_giRoulette / g_sunMarchFarDistance 与 rt_test.rgen 的 stage 11/12）
-    // 两者都写进 CameraUBO.rtSampleParams 的保留 lane（.y / .z），只被 rgen 读。
-    // =====================================================
 
     /** GI 循环俄罗斯轮盘：1 = 开（出厂，省 −7.8ms 整帧）/ 0 = 旧档。 */
     public static native boolean setGiRoulette(
@@ -395,10 +380,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
 
     public static native int getGiRoulette();
 
-    // =====================================================
-    // 2026-10-26 直接光模式 + 稀疏渲染（CameraUBO.sparseParams 尾追加 lane）。
-    // 两者都是运行时原子量 ⇒ 设置界面 Apply 下一帧生效，无新 spv 变体。
-    // =====================================================
 
     /** 直接光模式：0 = 传统 RIS（出厂）/ 1 = RTXDI 式时域 reservoir。 */
     public static native boolean setDirectLightMode(
@@ -459,9 +440,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
 
     public static native int getMotionVectorsEnabled();
 
-    // 2026-10-22（C1）：运动矢量档位 0..3（0=关 1=像素 2=像素y反 3=UV）。
-    // 与 setMotionVectorsEnabled 的区别：这个同时决定 mvecScale 的取值，
-    // 下一帧生效（constants 每帧重填），不需要重启。
     public static native int setMotionVectorScaleMode(int mode);
 
     public static native int getMotionVectorScaleMode();
@@ -534,13 +512,8 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
             float baseFeather,
             float sunlightStrength
     );
-    // phi_fwd 多重散射漫射场 + MS 残量尾巴（2026-10-02）：4 个 lane 一次下发，
-    // 见 RTXSettingsConfig.CloudMsSettings.toParamArray() 与
-    // CameraUBO.cloudMsParams。
-    /**
-     * 2026-10-25 v5（HPVolumeCloud 移植）的 28 项全参数，一次下发。
-     * 顺序必须与 RTXSettingsConfig.CLOUD_HP_LABELS / CameraUBO.hpShapeA..hpMiscA 一致。
-     */
+    
+
     public static native boolean setCloudHpParams(float[] params);
 
     /** 读回原生侧当前生效的 28 项（调试 / UI 同步用），长度不足 28 返回 false。 */
@@ -895,8 +868,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
      */
     public static native boolean setGodRayReprojection(float weight);
 
-    // 2026-10-06 设置清理：setFogBlobModeNative 随 fogBlobs 设置一起从 Java 侧
-    // 删除（密度模型已统一成单一公式，不再有"仅高度衰减 / 团雾"两个分支）。
     public static long pendingPhysicalDeviceHandle = 0L;
     public static long pendingDeviceHandle = 0L;
     public static long pendingQueueHandle = 0L;
@@ -905,7 +876,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
 
     public static native void clearWorldGeometry();
 
-    // === 核心修正：增加 layerId 参数以隔离渲染层级 ===
     public static native void uploadChunk(int sectionX, int sectionY, int sectionZ, int layerId, long vertexPointer, int vertexCount, int vertexStride);
 
     /**
@@ -978,8 +948,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
             int knownMicroTriangleCount
     );
 
-    // VLI source cache: exactly VLI_SOURCE_WORDS uint32 values (32 KiB) for
-    // one 16x16x16 Section.  The declaration matches the native JNI entry.
     public static native void uploadVoxelLightSection(
             int sectionX,
             int sectionY,
@@ -988,23 +956,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
             int voxelBytes
     );
 
-    // =====================================================
-    // RT Local Lights - L2
-    //
-    // lightPointer points to lightCount records.
-    //
-    // Current record layout:
-    // int worldX
-    // int worldY
-    // int worldZ
-    // int emissionLevel
-    // int typeCode
-    //
-    // lightStride = 20 bytes in the current Java producer.
-    //
-    // lightCount == 0 and lightPointer == 0 means:
-    // clear/replace this section with an empty light list.
-    // =====================================================
     public static native void uploadLightSection(
             int sectionX,
             int sectionY,
@@ -1013,10 +964,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
             int lightCount,
             int lightStride
     );
-    // =====================================================
-// RT Local Lights - L6
-// Remove every cached light Section in one unloaded chunk.
-// =====================================================
 
     public static native void removeLightChunk(
             int chunkX,
@@ -1025,15 +972,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
 
     private static boolean loaded = false;
 
-    // =====================================================
-    // Bundled Windows native runtime
-    //
-    // Every DLL under:
-    //   src/main/resources/natives/windows/
-    //
-    // is copied to the user's real Fabric game directory
-    // before rtx_backend.dll is loaded.
-    // =====================================================
 
     private static final String MOD_ID =
             "orion";
@@ -1069,7 +1007,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
         final Path targetDir =
                 gameDir.resolve("shaders");
 
-        // 2026-10-21：固定为生产档目录（延迟档已移除，见上方注释）。
         final String shaderSet = "shaders";
 
         int copied = 0;
@@ -1131,7 +1068,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
             return;
         }
 
-        // 无条件打一行：日志里能直接看出这次跑的是哪一档、哪个 gameDir。
         System.out.println(
                 "[RTX] shaders: set=" + shaderSet
                         + " target=" + targetDir
@@ -1266,9 +1202,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
     public static long currentSwapchainImage = 0;
     public static long currentCommandBuffer = 0;
 
-// =====================================================
-// RT -> Minecraft main target -> GUI composition
-// =====================================================
 
     public static long pendingGuiTargetImage = 0L;
 
@@ -1292,21 +1225,10 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
         rtInjectedToMainTarget = false;
     }
 
-    // 在原有的 uploadTextureAtlasNative 下方追加：
     public static native void updateBindlessDescriptorsNative();
 
-    // 在 NativeVulkan.java 中定义：
-// type: 0 = Albedo (基础色), 1 = Normal (法线), 2 = Specular (高光/粗糙度)
     public static native void setInWorld(boolean inWorld);
 
-    // =====================================================
-    // 2026-10-24 项 1：把原版可见性图的 Section 集合推给 native，
-    // 用于 TLAS 主射线掩码剔除（只清 mask 的 bit0，实例保留给次级射线）。
-    //
-    // coords = [x0,y0,z0, x1,y1,z1, ...]，Section 坐标（不是方块坐标）。
-    // count <= 0 表示本帧没有可见性数据，native 侧会自动关闭剔除。
-    // 调用点见 LevelRendererMixin.rtx$uploadVisibleSections。
-    // =====================================================
     public static native void setVisibleSections(int[] coords, int count);
 
     static {
@@ -1324,20 +1246,10 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
             );
 
 
-            // Extract every bundled Windows DLL to the user's
-            // actual Minecraft/Fabric instance directory first.
             extractBundledDlls(
                     gameDir
             );
 
-            // 2026-10-19：同时释放随包分发的 SPIR-V（shaders/ 目录）。
-            // 着色器由 C++ 通过**文件路径**加载（不是 classpath），
-            // 所以别人装上这个 mod 时必须先落到游戏目录，否则云不渲染。
-            //
-            // ⚠️ 2026-10-20 **必须 try-catch**：这里一旦抛 IOException，
-            // 会中断整个 load()（DLL 都不加载）⇒ 用户看到的就是"原版渲染"。
-            // 有一个用户正是这样（rt_debug.log 只有 1 KB、没有 VK INIT）。
-            // 着色器解压失败顶多让云不渲染，绝不能让整个 RTX 后端陪葬。
             try {
                 extractBundledShaders(
                         gameDir
@@ -1399,12 +1311,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
             loaded = false;
         }
     }
-    // =====================================================
-// No-direct-light ambient brightness
-//
-// range: 0.00 - 1.00
-// default: 0.10
-// =====================================================
 
     public static native boolean setNoDirectLightAmbient(
             float value
@@ -1452,10 +1358,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
 
     public static native void initStreamlineEarly();
 
-    // =====================================================
-// FG-2.6
-// Streamline Vulkan requirements bridge
-// =====================================================
 
     public static native boolean isFGRequirementsReady();
 
@@ -1472,10 +1374,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
     public static native int getFGComputeQueuesRequired();
 
     public static native int getFGOpticalFlowQueuesRequired();
-    // =====================================================
-// FG-2.11
-// Java Vulkan queue plan -> C++ Streamline bridge
-// =====================================================
 
     public static native void setStreamlineQueuePlan(
             int graphicsFamily,
@@ -1487,10 +1385,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
             boolean useNativeOpticalFlow
     );
 
-    // =====================================================
-// FG-3
-// Vulkan Manual Hooking
-// =====================================================
 
     public static native boolean prepareStreamlineVulkan(
             long instance,
@@ -1549,10 +1443,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
     );
 
 
-// =====================================================
-// FG-4.1
-// HUD-less / Final snapshots + binary UI Alpha
-// =====================================================
 
     public static native void setFGBackbufferFormat(
             int vkFormat
@@ -1572,41 +1462,15 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
             long surfaceHandle
     );
 
-    // HDR-2.3: the settings switch, and the surface capability reported from
-    // the swapchain format pick (which runs before the swapchain is created).
     public static native void setHDREnabledNative(boolean enabled);
     public static native void setHDRSurfaceSupportedNative(boolean supported);
 
-    // Set when the committed HDR setting changes, so the surface can force a
-    // reconfigure - the swapchain format is only re-read on a swapchain rebuild.
     public static volatile boolean hdrSwapchainDirty = false;
 
-    // RR-7 auto exposure: the switch and its one user-facing knob.  Neither
-    // needs a swapchain reconfigure - the exposure is applied inside the display
-    // compute pass, so both land on the next frame.  Switched off, the running
-    // exposure is driven back to neutral rather than frozen, which makes "off"
-    // match the pre-auto-exposure build exactly.
-    //
-    // The compensation is in EV on top of the shader's calibrated key, so 0.0
-    // is the tuned look.  The setter reports failure the way the other numeric
-    // knobs do; the switch cannot fail.
     public static native void setAutoExposureEnabledNative(boolean enabled);
     public static native boolean setAutoExposureCompensationNative(float ev);
     public static native float getAutoExposureCompensation();
 
-    // =====================================================
-    // 2026-10-16 诊断闸门（默认开；=0 / false 关闭）
-    //
-    // 现场：进程提交量有一条与玩法无关的固定速率增长（Vulkan 后端下约 38MB/s；
-    // OpenGL 后端下为 0）。已用 orion.streamline.earlyInit 排除"Streamline 早
-    // 初始化/NGX 加载"这一块，本闸门再切一刀：**保留 MC 的 Vulkan 后端，但跳过
-    // 我们自己的设备级初始化**（这一步会把 instance/physicalDevice/device/queue
-    // 交给 native，进而建 RR/FG/PCL/管线）。
-    //   · 关掉后泄漏仍在 ⇒ 与本模组的 native 链无关（MC/driver/注入侧）；
-    //   · 关掉后泄漏消失 ⇒ 责任在我们的设备级初始化或它开出的每帧路径。
-    // **只用于诊断**：RT/DLSS/FG 全部不可用。
-    // 写法照 DhFlags.flag()：先 -D 属性，再大写环境变量；"0"/"false" 都算关。
-    // =====================================================
     private static final String DEVICE_INIT_PROPERTY =
             "orion.native.deviceInit";
 
@@ -1662,8 +1526,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
                 RTXSettingsConfig.isSerEnabled()
         );
 
-        // RR-7: same reasoning as SER -- these are plain device-side switches,
-        // so they go across before the native init rather than after it.
         setAutoExposureEnabledNative(
                 RTXSettingsConfig.isAutoExposureEnabled()
         );
@@ -1672,9 +1534,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
                 RTXSettingsConfig.getAutoExposureCompensation()
         );
 
-        // 2026-10-28 间接光模式：**必须**在 initDeviceHandlesNative() 之前下发 ——
-        // SHaRC 的四块缓冲（176MB）与第二条 RT 管线是在 native init 里按它创建的。
-        // 若挪到 directLightMode 那一批（init 之后）就会永远读不到 1，模式永不生效。
         final String indirectModeEnv =
                 System.getenv("ORION_INDIRECT_MODE");
         if((indirectModeEnv == null || indirectModeEnv.isEmpty())
@@ -1696,16 +1555,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
         );
 
 
-        // =====================================================
-        // RTX Settings - restore saved NVIDIA Reflex mode
-        //
-        // 必须位于 initDeviceHandlesNative() 返回之后。
-        // 此时 Streamline / Reflex 已完成 native 初始化。
-        //
-        // 0 = Off
-        // 1 = On
-        // 2 = On + Boost
-        // =====================================================
 
         if(isReflexAvailable())
         {
@@ -1752,34 +1601,21 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
         final boolean savedFGFrameSync =
                 RTXSettingsConfig.isFGFrameSyncEnabled();
         setFGFrameSync(savedFGFrameSync);
-        // 2026-10-22（B2）：刷新率钳制开关随配置恢复。
         setFGRefreshCapEnabled(
                 RTXSettingsConfig.isFGRefreshCapEnabled()
         );
         setFGMultiplier(RTXSettingsConfig.getFGMultiplier());
         setFGBaseFrameLimit(RTXSettingsConfig.getFGBaseFrameLimit());
 
-        // 2026-10-22（MV 总开关）：链路一直在，但**从来没有人下发过** ——
-        // RTXSettingsConfig.motionVectorsEnabled 只被读进 GUI，原生侧永远停在校验
-        // 默认值的 1。这里补上恢复，并顺便用 setMotionVectorScaleMode 下发档位
-        // （它同时决定 g_mvScaleMode 与 g_motionVectorsEnabled：0 = 关，1/2/3 = 开）。
         try {
             setMotionVectorScaleMode(
                     RTXSettingsConfig.getMotionVectorsEnabled()
             );
         } catch (Throwable ignored) {
-            // 原生未加载时 getMotionVectorScaleMode 会抛 UnsatisfiedLinkError；
-            // 这条恢复路径与其余设置组一样，不能在初始化阶段把客户端带崩。
         }
 
-        // 渲染路径恒为 RR：SR 超分入口已从设置界面移除（强依赖 RR）。不再回读
-        // 配置里可能残留的 upscalerMode=1(SR)——那会让游戏一起步就落在已无入口
-        // 的 SR 路径上。srMode 只在 useSR 时被读取，路径恒 RR 后无需下发。
         setUpscalerMode(RTXSettingsConfig.UPSCALER_MODE_RR);
 
-        // =====================================================
-// RTX Settings - restore saved RR quality
-// =====================================================
 
         final int savedRRMode =
                 RTXSettingsConfig.getRRMode();
@@ -1818,9 +1654,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
                             + savedRRMode
             );
         }
-        // =====================================================
-// RTX Settings - restore no-direct-light ambient
-// =====================================================
 
         final float savedAmbient =
                 RTXSettingsConfig.getNoDirectLightAmbient();
@@ -1906,9 +1739,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
             );
         }
 
-        // =====================================================
-        // RTX Settings - restore local light intensity
-        // =====================================================
 
         final float savedLocalLightIntensity =
                 RTXSettingsConfig.getLocalLightIntensity();
@@ -2012,7 +1842,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
         )) {
             System.err.println("[RTX CONFIG] Failed to restore cloud view distance");
         }
-        // 2026-10-04 S2/S3：远云分辨率下限与远段步长加密（0 / 1.0 = 旧行为）。
         if(!setCloudResFloorPercent(
                 RTXSettingsConfig.getCloudResFloorPercent()
         )) {
@@ -2023,8 +1852,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
         )) {
             System.err.println("[RTX CONFIG] Failed to restore cloud far step density");
         }
-        // 2026-10-07 Perf-L10 实测后的两项 RT 优化（写 CameraUBO.rtSampleParams
-        // 的 .y/.z；这两格当时是保留 lane，现在已有读者 —— 见 camera_ubo.glsl 声明注释）。
         if(!setGiRoulette(
                 RTXSettingsConfig.getGiRoulette()
         )) {
@@ -2035,10 +1862,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
         )) {
             System.err.println("[RTX CONFIG] Failed to restore sun march far distance");
         }
-        // 2026-10-26 直接光模式 / 稀疏渲染（CameraUBO.sparseParams 尾块）。
-        // env 非空时**不下发**配置值：native 的三级解析是「UI 覆盖 → env → 出厂」，
-        // 这里若无条件下发，启动恢复会永远压住 ORION_* 实验入口（IDE 运行配置里
-        // 设了也白设）。在界面上点应用才算一次显式覆盖。
         final String directLightModeEnv =
                 System.getenv("ORION_DIRECT_LIGHT_MODE");
         if((directLightModeEnv == null || directLightModeEnv.isEmpty())
@@ -2055,31 +1878,22 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
                 )) {
             System.err.println("[RTX CONFIG] Failed to restore sparse rate percent");
         }
-        // 2026-10-09 运动矢量调试视图 / 总开关（写 perfAblationStage 的 .y/.z；
-        // 这两格当时是保留 lane，现在已有读者 —— 见 camera_ubo.glsl 声明注释）。
         if(!setMotionDebugView(
                 RTXSettingsConfig.getMotionDebugView()
         )) {
             System.err.println("[RTX CONFIG] Failed to restore motion debug view");
         }
-        // 2026-10-22 定案：运动矢量不再是用户可调项。
-        // 固定档位 1 = "MV 数据是像素位移 ⇒ mvecScale = 1/w, 1/h"（实测正确）；
-        // 层掩码在 native 内部固定为"只发 ENTITY（生物/掉落物）"，
-        // 粒子层与玩家自身层都不发（那是"整世界鬼影"的来源）。
-        // 需要实验时仍可用 ORION_MV_LAYERS / ORION_DIAG_* 环境变量覆盖。
         setMotionVectorScaleMode(1);
         if(!setCloudMarchParams(
                 RTXSettingsConfig.getCloudMarchSettings().toParamArray()
         )) {
             System.err.println("[RTX CONFIG] Failed to restore cloud march settings");
         }
-        // 2026-10-03 远淡出跟随 RR 档位（默认开；关掉回到旧行为）。
         if(!setCloudFadeFollowsRrMode(
                 RTXSettingsConfig.isCloudFadeFollowsRrMode()
         )) {
             System.err.println("[RTX CONFIG] Failed to restore cloud far fade mode");
         }
-        // 2026-10-06 远云剥离 RR（默认开；关掉回到"云进 RR 颜色输入"的旧档）。
         if(!setCloudPostRrComposite(
                 RTXSettingsConfig.isCloudPostRrComposite()
         )) {
@@ -2090,7 +1904,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
         )) {
             System.err.println("[RTX CONFIG] Failed to restore water params");
         }
-        // 2026-10-02 水面波面参考重构（HPWater）：波面法线侧 + 波动方程侧两组。
         if(!setWaterWaveParams(
                 RTXSettingsConfig.getWaterWaveSettings().toParamArray()
         )) {
@@ -2106,14 +1919,11 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
         )) {
             System.err.println("[RTX CONFIG] Failed to restore water FFT params");
         }
-        // 2026-10-13 afl getwaves 波面后端（复用 waterWaveShapeParams 尾块）。
         if(!setWaterWaveAflParams(
                 RTXSettingsConfig.getWaterWaveAflSettings().toParamArray()
         )) {
             System.err.println("[RTX CONFIG] Failed to restore water wave afl params");
         }
-        // 2026-10-03 TLAS 剔除距离 0 = **自适应**（游戏视距 × 1.25，随视距设置联动）；
-        // 启动恢复时游戏视距可直接读，无需等玩家打开设置。
         int restoredTlasCull =
                 RTXSettingsConfig.getPostProcessingSettings().tlasCullDistance();
         if(restoredTlasCull == 0) {
@@ -2139,13 +1949,10 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
                 RTXSettingsConfig.getPostGainB() })) {
             System.err.println("[RTX CONFIG] Failed to restore post processing params");
         }
-        // 2026-10-26 色彩分级 24 项（「色彩映射与调色」页）。与后处理参数分开下发，
-        // 因为它走的是独立的 push lane（PostProcessingPush 的 lane 8..31）。
         if(!setColorGradeParams(
                 RTXSettingsConfig.getColorGradeSettings().toParamArray())) {
             System.err.println("[RTX CONFIG] Failed to restore color grade params");
         }
-        // 2026-10-03 远云 guide 补写：0 = 关闭（回到"远处云也走 RR 的错误 guide"）。
         if(!setRrGuideSettings(
                 true,
                 RTXSettingsConfig.getPostProcessingSettings().rrFarCloudDistance())) {
@@ -2184,17 +1991,14 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
         RTXSettingsConfig.CloudShape2Settings cloudShape2 = RTXSettingsConfig.getCloudShape2Settings();
         if(!setCloudShape2Params(cloudShape2.toParamArray()))
             System.err.println("[RTX CONFIG] Failed to restore cloud shape2 settings");
-        // 2026-10-02 参考重构 #2~#7（五组尾块参数）。
         RTXSettingsConfig.CloudAmbientSettings cloudAmbient =
                 RTXSettingsConfig.getCloudAmbientSettings();
         if(!setCloudAmbientParams(cloudAmbient.toParamArray()))
             System.err.println("[RTX CONFIG] Failed to restore cloud ambient settings");
-        // 2026-10-14 日落天光修正。
         RTXSettingsConfig.CloudSkyHueSettings cloudSkyHue =
                 RTXSettingsConfig.getCloudSkyHueSettings();
         if(!setCloudSkyHueParams(cloudSkyHue.toParamArray()))
             System.err.println("[RTX CONFIG] Failed to restore cloud sky hue settings");
-        // 2026-10-15 体积云物理性质补齐。
         RTXSettingsConfig.CloudPhysicsSettings cloudPhysics =
                 RTXSettingsConfig.getCloudPhysicsSettings();
         if(!setCloudPhysicsParams(cloudPhysics.toParamArray()))
@@ -2213,7 +2017,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
                 RTXSettingsConfig.getCloudDetailSettings();
         if(!setCloudDetailParams(cloudDetail.toParamArray()))
             System.err.println("[RTX CONFIG] Failed to restore cloud detail settings");
- // 2026-10-10（#3/#4 云时域 + #5/#6 雾附加）。
         RTXSettingsConfig.CloudTemporalSettings cloudTemporal =
                 RTXSettingsConfig.getCloudTemporalSettings();
         if(!setCloudTemporalParams(cloudTemporal.toParamArray()))
@@ -2224,12 +2027,10 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
         RTXSettingsConfig.FogWispSettings fogWisp = RTXSettingsConfig.getFogWispSettings();
         if(!setFogWispParams(fogWisp.toParamArray()))
             System.err.println("[RTX CONFIG] Failed to restore fog wisp settings");
-        // 2026-10-10 借鉴（#1 云后空气透视 + #2 地面遮挡衰减）。
         RTXSettingsConfig.CloudAerialSettings cloudAerial =
                 RTXSettingsConfig.getCloudAerialSettings();
         if(!setCloudAerialParams(cloudAerial.toParamArray()))
             System.err.println("[RTX CONFIG] Failed to restore cloud aerial settings");
-        // 2026-10-03 薄层 SSS。
         RTXSettingsConfig.WaterSssSettings waterSss = RTXSettingsConfig.getWaterSssSettings();
         if(!setWaterSssParams(waterSss.toParamArray()))
             System.err.println("[RTX CONFIG] Failed to restore water SSS settings");
@@ -2268,8 +2069,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
         )) {
             System.err.println("[RTX CONFIG] Failed to restore volumetric fog settings");
         }
-        // 2026-10-06 设置清理：雾形态开关（setFogBlobModeNative）随 fogBlobs 删除
-        // —— 密度模型已统一成单一公式，不再有"仅高度衰减 / 团雾"两个分支。
 
         RTXSettingsConfig.VolumetricLightSettings godRays =
                 RTXSettingsConfig.getVolumetricLightSettings();
@@ -2356,14 +2155,6 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
             int height,
             boolean targetIsMainRenderTarget
     );
-// =====================================================
-// NVIDIA Reflex
-//
-// mode:
-// 0 = Off
-// 1 = On
-// 2 = On + Boost
-// =====================================================
 
     public static native boolean setReflexMode(int mode);
 
@@ -2371,66 +2162,29 @@ public final class NativeVulkan {// 新签名：传递区块坐标，顶点缓�
 
     public static native int getReflexMode();
 
-    // DLSS-G queue synchronization. True keeps generated-frame work ordered
-    // with the presenting client queue.
     public static native boolean setFGFrameSync(boolean enabled);
 
-    // 2026-10-22（B2）：按显示器刷新率给帧生成倍率设上限。
-    // 官方 DLSS-G §7.4：60Hz 安全上限 4×、75Hz 5×，再高只是把渲染时间换成
-    // 队列延迟。关掉后只受驱动 numFramesToGenerateMax 限制。
     public static native boolean setFGRefreshCapEnabled(boolean enabled);
 
     public static native boolean getFGRefreshCapEnabled();
 
-    // 2026-10-22（D2）：Reflex Flash 指示器（RFI）。左键按下的**那一沿**发一次。
-    // 原生侧会校验 ReflexState::flashIndicatorDriverControlled，未由驱动接管时
-    // 直接返回 false（不发无意义的 marker）。
     public static native boolean pclTriggerFlash();
 
-    // 2026-10-22（D2）：PCL 延迟测量 ping（PC Latency Stats 热键那条）。
-    // 目前没有热键绑定入口，方法先暴露出来，接上输入层后即可使用。
     public static native boolean pclLatencyPing();
 
-    // 2026-10-22（D3）：是否从 natives 目录下的 sl_debug_dev\ 加载
-    // development 构建（仅它带 sl.imgui）。**必须在 initStreamlineEarly 之前**
-    // 调用，且**下次启动才生效**：interposer 一旦加载就无法换版本。
     public static native boolean setStreamlineDevPluginsEnabled(boolean enabled);
 
-    // DLSS Frame Generation multiplier (倍增值): 2 = 2x, 4 = 4x, 6 = 6x.
-    // Stored as a request; native clamps it against numFramesToGenerateMax on
-    // the next apply, so asking for 4x on Ada without the multi-frame unlock
-    // runs at 2x instead of failing.
     public static native boolean setFGMultiplier(int multiplier);
 
-    // Ceiling the DLSS-G plugin reports, in multiplier units (2 = 2x). It reads
-    // 2 until the first frame-generation state query, which needs a world.
     public static native int getFGMultiplierMax();
 
-    // Base frame-rate cap for frame generation, in rendered frames per second:
-    // -1 pairs it with the display (refresh / multiplier), 0 removes it, and a
-    // positive value is an explicit target. Pushed to the Reflex frame limiter,
-    // which is the pacing path Streamline names for use with DLSS-G.
     public static native boolean setFGBaseFrameLimit(int fps);
 
-    // Hz the cap resolved to, so the label can show what "automatic" means.
     public static native int getFGBaseFrameLimit();
 
-    // Refresh rate of the display the desktop currently runs on.
     public static native int getDisplayRefreshRateHz();
 
-    // Pushed every frame: true while a full-screen menu (or the main menu) owns
-    // the screen. Frame generation is switched off for those frames and the base
-    // frame-rate cap is lifted with it, so a menu never renders at the paired
-    // rate.
     public static native boolean setFullscreenMenuOpen(boolean open);
-    // =====================================================
-// DLSS Ray Reconstruction quality
-//
-// 0 = Performance
-// 1 = Balanced
-// 2 = Quality
-// 3 = DLAA
-// =====================================================
 
     public static native boolean setRRMode(int mode);
 

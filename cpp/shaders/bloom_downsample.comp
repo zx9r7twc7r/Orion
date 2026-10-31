@@ -1,16 +1,5 @@
 #version 460
 
-// ===============================================================
-// 2026-10-07 泛光第 2 步：mip 链降采样（每级 = 上一级的 1/2）
-//
-// 与 bloom_prefilter.comp 用的是同一个 13-tap 盒，区别只有两点：
-//   · **不再做阈值**（阈值只在第 0 级做一次，后面各级已经是"要泛光的能量"）；
-//   · 输入输出都在 mip 链内部。
-//
-// 为什么要 mip 链而不是一次大核模糊：泛光要的是"很宽但很廉价"的模糊。单级做 30+ 像素
-// 的核在大分辨率下是 O(r²) 的采样量；mip 链每级只有 13 个采样，总代价 O(log r)，
-// 而最粗那级的一个纹素已经覆盖屏幕上很大一块 —— 宽光晕就是这么来的。
-// ===============================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -30,8 +19,6 @@ void main()
     vec2 texel = 1.0 / vec2(srcSize);
     vec2 uv = (vec2(pixel) + 0.5) / vec2(dstSize);
 
-    // 13-tap：目标纹素是源的 1/2 尺寸 ⇒ 每个目标纹素覆盖源上 2×2，
-    // 而这 13 个偏移在源的纹素空间里正好是 4×4 的箱式覆盖（双线性额外补足）。
     vec3 a = textureLod(bloomSourceMip, uv + texel * vec2(-2.0, -2.0), 0.0).rgb;
     vec3 b = textureLod(bloomSourceMip, uv + texel * vec2( 0.0, -2.0), 0.0).rgb;
     vec3 c = textureLod(bloomSourceMip, uv + texel * vec2( 2.0, -2.0), 0.0).rgb;

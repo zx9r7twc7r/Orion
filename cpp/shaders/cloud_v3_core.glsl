@@ -1,16 +1,3 @@
-// ===========================================================================
-// 体积云 v3 核心：云模型（MIT，逐段移植）
-//
-// 这个文件**不依赖引擎**（不读 CameraUBO、不做球壳求交），只吃参数与采样器，
-// 因此可以被两处同时 include：
-//   1) cpp/shaders/volumetric_clouds_v3.comp   游戏内路径
-//   2) cpp/shaders/cloud_preview.comp          离线预览工具（tools/cloudpreview）
-// 两边跑的是同一份代码 ⇒ 预览出来的形状/明暗就是游戏里会看到的东西。
-//
-//   :475-487 云型垂直梯度   :489-497 风剪切   :499-540 低频形状
-//   :542-563 高频侵蚀       :295-306 双 HG    :331-388 光能量
-//   :565-688 rayMarch       :762      地平线淡出
-// ===========================================================================
 #ifndef CLOUD_V3_CORE
 #define CLOUD_V3_CORE
 
@@ -97,7 +84,6 @@ float v3BeerLambertModified(float densityAlongLightRay, float attenuationReducti
         exp(densityAlongLightRay * attenuationReduction) * influenceReduction);
 }
 
-// 331-388 行（保留三处 MANIPULATE ME 的取值）
 float v3LightEnergy(float heightFraction, float dl, float dsLoded, float phaseProbability,
     float cosAngle, float stepSize, float brightness, float heightSkew)
 {
@@ -163,13 +149,8 @@ float v3SampleLowFrequency(
 
     vec3 weatherData = texture(weatherTex, unskewedSamplePoint.xz / weatherScale).rgb;
     float densityHeightGradient = v3DensityHeightGradient(relativeHeight, weatherData.g);
-    // 参考 :524 的注释值是 `densityHeightGradient * 0.5`，但它会把 baseCloud 整体
-    // 对半砍（实测直接没云）——作者注释掉的正是这个原因。这里改成**归一化**：
-    // 梯度峰值 1.0 时不改变密度，只按高度重新分配（积云中段厚、层云贴底）。
     baseCloud *= mix(1.0, densityHeightGradient, cloudTypeInfluence);
 
-    // 覆盖度：参考常量 0.6（:529）；weather.r 是覆盖度偏置。coverageMaster 是
-    // 引擎滑杆的主控，映射成"相对参考 0.6 的倍率"，0.4 时正好回到 0.6。
     float weatherCoverage = mix(0.6, weatherData.r, cloudTypeInfluence);
     float cloudCoverage = clamp(weatherCoverage * (0.4 + 1.2 * coverageMaster), 0.0, 1.0);
 
@@ -209,9 +190,6 @@ struct V3MarchSettings
     float silverIntensity;
     float silverSpread;
     float brightness;
-    // 2026-10-18：环境项。参考只有太阳项（GetLightEnergy），云底在玩家仰视时
- // 会接近纯黑。有 ambient/SH；这里用本引擎的 skyColor 补一个
-    // 按"云内遮挡"衰减的环境项，强度由滑杆给（0 = 逐字移植的原始行为）。
     float ambientStrength;
 };
 
@@ -220,8 +198,8 @@ struct V3MarchInputs
     vec3 rayOrigin;
     vec3 rayDirection;
     vec3 lightDirection;
-    vec3 shellOrigin;      // 内壳顶（= 云底）在 anchor 处的位置
-    vec3 earthCenter;      // 球心（anchor, base - R, anchor）
+    vec3 shellOrigin;
+    vec3 earthCenter;
     float startT;
     float endT;
     float layerThickness;
@@ -237,13 +215,12 @@ struct V3MarchInputs
     float curlStrength;
     float weatherScale;
     float erosionAmount;
-    float extinction;      // 每格消光（按密度滑杆换算）
-    vec3 ambientColor;     // 环境（天光）颜色，用于云底补光
+    float extinction;
+    vec3 ambientColor;
     int requestedSteps;
     int lightSamples;
     int frameIndex;
 };
-
 // ---------------------------------------------------------------- march
 // 565-688 行。返回 vec4(marchColor, accumDensity)，并写出首个命中距离。
 vec4 v3MarchClouds(
@@ -262,9 +239,6 @@ vec4 v3MarchClouds(
     float qualityScale = clamp(float(inputs.requestedSteps) / 24.0, 0.5, 1.5);
     int steps = int(clamp(referenceSteps * qualityScale, float(V3_MIN_STEPS), float(V3_MAX_STEPS)));
     float stepSize = (inputs.endT - inputs.startT) / float(steps);
-    // 2026-10-18 修正：参考的 ATMOSPHERE_THICKNESS 是**层厚常量**，不是当前射线的
-    // 弦长（endT-startT）。用弦长会让相对坐标/相对高度被压缩，云型梯度直接归零
-    // （预览实测：从上方俯视完全没有云）。
     float atmosphereThickness = max(inputs.layerThickness, 1.0);
     int lightSampleCount = clamp(inputs.lightSamples, 1, V3_MAX_LIGHT_SAMPLES);
 
@@ -272,7 +246,6 @@ vec4 v3MarchClouds(
     const float hgLight = v3HGModified(cosAngle, settings.eccentricity,
         settings.silverIntensity, settings.silverSpread);
 
-    // 太阳 cone 采样核（:598-624）
     vec3 lightDirection = normalize(inputs.lightDirection);
     vec3 maxCompUnitVector;
     if(abs(lightDirection.x) > abs(lightDirection.y) && abs(lightDirection.x) > abs(lightDirection.z))
@@ -320,10 +293,6 @@ vec4 v3MarchClouds(
         vec3 samplePoint = v3RelativePosition(pos, inputs.shellOrigin, atmosphereThickness);
         samplePoint /= inputs.noiseScale;
 
-        // 相对高度：参考用 cosTheta 近似，但那条式子在
-        // **接近水平的视线**上会乘一个 dot(dir,up)≈0 的因子 ⇒ 高度恒为 0，
-        // 云型梯度随即把密度清零（实测"层内平视 / 云顶俯视看不到云"）。
-        // 这里直接用几何高度：h = (pos.y - 云底) / 层厚 —— 与参考语义一致且稳定。
         float relativeHeight = clamp((pos.y - inputs.shellOrigin.y) /
             max(inputs.layerThickness, 1.0), 0.0, 1.0);
         float heightFraction = relativeHeight;
@@ -368,16 +337,9 @@ vec4 v3MarchClouds(
             float totalLightEnergy = v3LightEnergy(heightFraction, densityAlongLight, baseDensity,
                 hgLight, cosAngle, stepSize, settings.brightness, inputs.heightGradientSkew);
 
-            // 2026-10-18 与参考版本的唯一差别（已注释说明）：
-            // 参考用 `transmittance = mix(T, L, 1-accumDensity); returnColor += T;`，
-            // 每步都累加一次近 1 的量，稀疏云会把颜色累到几十（预览实测一片死白）。
-            // 这里改成能量守恒的积分：σ = density × extinction，
-            //   opacity = 1 - exp(-σ·ds)，scattering += L·T·opacity，T *= 1-opacity。
-            // 密度/光照/相位/cone 采样仍逐字来自参考。
             float sigma = highFreqDensity * inputs.extinction * stepSize;
             float sampleOpacity = 1.0 - exp(-sigma);
 
-            // 环境项：用"沿光线的密度"近似遮挡，厚云底自然更暗
             float ambientOcclusion = exp(-densityAlongLight * 0.08);
             vec3 radiance = vec3(totalLightEnergy) +
                 inputs.ambientColor * settings.ambientStrength * ambientOcclusion;
@@ -392,10 +354,6 @@ vec4 v3MarchClouds(
         }
     }
 
-    // 地平线淡出（参考 :762）。参考只在"向上看"时才走这条路径（他们 _dot < 0.06
-    // 直接早退），所以原式对向下视线会算出负数 ⇒ smoothstep 归零。预览实测：
-    // 从层顶俯视整幅图 0 密度，就是这个 clamp 缺失导致的。
-    // 这里只在 dir.y > 0 时淡出，向下视线保持原样。
     float horizonFade = 1.0;
     if(inputs.rayDirection.y > 0.0)
     {

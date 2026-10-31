@@ -21,10 +21,8 @@ import net.minecraft.client.Minecraft;
  * </ol>
  */
 public final class DhBridge {
-    /** DH 的 Fabric mod id。注意 API jar 自身的 id 是 {@code dh-api}，它的 parent 才指向这里。 */
     private static final String MOD_ID = "distanthorizons";
 
-    /** 低于此 API 主版本一律拒绝接入：语义未知时宁可不要远场，也不要在猜测上建栈。 */
     private static final int MIN_API_MAJOR = 7;
 
     private static final boolean MOD_PRESENT = FabricLoader.getInstance().isModLoaded(MOD_ID);
@@ -34,7 +32,6 @@ public final class DhBridge {
     private static String status = MOD_PRESENT ? "未探测" : "未安装 Distant Horizons";
     private static long frame;
     private static boolean frameEnded;
-    /** 远场网格路径的熔断器：出错一次即停用，避免每帧刷屏。 */
     private static boolean lodMeshEnabled = true;
 
     private DhBridge() {
@@ -121,18 +118,14 @@ public final class DhBridge {
         boolean worldLoaded = minecraft.level != null;
 
         try {
-            // level 只作为"身份"参与引用比较（换世界检测），不做任何字段访问。
             DhApiImpl.tick(frame, worldLoaded, minecraft.level);
         } catch (Throwable failure) {
-            // 运行期一次性异常即彻底停用：探针/接入代码再出错也不该影响每一帧。
             supported = false;
             status = "运行期异常，已停用：" + failure;
             log(status);
             return;
         }
 
-        // C 阶段：把 DH 地形当几何喂给 TLAS（默认关闭，见 DhFlags.LOD_MESH）。
-        // 与上面的探针解耦：它自己判断世界/玩家是否可用，出错也只停它自己。
         if (lodMeshEnabled) {
             try {
                 DhFarFieldUploader.tick();
@@ -150,17 +143,11 @@ public final class DhBridge {
         try {
             DhApiImpl.reset();
         } catch (Throwable ignored) {
-            // 清理失败没有副作用：下次进世界会从头重建。
         }
         try {
-            // 旧世界的网格必须撤下：它的坐标只对旧世界成立。
             DhFarFieldUploader.reset();
         } catch (Throwable ignored) {
-            // 同上。
         }
-        // P1-A（09-25）：DH 换世界/退世界时也要清掉远场接管闸门。此前硬复位只挂在
-        // VoxyLodManager.clearNative() 里，DH 单独跑时会漏 ⇒ 旧世界的"LOD 在供数据"
-        // 状态会把近场压制带进新世界。
         FarFieldGate.onLodHardReset();
         lodMeshEnabled = true;
     }

@@ -73,18 +73,6 @@ public final class VoxyCompat {
                         + sourceRevision + " meshes=" + source.size()
                         + " renderDistance=" + renderDistanceChunks);
             }
-            // ⭐ 2026-09-26 性能（实测取证）：先用**零克隆**的便宜指纹判"有没有变"，没变直接返回。
-            //
-            // 原来这里无条件对**每一个** LOD 网格做 opaque/transparent 各一次 clone() +
-            // 每个网格 5 次反射 + new LodMesh + List.copyOf，而"revision 没变"的短路在
-            // **这一整段之后**才判（原 :97）。rd=10 时快照是 2.4M~5.0M 个 quad × 64B
-            // ≈ **150~320 MB/帧** 的纯字节克隆，按内存带宽就是 15~30ms/帧，与实测基帧
-            // 26~31ms 同量级，而且不产生任何画面（这就是"站着不动也只有三十几帧"的主因之一）。
-            //
-            // 便宜指纹的语义与原 snapshotFingerprint **完全一致**（同样只吃
-            // key/version/两桶长度，逐项同序）：长度是 O(1) 不拷贝，version 本身是
-            // section 数据的内容哈希。两边算出的值可直接互相比较，所以下面 observedSnapshotHash
-            // 的赋值不需要改。
             int cheapFingerprint = sourceFingerprint(source, api);
             if (sourceRevision == observedSourceRevision && cheapFingerprint == observedSnapshotHash) {
                 return;
@@ -95,8 +83,6 @@ public final class VoxyCompat {
                 Access access = api.access(mesh.getClass());
                 byte[] opaque = (byte[]) access.opaque.invoke(mesh);
                 byte[] transparent = (byte[]) access.transparent.invoke(mesh);
-                // The provider promises immutable arrays, but copying here prevents an asynchronous Voxy
-                // rebuild from racing the JNI upload after this render-thread poll returns.
                 converted.add(new LodMesh(
                         ((Number) access.key.invoke(mesh)).longValue(),
                         ((Number) access.version.invoke(mesh)).longValue(),
@@ -350,7 +336,6 @@ public final class VoxyCompat {
                 try {
                     return type.getMethod(name, parameterTypes);
                 } catch (NoSuchMethodException ignored) {
-                    // Configuration is optional; the provider itself is not.
                 }
             }
             return null;
@@ -360,8 +345,6 @@ public final class VoxyCompat {
             try {
                 Class<?> bridge;
                 try {
-                    // 类名由 voxy fork 的 jar 决定，必须与 jar 内实际类名逐字一致
-                    // （me.cortex.voxy.client.compat.CausticaBridge），不能跟着本工程改名。
                     bridge = Class.forName("me.cortex.voxy.client.compat.CausticaBridge");
                 } catch (ClassNotFoundException missingCausticaName) {
                     bridge = Class.forName("me.cortex.voxy.client.compat.VoxyCausticaBridge");

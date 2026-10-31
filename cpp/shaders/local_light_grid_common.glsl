@@ -1,24 +1,3 @@
-// ===========================================================================
-// local_light_grid_common.glsl —— 体积雾的"动态光源取样"（2026-10-23 新增）
-//
-// 目的：让雾的入散射里出现火把 / 岩浆 / 发光方块的照亮（体积雾自 2026-10-19
-// B 方案重做后只有太阳项 + 环境项，方块光完全不参与）。
-//
-// 数据来源 = **同一份** binding 17/18 的本地光表与空间网格，因此"雾里亮的那个
-// 火把"与"rgen 里给表面打光的那个火把"结构上不可能不是同一盏灯。本文件的
-// 常量 / hash / 邻域走访 / 范围衰减 / 发光色表全部**逐行照抄**
-// `rt_test.rgen`（唯一真源，见那里的注释：localLightGridHash32、
-// localLightGridLookupCell、vptLocalLightRange/Fade/Attenuation、
-// decodeLocalLightColor、localLightIntensity）。rgen 那份改动时这里必须跟着改，
-// 否则雾里的亮度会与表面上的亮度漂移。
-//
-// 与 rgen 的唯一差异（两处，都是"平台适配"，不是算法差异）：
-//   1) 绑定号：rgen 用 g_rayTracingDescriptorSet 的 17/18；体积云 pass 是另一
-//      个 descriptor set，这里声明成 12/13（宿主 VulkanCore.cpp 绑同一个 buffer）。
-//   2) 新增 fogGatherLocalLights()：把网格邻域里的灯**一次**收进一个固定小数组，
-//      供沿视线的每个 march 步复用。rgen 是按接收点逐步查表（每步一次 NEE），
-//      雾的步数少、但每步都查表会把 8 个 cell 的 hash 走访乘上步数。
-// ===========================================================================
 #ifndef LOCAL_LIGHT_GRID_COMMON_GLSL
 #define LOCAL_LIGHT_GRID_COMMON_GLSL
 
@@ -34,13 +13,9 @@ struct LocalLightGPU
 
 layout(std430, binding = 12, set = 0) readonly buffer FogLocalLightBuffer
 {
-    uvec4 header;              // .x = lightCount
+    uvec4 header;
     LocalLightGPU lights[];
 } fogLightBuffer;
-
-// ---- binding 13：空间网格（与 rgen 的 binding 18 同一 buffer）----
-// words[0..3] = header（.z = hashCapacity），随后 hashCapacity × 8 words 的
-// 开放寻址槽，再往后是打包的 binding-12 灯下标。
 layout(std430, binding = 13, set = 0) readonly buffer FogLocalLightGridBuffer
 {
     uint words[];
@@ -51,11 +26,8 @@ const float LOCAL_LIGHT_MAX_RANGE = 30.0;
 const float VPT_LOCAL_MAX_DISTANCE = 30.0;
 const float VPT_LOCAL_RANGE_PER_EMISSION = 2.0;
 const float VPT_LOCAL_FADE_START_FRACTION = 0.40;
-// rgen:1320 的全局能量标定（用户滑杆再乘在 localLightIntensity() 上）。
 const float LOCAL_LIGHT_ENERGY_SCALE = 0.35;
 
-// 雾一次最多带走几盏灯。8 盏覆盖"玩家周围 30 格内所有发光方块"的常见情形；
-// 超出部分按网格顺序截断（近处优先由 30 格范围本身保证）。
 const int FOG_LIGHT_MAX = 8;
 
 uint localLightGridHash32(ivec3 cellCoord)
@@ -140,7 +112,6 @@ bool localLightGridLookupCell(
 // rgen:2488 起的三段范围/衰减（逐行照抄）。
 float vptLocalLightRange(float emissionLevel)
 {
-    // rainWallParams1.w = Java 滑块「本地光最远照明距离」（格）。
     float userLocalMax = cam.rainWallParams1.w;
     float localMaxDistance = userLocalMax > 0.5
         ? min(VPT_LOCAL_MAX_DISTANCE, userLocalMax)
@@ -168,15 +139,14 @@ float vptLocalLightDistanceAttenuation(float distanceToLight)
 vec3 decodeLocalLightColor(uint typeCode)
 {
     if(typeCode == 0u) return vec3(1.00, 0.90, 0.75);
-    if(typeCode == 1u) return vec3(1.00, 0.62, 0.28);   // 火把/灯笼/营火
-    if(typeCode == 2u) return vec3(0.25, 0.72, 1.00);   // 灵魂火
-    if(typeCode == 3u) return vec3(1.00, 0.18, 0.08);   // 红石火把
-    if(typeCode == 4u) return vec3(1.00, 0.34, 0.08);   // 岩浆
-    if(typeCode == 5u) return vec3(1.00, 0.82, 0.52);   // 萤石/海晶灯/菌光体
-    if(typeCode == 6u) return vec3(0.70, 0.28, 1.00);   // 地狱传送门
+    if(typeCode == 1u) return vec3(1.00, 0.62, 0.28);
+    if(typeCode == 2u) return vec3(0.25, 0.72, 1.00);
+    if(typeCode == 3u) return vec3(1.00, 0.18, 0.08);
+    if(typeCode == 4u) return vec3(1.00, 0.34, 0.08);
+    if(typeCode == 5u) return vec3(1.00, 0.82, 0.52);
+    if(typeCode == 6u) return vec3(0.70, 0.28, 1.00);
     return vec3(1.00, 0.90, 0.75);
 }
-
 // rgen:1318 localLightIntensity()：用户滑杆「本地光源照射强度」，主机写的是
 // intensity + 1.0，这里减 1 还原；车道没下发过（0）时退回 1.0。
 float localLightIntensity()
@@ -279,4 +249,4 @@ int fogGatherLocalLightsIndexed(
     return gathered;
 }
 
-#endif // LOCAL_LIGHT_GRID_COMMON_GLSL
+#endif

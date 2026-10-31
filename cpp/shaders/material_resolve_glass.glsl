@@ -53,9 +53,6 @@ void resolveHitMaterialGlass(vec3 rayOrigin, vec3 rayDirection, vec3 barycentric
         payload.pomSelfShadow = 1.0;
         payload.pomMicroOcclusion = 1.0;
         payload.glassAlpha = 1.0;
-        payload.prevOffsetX = 0.0;
-        payload.prevOffsetY = 0.0;
-        payload.prevOffsetZ = 0.0;
         return;
     }
 
@@ -130,9 +127,6 @@ void resolveHitMaterialGlass(vec3 rayOrigin, vec3 rayDirection, vec3 barycentric
             }
         }
 
-        payload.prevOffsetX = hitWorldOffset.x;
-        payload.prevOffsetY = hitWorldOffset.y;
-        payload.prevOffsetZ = hitWorldOffset.z;
     }
 
 float interpU =
@@ -278,10 +272,9 @@ bool isVoxyEmissive = !isDhLod && voxyLodMarker < -1.5;
         payload.pomSelfShadow = 1.0;
         payload.pomMicroOcclusion = 1.0;
         payload.normal = normalize(fixedNormal);
-        payload.albedo = voxyAlbedo;
+        payload.albedoPacked = packAlbedoUnorm(voxyAlbedo);
         payload.glassAlpha = isVoxyGlass ? clamp(interpColor.a, 0.06, 0.72) : 1.0;
         // 同步 alpha blend 源 alpha（voxy 玻璃也会进玻璃透射分支）。
-        payload.glassBlendAlpha = payload.glassAlpha;
         // LOD 水是**稀疏代理边界**，不拥有闭合介质 —— 用水的界面着色
         // （低粗糙度 + 介质 IOR），但**不声明介质进出**（RT_WATER_NONE 而非
         // AIR_TO_WATER / WATER_TO_AIR）。参考注释原文："把细交接环当体积会让它
@@ -380,7 +373,7 @@ bool isVoxyEmissive = !isDhLod && voxyLodMarker < -1.5;
         payload.pomSelfShadow = 1.0;
         payload.pomMicroOcclusion = 1.0;
         payload.normal = normalize(dhNormal);
-        payload.albedo = dhAlbedo;
+        payload.albedoPacked = packAlbedoUnorm(dhAlbedo);
         // DH 几何里没有玻璃：水面是唯一该有界面语义的东西，而它由
         // state = RT_HIT_WATER 表达，所以这里恒 1.0。
         payload.glassAlpha = 1.0;
@@ -468,10 +461,9 @@ bool isVoxyEmissive = !isDhLod && voxyLodMarker < -1.5;
         payload.pomSelfShadow = 1.0;
         payload.pomMicroOcclusion = 1.0;
         payload.normal = normalize(fixedNormal);
-        payload.albedo = voxyAlbedo;
+        payload.albedoPacked = packAlbedoUnorm(voxyAlbedo);
         payload.glassAlpha = isVoxyGlass ? clamp(interpColor.a, 0.06, 0.72) : 1.0;
         // 同步 alpha blend 源 alpha（voxy 玻璃也会进玻璃透射分支）。
-        payload.glassBlendAlpha = payload.glassAlpha;
         // LOD 水是**稀疏代理边界**，不拥有闭合介质 —— 用水的界面着色
         // （低粗糙度 + 介质 IOR），但**不声明介质进出**（RT_WATER_NONE 而非
         // AIR_TO_WATER / WATER_TO_AIR）。参考注释原文："把细交接环当体积会让它
@@ -1498,7 +1490,7 @@ if(isWaterMaterial && abs(geoNormal.y) > 0.5)
         payload.pomSelfShadow = 1.0;
         payload.pomMicroOcclusion = 1.0;
         payload.normal = vec3(0.0, 1.0, 0.0);
-        payload.albedo = dbgColor;
+        payload.albedoPacked = packAlbedoUnorm(dbgColor);
         payload.glassAlpha = 1.0;
         payload.state = makeHitState(
             getRayPurpose(payload.state), RT_HIT_OPAQUE,
@@ -1613,14 +1605,13 @@ payload.glassAlpha =
 
 // alpha blend 的源 alpha：无条件 texture x vertex（见 hit_payload.glsl 的说明）。
 // 实测染色玻璃贴图 alpha = 102/255 = 0.400；这里不再受顶点 materialId 判定影响。
-payload.glassBlendAlpha =
     clamp(albedoColor.a, 0.0, 1.0);
 
 payload.normal =
     normalize(fixedNormal);
 
-payload.albedo =
-    albedoColor.rgb;
+payload.albedoPacked = packAlbedoUnorm(
+    albedoColor.rgb);
 
 
 /// =====================================================
@@ -1651,8 +1642,8 @@ bool t12IsGlass =
     t12IsPortal;
 
 
-payload.albedo =
-    albedoColor.rgb;
+payload.albedoPacked = packAlbedoUnorm(
+    albedoColor.rgb);
 
 
 if(t12IsGlass)
@@ -1680,11 +1671,11 @@ if(t12IsGlass)
     // albedo (the camera glass path consumes it only as the tint and the RR
     // guide pins rrDiffuseAlbedo to 0 for a pane), so overriding it here changes
     // the filter and nothing else.
-    payload.albedo =
+    payload.albedoPacked = packAlbedoUnorm(
         glassPaneTransmissionColor(
             atlasSpriteSample.rgb,
             interpColor.rgb
-        );
+        ));
 
     // =====================================================
     // Glass camera-side classification

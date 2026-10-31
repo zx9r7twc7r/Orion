@@ -2,23 +2,9 @@
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_ray_query : require
 
-// 地形高度场的生产者（2026-09-30）。
-//
-// 每帧派发一次，512×512，每个纹素一条**竖直向下**的射线 —— 26.2 万条，比太阳
-// 阴影图高一个量级但仍是每帧固定。存的是该 XZ 列首个实心地面的世界 Y，消费者
-// （体积雾 / 体积光 / 贴地薄雾）拿 march 采样点的 Y 去减，得到"离该列地面多高"。
-// 完整论证见 terrain_height.glsl。
-//
-// 与太阳阴影图的唯一结构差别：那边是斜向的长柱（要把遮挡体的深度比出来），
-// 这边是竖直的短柱，只需要"这一列的地面在哪"，所以方向固定、长度固定。
-//
-// 设备要求：VK_KHR_ray_query（计算着色器用不了 traceRayEXT，见 sun_shadow.glsl）。
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-// 只需要到 viewInverse 为止的前缀。std140 里"少声明"是安全的
-// （多声明、或者跳过某个成员再继续才致命），而这个 pass 不读任何
-// 云/雾/天空参数 —— 只有网格跟随需要相机位置。
 layout(set = 0, binding = 0) uniform CameraProperties
 {
     #include "camera_ubo.glsl"
@@ -26,11 +12,8 @@ layout(set = 0, binding = 0) uniform CameraProperties
 
 layout(set = 0, binding = 1) uniform accelerationStructureEXT sceneTlas;
 
-// 该列的地面世界 Y；无命中写 TERRAIN_HEIGHT_EMPTY。
 layout(set = 0, binding = 2, r32f) uniform image2D terrainHeightImage;
 
-// 选择 terrain_height.glsl 里的"生产者"半边（射线追踪函数）。消费者半边
-// （terrainGroundHeight）依赖 sampler2D terrainHeightMap，这个 pass 没有，不选。
 #define TERRAIN_HEIGHT_PRODUCER 1
 #include "terrain_height.glsl"
 
@@ -47,7 +30,6 @@ void main()
     vec2 worldXZ = terrainHeightCenterXZ() +
         (uv * 2.0 - 1.0) * TERRAIN_HEIGHT_EXTENT_XY;
 
-    // 起点高度与长度只跟相机 Y 有关，所以对所有纹素都一样。
     float originY;
     float maxDistance;
     terrainHeightProbeRange(originY, maxDistance);
@@ -56,8 +38,6 @@ void main()
     vec3 origin = vec3(worldXZ.x, originY, worldXZ.y);
     float hitDistance = terrainHeightTrace(origin, down, maxDistance);
 
-    // 返回值正好等于 maxDistance 就是"没打到"。留 0.5 格的余量，
-    // 免得贴着下边界的命中被误判成 miss。
     float groundY = hitDistance < maxDistance - 0.5
         ? origin.y - hitDistance
         : TERRAIN_HEIGHT_EMPTY;

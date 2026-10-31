@@ -6,28 +6,13 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class PBRAtlasStorage {
-    // 2026-10-29：这两份 CPU 图集是**上传后即退役**的 —— TextureAtlasPBRMixin 在
-    // NativeVulkan.uploadPBRAtlases(...) 返回后立刻 close 并置 null（见那边的说明）。
-    // 唯一合法用法：在同一段构建代码里 new → 填充 → 取 getPointer() 上报 → 关闭。
-    // 任何"稍后再读 CPU 图集"的写法都会拿到 null，请改成延迟关闭而不是假设它有效。
     public static NativeImage globalNormalAtlas = null;
     public static NativeImage globalSpecularAtlas = null;
 
-    // VPT-1.3: one RGB value per atlas sprite, expanded over that sprite's
-    // atlas rectangle.  Section compilation reads this CPU image by mesh UV;
-    // it is never uploaded as a Vulkan texture.
     public static NativeImage globalVptAlbedoAtlas = null;
 
-    // OMM uses the original sprite alpha, never the PBR atlas.  Regions are
-    // rebuilt on every block-atlas reload and are read-only while sections are
-    // compiled on worker threads.
     private static volatile long ommRegionGeneration;
 
-    // Spatial index over ommSpriteRegions: a uniform UV grid where each cell
-    // holds, in list order, every region whose rectangle overlaps the cell.
-    // A bucket scan visits a strict subset of the previous linear scan in the
-    // same relative order, so the first containing region -- and therefore the
-    // returned answer -- is identical to the full scan.
     private static final int REGION_GRID = 64;
     private static volatile List<OmmSpriteRegion>[] ommRegionGrid = emptyRegionGrid();
 
@@ -38,13 +23,6 @@ public final class PBRAtlasStorage {
     private static final ThreadLocal<RegionLookup> LAST_OMM_REGION =
             ThreadLocal.withInitial(RegionLookup::new);
 
-    // Bumped on every block-atlas reload. The bind hook in
-    // VulkanRenderPassAtlasHijackMixin caches the last (epoch, view) pair, so
-    // a reload still forces its push when the driver hands the replacement the
-    // freed view's numeric value -- the one case a handle comparison alone
-    // reads as "nothing changed".  Lives here rather than in the mixin because
-    // a static member of a mixin is merged into the target class, leaving the
-    // mixin's own copy untouched.
     private static final AtomicLong ATLAS_EPOCH = new AtomicLong();
 
     public static void bumpAtlasEpoch() {
@@ -68,9 +46,6 @@ public final class PBRAtlasStorage {
         @SuppressWarnings("unchecked")
         final List<OmmSpriteRegion>[] grid = new List[REGION_GRID * REGION_GRID];
         for (OmmSpriteRegion region : regions) {
-            // Register with the same epsilon padding containsPoint accepts, so
-            // a point found by the old linear scan always lands in a cell the
-            // region was registered under.
             final int minU = regionCell(region.u0() - OmmSpriteRegion.UV_EPSILON);
             final int maxU = regionCell(region.u1() + OmmSpriteRegion.UV_EPSILON);
             final int minV = regionCell(region.v0() - OmmSpriteRegion.UV_EPSILON);
@@ -91,35 +66,16 @@ public final class PBRAtlasStorage {
     }
 
     private static int regionCell(float uv) {
-        // Clamp instead of rejecting: atlas edge regions accept points a hair
-        // outside [0,1] (containsPoint epsilon), and the old scan found them.
         final int cell = (int) (uv * REGION_GRID);
         return Math.max(0, Math.min(REGION_GRID - 1, cell));
     }
 
-    // MC 26.3 derives the chunk layer of every quad from the sprite's own
-    // pixels (ChunkSectionLayer.byTransparency), and one anti-aliased texel is
-    // enough to move leaves, grass and vines into the TRANSLUCENT layer beside
-    // windows.  Inside that layer a window is a sprite whose *body* is
-    // half-transparent: most of its area is neither invisible nor opaque.
-    // Cutout art with a soft edge -- leaves, grass, vines, bars, chains --
-    // spends its anti-aliased texels on a thin fringe and stays either mostly
-    // invisible or mostly opaque, so it fails this test.  The mean alpha of
-    // the visible texels was tried first and cannot do the job: fire is
-    // painted as a soft low-alpha blob, so it averages darker than most glass
-    // while sharing none of its behaviour.
     private static final float SEE_THROUGH_BODY_FRACTION = 0.5f;
 
-    // Alpha this high or higher is opaque body, not transmission.
     private static final int OPAQUE_ALPHA = 250;
 
-    // The visible texels must also average well below opaque, so a sprite that
-    // is "half-transparent" only through a broad near-opaque gradient is not
-    // misread as a window.
     private static final float SEE_THROUGH_MAX_MEAN_ALPHA = 240.0f;
 
-    // Precomputed once per sprite at atlas build time; a section compile then
-    // reads one boolean instead of walking pixels per quad.
     public static boolean computeSeeThrough(NativeImage source) {
         if (source == null) {
             return false;
@@ -157,8 +113,6 @@ public final class PBRAtlasStorage {
         }
 
         if (visible == 0L) {
-            // Fully transparent everywhere: no material at all, so it must
-            // never be published as a see-through body.
             return false;
         }
 
@@ -170,9 +124,6 @@ public final class PBRAtlasStorage {
         return meanVisibleAlpha < SEE_THROUGH_MAX_MEAN_ALPHA;
     }
 
-    // Answers for the quad currently being tagged.  An unknown footprint keeps
-    // the historical answer: before the texture was consulted at all, every
-    // unclassified translucent-layer quad was published as clear glass.
     public static boolean spriteIsSeeThrough(float u, float v) {
         final OmmSpriteRegion region = findOmmSpriteRegion(u, v);
         return region == null || region.seeThrough();

@@ -63,7 +63,6 @@ public abstract class VulkanGpuSurfaceAcquireMixin {
 
     @Inject(method = "acquireNextTexture", at = @At("RETURN"), remap = false)
     private void afterAcquire(CallbackInfo ci) {
-        // 必须先结算再走下面的 early return，否则 resolveSurfaceFields 失败时会漏记。
         FrameBudget.acquireTail();
 
         if (NativeVulkan.handlesPending) {

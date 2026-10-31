@@ -1,46 +1,11 @@
-// ===========================================================================
-// vendored from takram-design-engineering/three-geospatial (MIT):
-//   packages/atmosphere/src/shaders/bruneton/{file}
-// 上游基于 Eric Bruneton "Precomputed Atmospheric Scattering" (BSD-2)。
-// 本文件为原样入库（本移植仅做 include guard / 精度声明 / 坐标注入适配，
-// 数学与常量未动）。授权全文保留在文件头部原注释中。
-// 消费者须已声明 #extension GL_GOOGLE_include_directive : require。
-// ===========================================================================
 #ifndef BRUNETON_DEFINITIONS
 #define BRUNETON_DEFINITIONS
 precision highp float;
 precision highp sampler3D;
 
-// Based on: https://github.com/ebruneton/precomputed_atmospheric_scattering/blob/master/atmosphere/definitions.glsl
 
-/**
- * Copyright (c) 2017 Eric Bruneton
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the copyright holders nor the names of its
- *    contributors may be used to endorse or promote products derived from
- *    this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
- * THE POSSIBILITY OF SUCH DAMAGE.
- */
+
+
 
 #define assert(x)
 
@@ -68,28 +33,17 @@ precision highp sampler3D;
 #define Luminance float
 #define Illuminance float
 
-// A generic function from Wavelength to some other type.
 #define AbstractSpectrum vec3
-// A function from Wavelength to Number.
 #define DimensionlessSpectrum vec3
-// A function from Wavelength to SpectralPower.
 #define PowerSpectrum vec3
-// A function from Wavelength to SpectralIrradiance.
 #define IrradianceSpectrum vec3
-// A function from Wavelength to SpectralRadiance.
 #define RadianceSpectrum vec3
-// A function from Wavelength to SpectralRadianceDensity.
 #define RadianceDensitySpectrum vec3
-// A function from Wavelength to ScatteringCoefficient.
 #define ScatteringSpectrum vec3
 
-// A position in 3D (3 length values).
 #define Position vec3
-// A unit direction vector in 3D (3 unit-less values).
 #define Direction vec3
-// A vector of 3 luminance values.
 #define Luminance3 vec3
-// A vector of 3 illuminance values.
 #define Illuminance3 vec3
 
 #define TransmittanceTexture sampler2D
@@ -108,8 +62,7 @@ const LuminousPower lm = 1.0;
 
 #if !defined(PI)
 const float PI = 3.14159265358979323846;
-#endif // !defined(PI)
-
+#endif
 const Length km = 1000.0 * m;
 const Area m2 = m * m;
 const Volume m3 = m * m * m;
@@ -155,4 +108,4 @@ struct AtmosphereParameters {
   Number mu_s_min;
 };
 
-#endif // BRUNETON_DEFINITIONS
+#endif

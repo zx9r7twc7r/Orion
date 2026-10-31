@@ -78,28 +78,17 @@ public final class EntityVisibilityCuller {
     private static final int CAPTURE_FRAMES = 5;
     private static final double HITBOX_LIMIT = 50.0D;
     private static final long VISIBLE_HOLD_MS = 1000L;
-    /**
-     * 是否允许剔除"视锥外"的实体。{@code false} = 自创的保守档（光追保阴影/GI）：
-     */
+    
+
     private static final boolean CULL_OUTSIDE_FRUSTUM = false;
-    /**
-     * 相机高速移动闸门，**照抄 Sodium**：
-     * {@code sodium/client/render/chunk/occlusion/AsyncCameraTimingControl.java:8-10}
-     * （{@code ENTER_SYNC_STEP_THRESHOLD = 32}, {@code EXIT_SYNC_STEP_THRESHOLD = 20}）。
-     *
-     * <p>Sodium 用它决定"区块可见性图这一帧走同步还是异步"；我们用同一判据决定
-     * "这份异步剔除结果还可不可信"：单帧位移 ≥32 格（传送、旁观加速、鞘翅俯冲）时，
-     * 采集快照与真实相机已经对不上，继续用只会错剔 ⇒ 释放全部结果；位移回落到 ≤20 格
-     * 才恢复。两个阈值成迟滞带，避免在阈值附近来回切。</p>
-     */
+    
+
     private static final double CAMERA_SYNC_ENTER_BLOCKS = 32.0D;
     private static final double CAMERA_SYNC_EXIT_BLOCKS = 20.0D;
 
     private static final AtomicBoolean enabled = new AtomicBoolean(resolveEnabled());
     private static final AtomicBoolean available = new AtomicBoolean(false);
-    /** 主线程写、守护线程读：本轮的候选快照。 */
     private static final AtomicReference<Batch> pending = new AtomicReference<>(Batch.EMPTY);
-    /** 守护线程写、渲染线程读：本轮被判为不可见的实体 id。整轮替换，永不残留。 */
     private static final AtomicReference<IntOpenHashSet> culled =
             new AtomicReference<>(new IntOpenHashSet());
     private static final Set<Integer> forcedVisibleIds = ConcurrentHashMap.newKeySet();
@@ -108,28 +97,22 @@ public final class EntityVisibilityCuller {
     private static OrionVoxelDataProvider provider;
     private static Thread worker;
 
-    /** 主线程：帧序号（采集节奏）。 */
     private static int frameCounter;
-    /** 主线程写、守护线程读：世界实例身份变化的代数，防止旧世界的判定结果落到新世界。 */
     private static volatile int levelEpoch;
     private static ClientLevel lastLevel;
 
-    /** 守护线程消费请求（世界 tick / 新采集）。 */
     private static volatile boolean requestCull = true;
     private static volatile double cameraX;
     private static volatile double cameraY;
     private static volatile double cameraZ;
     private static volatile boolean cameraValid;
-    /** 调试读数。 */
     private static volatile int lastConsidered;
     private static volatile int lastCulled;
 
-    // 主线程私有：相机位移闸门状态（每帧更新，见 updateCameraMoveGate）。
     private static double gateLastX = Double.NaN;
     private static double gateLastY = Double.NaN;
     private static double gateLastZ = Double.NaN;
     private static boolean gateValid;
-    /** true = 相机正在高速移动，本帧不做剔除（全部可见）。 */
     private static boolean fastCameraMove;
 
     private EntityVisibilityCuller() {}
@@ -151,7 +134,6 @@ public final class EntityVisibilityCuller {
         final int id;
         final double minX, minY, minZ, maxX, maxY, maxZ;
         final double posX, posY, posZ;
-        /** 采集时这一帧是否落在相机视锥内（见 {@link #CULL_OUTSIDE_FRUSTUM}）。 */
         final boolean inFrustum;
 
         Candidate(int id, AABB box, Vec3 position, boolean inFrustum) {
@@ -174,7 +156,6 @@ public final class EntityVisibilityCuller {
     }
 
     private static boolean resolveEnabled() {
- // 应急总闸：-Drtx.=0（与本工程其它调试开关同风格）。
         return !"0".equals(System.getProperty("rtx.entityCulling", "1"));
     }
 
@@ -254,7 +235,6 @@ public final class EntityVisibilityCuller {
         if(!isCullingActive()) {
             return;
         }
-        // 位移闸门逐帧更新（与 Sodium 一致），采集本身仍按 CAPTURE_FRAMES 节流。
         final Minecraft minecraft = Minecraft.getInstance();
         final Camera camera = minecraft.gameRenderer == null
                 ? null
@@ -266,7 +246,6 @@ public final class EntityVisibilityCuller {
         try {
             captureRound(minecraft, camera);
         } catch(Throwable failure) {
-            // 策略 3：采集失败一律退回"全部可见"，绝不让剔除链路把渲染线程带走。
             if(!captureFailureLogged) {
                 captureFailureLogged = true;
                 System.err.println("[ORION CULL] capture failed, releasing all: " + failure);
@@ -317,7 +296,6 @@ public final class EntityVisibilityCuller {
     private static void captureRound(Minecraft minecraft, Camera camera) {
         final ClientLevel level = minecraft.level;
         if(level == null || minecraft.player == null || minecraft.player.tickCount <= 10) {
-            // 不在世界里：清空结果，避免残留判定把新世界的实体误剔。
             lastLevel = null;
             pending.set(Batch.EMPTY);
             culled.set(new IntOpenHashSet());
@@ -325,7 +303,6 @@ public final class EntityVisibilityCuller {
             return;
         }
         if(level != lastLevel) {
-            // 换维/换世界：id 命名空间可能复用，作废本轮所有结果。
             lastLevel = level;
             ++levelEpoch;
             culled.set(new IntOpenHashSet());
@@ -342,10 +319,6 @@ public final class EntityVisibilityCuller {
         cameraZ = cameraPos.z;
         cameraValid = true;
 
-        // 相机高速移动闸门（Sodium AsyncCameraTimingControl 同款 32/20 迟滞）：
-        // 位移过大的帧，异步判定与真实相机已经对不上 ⇒ 作废整轮结果、全部可见。
-        // 相机快照仍然更新、requestCull 仍然置位，让剔除线程用空批次自然收尾，
-        // 不会把上一轮的集合继续沿用下去。
         if(fastCameraMove) {
             pending.set(new Batch(Collections.emptyList(), levelEpoch));
             requestCull = true;
@@ -355,8 +328,6 @@ public final class EntityVisibilityCuller {
             return;
         }
 
-        // 自创（光追保阴影）：视锥判定必须在主线程做 —— Frustum 是相机持有的可变对象，
-        // 跨线程读会和下一帧的 prepareCullFrustum()/offset() 撞车。这里只把结果布尔量带走。
         final Frustum frustum = camera.getCullFrustum();
 
         final List<Candidate> candidates = new ArrayList<>();
@@ -387,8 +358,6 @@ public final class EntityVisibilityCuller {
         if(entity == null) {
             return null;
         }
-        // 策略 2：玩家 / 相机实体 / 载具与乘客 / 矿车永不剔。
-        // 我们还有本地玩家身体代理（LevelRendererMixin 合成提交），误剔就是"自己不见了"。
         if(entity == minecraft.player
                 || entity == camera.entity()
                 || entity.isPassenger()
@@ -397,17 +366,14 @@ public final class EntityVisibilityCuller {
                 || forcedVisibleIds.contains(entity.getId())) {
             return null;
         }
-        // 发光（队伍/被敌人标记）实体不剔。
         if(minecraft.shouldEntityAppearGlowing(entity)) {
             return null;
         }
-        // 完全隐形的实体本来就不提交模型几何，没什么可剔的。
         if(entity.isInvisible()) {
             return null;
         }
         final EntityRenderer<? super Entity, ?> renderer =
                 minecraft.getEntityRenderDispatcher().getRenderer(entity);
-        // instanceof 而不是强转：万一 mixin 没被应用，这里只是"不剔"，不会把渲染线程打崩。
         if(!(renderer instanceof EntityRendererCullAccess access)) {
             if(!accessorFailureLogged) {
                 accessorFailureLogged = true;
@@ -424,15 +390,11 @@ public final class EntityVisibilityCuller {
             return null;
         }
         if(box.hasNaN() || box.getSize() == 0.0D) {
-            // 原版 EntityRenderer.shouldRender 的同款兜底：marker 盔甲架、display 实体的
-            // 剔除盒是 0 尺寸，给一个 2 格盒。
             final double x = entity.getX();
             final double y = entity.getY();
             final double z = entity.getZ();
             box = new AABB(x - 2.0D, y - 2.0D, z - 2.0D, x + 2.0D, y + 2.0D, z + 2.0D);
         }
-        // 自创：视锥外不剔（见类注释与 CULL_OUTSIDE_FRUSTUM）。判据与
-        // EntityRenderer.shouldRender 一致：剔除盒（同上兜底）对相机视锥求交。
         final boolean inFrustum = CULL_OUTSIDE_FRUSTUM || frustum == null || frustum.isVisible(box);
         return new Candidate(entity.getId(), box, entity.position(), inFrustum);
     }
@@ -441,10 +403,7 @@ public final class EntityVisibilityCuller {
         final Vec3d camera = new Vec3d(0, 0, 0);
         final Vec3d aabbMin = new Vec3d(0, 0, 0);
         final Vec3d aabbMax = new Vec3d(0, 0, 0);
-        // 守护线程私有：最近一次被判为可见的时间（1s 迟滞）。其余线程不读。
         final Int2LongOpenHashMap lastVisibleAt = new Int2LongOpenHashMap();
-        // 缺省 0 = "很久以前"：未记录过的实体第一轮就会被正常判定（不能用 Long.MIN_VALUE，
-        // 否则 now - MIN_VALUE 会溢出成负数，所有实体都会被误当成"刚判过可见"）。
         lastVisibleAt.defaultReturnValue(0L);
 
         double lastCameraX = Double.NaN;
@@ -482,7 +441,6 @@ public final class EntityVisibilityCuller {
 
                 final Batch batch = pending.get();
                 if(batch.epoch != levelEpoch) {
-                    // 采集后换过世界：这份快照作废（主线程已清空结果）。
                     continue;
                 }
                 final List<Candidate> candidates = batch.candidates;
@@ -499,11 +457,9 @@ public final class EntityVisibilityCuller {
                 final long now = System.currentTimeMillis();
                 final IntOpenHashSet hidden = new IntOpenHashSet(Math.max(16, candidates.size() / 4));
                 for(Candidate candidate : candidates) {
-                    // 策略 2 的运行时版本：1s 强制可见窗口（CullableMixin.setTimeout）。
                     if(now - lastVisibleAt.get(candidate.id) < VISIBLE_HOLD_MS) {
                         continue;
                     }
-                    // 策略 1：超出追踪距离不剔（CullTask:105-110），并刷新可见窗口。
                     final double dx = candidate.posX - camX;
                     final double dy = candidate.posY - camY;
                     final double dz = candidate.posZ - camZ;
@@ -511,12 +467,10 @@ public final class EntityVisibilityCuller {
                         lastVisibleAt.put(candidate.id, now);
                         continue;
                     }
-                    // 自创：视锥外不剔（光追下仍会投影/参与 GI）。采集时已算好，这里只读布尔。
                     if(!candidate.inFrustum) {
                         lastVisibleAt.put(candidate.id, now);
                         continue;
                     }
-                    // 超大箱子放行（CullTask:111-116），同样刷新可见窗口。
                     if(candidate.sizeX() > HITBOX_LIMIT || candidate.sizeY() > HITBOX_LIMIT
                             || candidate.sizeZ() > HITBOX_LIMIT) {
                         lastVisibleAt.put(candidate.id, now);
@@ -528,7 +482,6 @@ public final class EntityVisibilityCuller {
                     try {
                         visible = culling.isAABBVisible(aabbMin, aabbMax, camera);
                     } catch(Throwable failure) {
-                        // 策略 3：异常按可见处理。
                         lastVisibleAt.put(candidate.id, now);
                         continue;
                     }
@@ -538,13 +491,11 @@ public final class EntityVisibilityCuller {
                         hidden.add(candidate.id);
                     }
                 }
-                // 整轮替换：不在本轮集合里的实体一律可见（含已卸载的实体）。
                 culled.set(hidden);
                 lastConsidered = candidates.size();
                 lastCulled = hidden.size();
                 prune(lastVisibleAt, now);
             } catch(Throwable failure) {
-                // 策略 3：任何异常都退回"全部可见"，绝不凭空消失。
                 System.err.println("[ORION CULL] round failed, releasing all: " + failure);
                 culled.set(new IntOpenHashSet());
             }

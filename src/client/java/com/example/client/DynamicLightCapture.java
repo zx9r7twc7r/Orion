@@ -50,47 +50,34 @@ import org.lwjgl.system.MemoryUtil;
  */
 public final class DynamicLightCapture
 {
-    /** 每帧最多上报多少条。native 侧上限 128，这里留足余量即可。 */
     private static final int MAX_LIGHTS = 32;
 
-    /** 与 native 侧 {@code DynamicLightRecord} 一致：4 float + 4 int。 */
     private static final int BYTES_PER_LIGHT = 32;
 
-    /** 超过这个距离的实体不参与（本地光本来就有距离衰减，远处不值得付采样成本）。 */
     private static final double MAX_DISTANCE = 48.0;
 
-    /**
-     * 应急总闸（不需要重编、不需要 GUI）：{@code -Dorion.dynamicLights=0} 关掉整条链路
-     * —— 连每帧采集与 JNI 调用一起省掉，比把设置里的强度滑条拖到 0 更彻底。
-     */
+    
+
     private static final boolean ENABLED =
             !"0".equals(System.getProperty("orion.dynamicLights"));
 
-    /**
-     * 发光实体 → {发射等级 0..15, RGB}。
-     *
-     * <p>只收"看起来就在发光"的实体。刻意**不含** {@code experience_orb} 这类成百上千的量：
-     * 它们会瞬间占满 32 个槽位、把烈焰人这类真正的光源挤掉（而且经验塔会整片发亮）。</p>
-     */
+    
+
     private static final Map<String, int[]> ENTITY_LIGHTS = Map.ofEntries(
-            // 暖橙
             Map.entry("blaze", new int[] {15, rgb(255, 140, 46)}),
             Map.entry("magma_cube", new int[] {12, rgb(255, 89, 20)}),
             Map.entry("small_fireball", new int[] {14, rgb(255, 128, 31)}),
             Map.entry("fireball", new int[] {15, rgb(255, 128, 31)}),
             Map.entry("dragon_fireball", new int[] {15, rgb(255, 115, 160)}),
-            // 青 / 蓝白
             Map.entry("glow_squid", new int[] {12, rgb(56, 199, 255)}),
             Map.entry("allay", new int[] {10, rgb(140, 217, 255)}),
             Map.entry("spectral_arrow", new int[] {6, rgb(128, 230, 255)}),
-            // 高亮
             Map.entry("end_crystal", new int[] {15, rgb(255, 140, 242)}),
             Map.entry("lightning_bolt", new int[] {15, rgb(217, 230, 255)}),
             Map.entry("firework_rocket", new int[] {10, rgb(255, 217, 128)}),
             Map.entry("glow_item_frame", new int[] {8, rgb(255, 209, 122)})
     );
 
-    /** 非方块物品的发光（方块物品走 BlockState.getLightEmission）。 */
     private static final Map<String, Integer> ITEM_LIGHT_EMISSION = Map.of(
             "lava_bucket", 15
     );
@@ -103,10 +90,8 @@ public final class DynamicLightCapture
 
     private static int lastReportedCount = -1;
 
-    /**
-     * native 侧缺这个符号时置位（例如把 {@code run/rtx_backend.dll} 回滚成旧版）。
-     * 不这样处理的话，每帧一次 {@code UnsatisfiedLinkError} 会把渲染线程打断。
-     */
+    
+
     private static boolean nativeUnavailable = false;
 
     private DynamicLightCapture() {}
@@ -118,7 +103,6 @@ public final class DynamicLightCapture
         double y;
         double z;
         int emission;
-        /** 颜色（8/8/8 打包）。0 = 没给 ⇒ 着色器回退到调色板。 */
         int packedRgb;
     }
 
@@ -155,12 +139,11 @@ public final class DynamicLightCapture
                     .putFloat((float) candidate.y)
                     .putFloat((float) candidate.z)
                     .putFloat(candidate.emission)
-                    .putInt(0)                  // meta.x：typeCode —— 现在只做兜底，0 = 用 RGB
-                    .putInt(candidate.packedRgb) // meta.y：8/8/8 RGB
+                    .putInt(0)
+                    .putInt(candidate.packedRgb)
                     .putInt(0)
                     .putInt(0);
         }
-
         records.flip();
 
         try
@@ -173,7 +156,6 @@ public final class DynamicLightCapture
         }
         catch(Throwable failure)
         {
-            // 旧 DLL 没有这个符号：一次性降级并留一行日志，不要每帧抛异常。
             nativeUnavailable = true;
             System.out.println("[DYNLIGHT] disabled: " + failure);
             return;
@@ -201,7 +183,6 @@ public final class DynamicLightCapture
         collectHeldLights(minecraft);
         collectEntityLights(minecraft);
 
-        // 按实体 id 升序 —— 槽位稳定（见类注释）。
         candidates.sort(Comparator.comparingInt(candidate -> candidate.id));
 
         return Math.min(candidates.size(), MAX_LIGHTS);
@@ -211,7 +192,6 @@ public final class DynamicLightCapture
     {
         final int playerId = minecraft.player.getId();
 
-        // 眼位 + 视线方向偏移 ≈ 手上的位置。两种手分别算，避免主副手都有光时两点重合。
         addHeldLight(
                 minecraft,
                 minecraft.player.getMainHandItem(),
@@ -304,7 +284,6 @@ public final class DynamicLightCapture
 
         final Item item = stack.getItem();
 
-        // 方块物品：直接问方块自己的光照等级（火把/灯笼/萤石/海晶灯/菌光体…全都覆盖）。
         if(item instanceof BlockItem blockItem)
         {
             return blockItem.getBlock().defaultBlockState().getLightEmission();
@@ -326,7 +305,6 @@ public final class DynamicLightCapture
 
         if(!(item instanceof BlockItem blockItem))
         {
-            // 非方块物品（岩浆桶一类）统一暖橙。
             return rgb(255, 140, 46);
         }
 
@@ -336,27 +314,22 @@ public final class DynamicLightCapture
                 block == Blocks.LANTERN || block == Blocks.CAMPFIRE ||
                 block == Blocks.FIRE)
         {
-            return rgb(255, 140, 51);            // 暖橙（调色板 1）
+            return rgb(255, 140, 51);
         }
-
         if(block == Blocks.SOUL_TORCH || block == Blocks.SOUL_WALL_TORCH ||
                 block == Blocks.SOUL_LANTERN || block == Blocks.SOUL_CAMPFIRE ||
                 block == Blocks.SOUL_FIRE)
         {
-            return rgb(51, 191, 255);            // 青蓝（调色板 2）
+            return rgb(51, 191, 255);
         }
-
         if(block == Blocks.REDSTONE_TORCH || block == Blocks.REDSTONE_WALL_TORCH)
         {
-            return rgb(255, 31, 15);             // 红（调色板 3）
+            return rgb(255, 31, 15);
         }
-
         if(block == Blocks.LAVA)
         {
-            return rgb(255, 69, 13);             // 岩浆橙（调色板 4）
+            return rgb(255, 69, 13);
         }
-
-        // 暖白（调色板默认值）：萤石 / 海晶灯 / 菌光体 / 南瓜灯 / 红石灯…
         return rgb(255, 209, 122);
     }
 
@@ -367,7 +340,6 @@ public final class DynamicLightCapture
 
     private static String pathOf(Object registryEntry)
     {
-        // 1.21+ 的注册表键是 Identifier；这里只取 path（"torch" / "blaze" …）。
         final var key = registryEntry instanceof Item item
                 ? BuiltInRegistries.ITEM.getKey(item)
                 : BuiltInRegistries.ENTITY_TYPE.getKey(

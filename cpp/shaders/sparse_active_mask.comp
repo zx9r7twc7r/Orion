@@ -2,20 +2,6 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_GOOGLE_include_directive : require
 
-// ============================================================================
-// 2026-10-27 稀疏渲染的活跃像素掩码。照搬 RTX Remix：
-//   _ref/dxvk-remix/src/dxvk/shaders/rtx/pass/sparse_rendering/active_pixel_mask.comp.slang
-//   _ref/.../active_pixel_mask_binding_indices.h
-//     ACTIVE_PIXEL_MASK_THREADGROUP_SIZE_WIDTH/HEIGHT = 8 / 8
-//     ACTIVE_PIXEL_MASK_BLOCK_WIDTH/HEIGHT            = 4 / 2
-//   一个线程 = 一个 mask texel = 一个 4x2 像素块，结果打包进一个 uint 的
-//   低 8 位（bit = localY * 4 + localX）。越界像素的 bit 恒 0（= 非活跃）。
-//
-// 判定与 rt_test.rgen 的 vptSparsePixelIsActive 必须逐位一致：
-//   阈值 = BlueNoise128x128x64x8（Remix 默认噪声源）
-//   active = threshold <= samplingRate
-// 因此 rgen 可以直接读这张图，不必再自己抽签（Remix 的 raygen 也是读 mask）。
-// ============================================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -29,16 +15,15 @@ layout(binding = 1, std430) readonly buffer BlueNoiseTable
 
 layout(push_constant) uniform SparseMaskPush
 {
-    uint width;        // 渲染分辨率
+    uint width;
     uint height;
     uint frameIndex;
-    uint maskWidth;    // mask 的 block 列数 = ceil(width / 4)
-    float samplingRate;// [0,1]，宿主已按 Remix 的 adaptive / max 规则算好
+    uint maskWidth;
+    float samplingRate;
     uint pad0;
     uint pad1;
     uint pad2;
 } pc;
-
 // 与 rt_test.rgen 的 vptSparseBlueNoiseThreshold 逐行相同。
 float sparseBlueNoiseThreshold(uvec2 pixelCoord, uint frameIdx)
 {

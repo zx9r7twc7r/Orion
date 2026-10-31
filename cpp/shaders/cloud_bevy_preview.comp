@@ -1,67 +1,50 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-// ===========================================================================
-// v4 预览：同一个 compute 里四种模式（push constant.mode）
-//   0 = 烘焙 2D 图集（atlasImage）
-//   1 = 烘焙 32³ worley（worleyImage）
-//   2 = 烘焙 64³ Perlin-Worley 形状体（shapeVolume）
-//   3 = raymarch（输出 rgba16f，rgb=散射，a=透射率）
-// 与游戏内 volumetric_clouds_v4.comp 共用 cloud_bevy_core.glsl。
-// 注意 mode 的编号顺序是"历史遗留"的（2 是形状体、3 才是 raymarch），
-// 宿主每帧必须推 3 才会跑主 march —— 之前推 2 导致整帧只重烘形状体、画面全黑。
-// ===========================================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform PreviewParams
 {
-    vec4 cameraPosition;   // xyz=相机（格，绝对）, w=垂直 FOV(rad)
-    vec4 cameraForward;    // xyz=视线, w=未用
-    vec4 cameraRight;      // xyz=右, w=未用
-    vec4 cameraUp;         // xyz=上, w=未用
-    vec4 sunDirection;     // xyz=太阳方向, w=太阳强度
-    vec4 layer;            // x=云底, y=云顶, z=时间, w=frameIndex
-    vec4 shape;            // x=coverage, y=density, z=baseScale, w=detailScale
-    vec4 light;            // x=steps, y=shadowSteps, z=ambientScale, w=sunScale
-    vec4 extras;           // x=detailStrength, y=edgeSoftness, z=bottomSoftness, w=未用（曝光只在 tonemap）
-    vec4 steps;            // x=shapeAmount, y=shapeScale, z=sunGlow, w=unused
-    vec4 sky;              // rgb=天空辐亮度（与 tonemap 同一份）, w=unused
-    vec4 flags;            // x=1 ⇒ A 方案原型（有限云团），y=1 ⇒ B 方案（体积）
-    vec4 volume;           // xyz=体积中心（世界 xz）, w=边长（格）
-    // ---- UE 预设专属（2026-10-22），追加在末尾，std140 偏移不影响上面任何字段 ----
-    vec4 ueA;              // x=msOctaves y=msContribution z=msOcclusion w=luminanceScale
-    vec4 ueB;              // x=groundContribution y=cloudAO z=atmosphereDensity w=weatherScale 倍率
-    // ---- HP 全参数（2026-10-25，面板可调）----
-    vec4 hpA;   // x=DetailNoiseScale y=DetailStrength z=BottomSmoothHeight w=WispyEdgeWidth
-    vec4 hpB;   // x=WispyReach y=WispyTopHeight z=WispyTopHardness w=WispyWeight
-    vec4 hpC;   // x=BillowyWeight y=LoCoverTopMax z=LoCoverTopStr w=CovMapScale
-    vec4 hpD;   // x=ScWorleyStrength y=ScHeightScale z=ScCellThickStr w=unused
-    vec4 hpE;   // x=ForwardEcc y=BackwardEcc z=PowderIntensity w=AOUpwardScale
-    vec4 hpF;   // x=PhiFwdIntensity y=PhiFwdDepthPow z=PhiFwdDepthBias w=PhiFwdCompress
-    vec4 hpG;   // x=PhiFwdBoundary y=PhiFwdMSBuild z=ScatterODScale w=ScatterCurvePow
-    vec4 hpH;   // x=DetailStrengthCu y=DetailStrengthTcu z=DetailStrengthCb w=AmbientBottomMult
+    vec4 cameraPosition;
+    vec4 cameraForward;
+    vec4 cameraRight;
+    vec4 cameraUp;
+    vec4 sunDirection;
+    vec4 layer;
+    vec4 shape;
+    vec4 light;
+    vec4 extras;
+    vec4 steps;
+    vec4 sky;
+    vec4 flags;
+    vec4 volume;
+    vec4 ueA;
+    vec4 ueB;
+    vec4 hpA;
+    vec4 hpB;
+    vec4 hpC;
+    vec4 hpD;
+    vec4 hpE;
+    vec4 hpF;
+    vec4 hpG;
+    vec4 hpH;
 } params;
-
 layout(rgba16f, set = 0, binding = 1) uniform image2D atlasImage;
 layout(rgba16f, set = 0, binding = 2) uniform image3D worleyImage;
 layout(set = 0, binding = 3) uniform sampler2D atlasTex;
 layout(set = 0, binding = 4) uniform sampler3D worleyTex;
 layout(rgba16f, set = 0, binding = 5) uniform writeonly image2D outImage;
-layout(rgba16f, set = 0, binding = 6) uniform image3D shapeVolume;     // 64^3 Perlin-Worley
-layout(set = 0, binding = 7) uniform sampler3D shapeTex;              // 采样视图
-layout(r32f, set = 0, binding = 8) uniform writeonly image2D outDepth; // 首个命中距离（TAA 重投影用）
-layout(set = 0, binding = 9) uniform sampler3D baseTex;      // 3D base 体积（替代 2D 图集）
+layout(rgba16f, set = 0, binding = 6) uniform image3D shapeVolume;
+layout(set = 0, binding = 7) uniform sampler3D shapeTex;
+layout(r32f, set = 0, binding = 8) uniform writeonly image2D outDepth;
+layout(set = 0, binding = 9) uniform sampler3D baseTex;
 layout(rgba16f, set = 0, binding = 10) uniform image3D baseVolume;
-
 layout(push_constant) uniform Push
 {
-    vec4 mode;   // x = 0/1/2
+    vec4 mode;
 } pc;
-
 #include "cloud_bevy_core.glsl"
-// 2026-10-25：v5 重写版（Schneider 纹理式密度 + Hillaire 光照）。
-// mode 8 = 渲染；mode 10/11/12 = 烘焙 weather/detail/base（见文件头 mode 表）。
 #define V5_NOISE_BAKER 1
 #include "cloud_v5_core.glsl"
 // 接游戏端的大气散射模型与水波场（与 volumetric_clouds_v4.comp / 水面 pass 同一套 include）。
@@ -72,16 +55,14 @@ struct PreviewCamStub
 {
     vec4 historyParams;
     vec4 weatherParams;
-    vec4 waterStyleParams1;   // y = 大涌起伏, z = 细波纹理（游戏出厂 1.0）
+    vec4 waterStyleParams1;
     float frameCount;
 };
 const PreviewCamStub cam =
     PreviewCamStub(vec4(0.0), vec4(0.0), vec4(0.0, 1.0, 1.0, 1.0), 0.0);
-
-#include "sky_model_common.glsl"     // 内部再 include sky_sun_common.glsl
+#include "sky_model_common.glsl"
 #include "clear_sky_aerial.glsl"
-#include "water_noise_wave.glsl"     // 内部再 include water_psrdnoise.glsl
-
+#include "water_noise_wave.glsl"
 // 与游戏 volumetric_clouds_v4.comp 里的 v4HG 同式（归一化 HG，含 4π）
 float previewHG(float cosine, float g)
 {
@@ -123,7 +104,6 @@ vec3 previewSky(vec3 dir, vec3 sunDir, vec3 tint)
     vec3 col = (radianceZenith * wZ + radianceSunSide * wS + radianceAntiSun * wA) /
         max(wZ + wS + wA, 1.0e-4);
 
-    // 太阳盘 + 窄晕（大气模型只给散射底色，盘面要单独加）
     float mu = max(dot(dir, sunDir), 0.0);
     col += directLightColor * (pow(mu, 3000.0) * 9.0 + pow(mu, 120.0) * 0.20);
 
@@ -145,7 +125,6 @@ HPCloudConfig hpPreviewShapeConfig(float bottomHeight, float topHeight, float pl
     hp.planetRadius = planetRadius;
     hp.coverage = clamp(params.shape.x, 0.0, 1.0);
     hp.densityMult = params.shape.y * 0.004;
-    // 与游戏端逐字一致：shape.z 就是**噪声尺度**（越大云越小，方向反转在 UI 做）。
     hp.noiseScale = max(params.shape.z, 0.05);
     hp.detailScale = clamp(params.shape.w, 0.1, 12.0) / 10.0;
     hp.detailStrength = clamp(params.light.w, 0.0, 2.0);
@@ -169,7 +148,7 @@ HPCloudConfig hpPreviewShapeConfig(float bottomHeight, float topHeight, float pl
     hp.backwardEcc = clamp(params.hpE.y, 0.0, 1.0);
     hp.powderIntensity = clamp(params.hpE.z, 0.0, 1.0);
     hp.aoUpwardScale = clamp(params.hpE.w, 0.0, 2.0);
-    hp.phiFwdIntensity = clamp(params.hpF.x, 0.0, 6.0);   // 游戏 cloudMsParams.x 可到 6
+    hp.phiFwdIntensity = clamp(params.hpF.x, 0.0, 6.0);
     hp.phiFwdDepthPow = clamp(params.hpF.y, 0.0, 2.0);
     hp.phiFwdDepthBias = clamp(params.hpF.z, -0.3, 0.5);
     hp.phiFwdCompress = clamp(params.hpF.w, 0.0, 3.0);
@@ -179,14 +158,11 @@ HPCloudConfig hpPreviewShapeConfig(float bottomHeight, float topHeight, float pl
     hp.scatterCurvePow = clamp(params.hpG.w, 0.5, 3.0);
     return hp;
 }
-
 void main()
 {
     ivec3 id = ivec3(gl_GlobalInvocationID);
     int mode = int(pc.mode.x + 0.5);
 
-    // B 方案：体积中心/边长必须在**烘焙与采样之间保持一致**，否则云会与世界错位。
-    // 首次烘焙时宿主还没填 UBO（全 0），这里给默认值兜底。
     gBevyVolumeOrigin = params.volume.xyz;
     gBevyVolumeExtent = params.volume.w > 100.0 ? params.volume.w : 10000.0;
     gBevyLayerHeight = (params.layer.y - params.layer.x) > 10.0 ?
@@ -222,17 +198,12 @@ void main()
     }
     if(mode == 5)
     {
-        // B 方案：把云团场烘进 baseVolume（128³，一次），raymarch 时只做纹理采样
         ivec3 bsize = imageSize(baseVolume);
         if(any(greaterThanEqual(id, bsize))) return;
         imageStore(baseVolume, id, bevyRenderPuffVolume((vec3(id) + vec3(0.5)) / vec3(bsize)));
         return;
     }
 
-    // ---- v5 烘焙（2026-10-25）：三张资产，全部可平铺 ----
-    // mode 10：weather map → atlasImage（R 覆盖率 / G 云型 / B 密度）
-    // mode 11：detail 侵蚀 → worleyImage（R G B 三档 Worley）
-    // mode 12：base 形状   → baseVolume（R Perlin-Worley / G B A 三档 Worley）
     if(mode == 10)
     {
         ivec2 size = imageSize(atlasImage);
@@ -262,70 +233,46 @@ void main()
     ivec2 size = imageSize(outImage);
     if(any(greaterThanEqual(pixel, size))) return;
 
-    // ---- mode 13：密度场竖直切片诊断（2026-10-25）----
-    // 屏幕 x → 世界 x ∈ [-4000, 4000]（z = 相机 z + 2000），屏幕 y → 世界 y ∈
-    // [0, 云顶 + 400]。r = 完整密度，g = 光照 march 透过率，b = coverage。
-    // 直接看密度场的竖向结构，回答"云为什么是扁的"这类问题，不再靠猜。
     if(mode == 13)
     {
         vec2 uv01 = (vec2(pixel) + 0.5) / vec2(size);
         vec2 fwdXZ = normalize(params.cameraForward.xz);
-        // 2026-10-25：近场 0.2~10 km（7.7 m/px）。原来是 4~34 km，
-        // 在 pitch 25 下那条线整个跑到云层上方去了，切片里看不到任何东西还容易误判。
         float d = 200.0 + uv01.x * 9800.0;
         float wx = params.cameraPosition.x + fwdXZ.x * d;
         float wz = params.cameraPosition.z + fwdXZ.y * d;
         float wy = uv01.y * (params.layer.y + 400.0);
         HPCloudConfig hp = hpPreviewShapeConfig(params.layer.x, params.layer.y, 6360000.0);
-        // 诊断切片**不要距离淡出**（viewDistance=0 ⇒ 关闭）：这里要看的是原始密度场。
-        // （hpDefaultConfig 的默认值就是 0；显式再写一次是为了让意图留在代码里。）
         hp.viewDistance = 0.0;
         vec3 posAlt = vec3(wx, wy, wz);
         hp.cameraAlt = posAlt;
         float dens; float localH;
         hpEvaluateCloudProperties(posAlt, params.layer.y - params.layer.x, 0.0,
             false, hp, atlasTex, baseTex, worleyTex, dens, localH);
-        // r = 归一化密度（1 = 满密度 σt=1×densityMult；注意 outDensity 已含
-        //     densityMult，直接乘常数会永远接近 0 —— 第一版就是这样一片绿），
-        // g = profile 局部高度 localHeight，b = 空
         imageStore(outImage, pixel,
             vec4(clamp(dens / max(hp.densityMult, 1.0e-6), 0.0, 1.0), localH, 0.0, 1.0));
         imageStore(outDepth, pixel, vec4(1.0e9, 0.0, 0.0, 0.0));
         return;
     }
 
-    // ---- mode 14：密度场俯视切片（2026-10-25）----
-    // 屏幕 = 世界 XZ 平面（以相机为中心 ±12 km，覆盖半个天气图），高度取层中部。
-    // 用途：直接量化密度场的**各向异性**（"云为什么被沿 X 拉成条"这类问题），
-    // 不再靠从渲染图反推。r = 归一化密度 1 = 满密度，g = coverage，b = cloudType。
     if(mode == 14)
     {
         vec2 uv01 = (vec2(pixel) + 0.5) / vec2(size);
         HPCloudConfig hp = hpPreviewShapeConfig(params.layer.x, params.layer.y, 6360000.0);
-        hp.viewDistance = 0.0;                       // 诊断不看淡出
+        hp.viewDistance = 0.0;
         float wx = params.cameraPosition.x + (uv01.x - 0.5) * 24000.0;
         float wz = params.cameraPosition.z + (uv01.y - 0.5) * 24000.0;
-        // 高度：层中部（h = 0.45），密度最饱满的位置
         float wy = params.layer.x + (params.layer.y - params.layer.x) * 0.45;
         float dens;
         float localH;
         hpEvaluateCloudProperties(vec3(wx, wy, wz),
             max(params.layer.y - params.layer.x, 1.0), 0.0,
             false, hp, atlasTex, baseTex, worleyTex, dens, localH);
-        // r = 归一化密度（1 = 满密度）；g = profile 局部高度 localHeight。
-        // 想单独看体积纹理原始内容时，把下面两行换成
-        //   vec3 uvw = vec3(wx, wy, wz) / (8000.0 / max(params.shape.z, 0.05));
-        //   imageStore(..., vec4(texture(baseTex, uvw).r, texture(baseTex, vec3(uvw.x, 0.5, uvw.z)).r, 0, 1));
-        // （2026-10-25 就是这么抓到 CLAMP 采样器把半空间夹成平板的）。
         imageStore(outImage, pixel,
             vec4(clamp(dens / max(hp.densityMult, 1.0e-6), 0.0, 1.0), localH, 0.0, 1.0));
         imageStore(outDepth, pixel, vec4(1.0e9, 0.0, 0.0, 0.0));
         return;
     }
 
-    // ---- mode 7：诊断。把 baseVolume 在层中部的 xz 切片铺成一张图 ----
-    // 目的：标定它的实际值域分布。UE 模型的覆盖度 remap 需要知道这个分布，
-    // 否则只能瞎猜 —— 实测直接猜的结果是"处处薄云、没有云团"（见 out/ue2.png）。
     if(mode == 7)
     {
         const vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
@@ -337,9 +284,6 @@ void main()
     }
 
     vec2 ndc = (vec2(pixel) + 0.5) / vec2(size) * 2.0 - 1.0;
-    // Row 0 is the TOP of the screen, so NDC +y must mean "look up".
-    // Without this flip the whole image is vertically inverted (pitch +22 rendered
-    // a downward cloud-sea view).
     ndc.y = -ndc.y;
     float tanHalfFov = tan(params.cameraPosition.w * 0.5);
     float aspect = float(size.x) / float(size.y);
@@ -351,19 +295,12 @@ void main()
     float bottom = params.layer.x;
     float top = params.layer.y;
 
-    // 逐像素的天空辐亮度：合成、空气透视、地平线以下都由它负责
     vec3 skyRay = previewSky(dir, sunDir, params.sky.rgb);
 
-    // 太阳色接游戏端：volumetric_clouds_v4.comp 里 directLightColor 用的就是
-    // skyModelSunColor(lightDirection, 0.5)。这里只把它归一化成"最大通道=1"的染色，
-    // 绝对亮度仍由 0.85 那个辐亮度标定管，避免和曝光标定纠缠。
     vec3 sunTint = skyModelSunColor(sunDir.y > 0.0 ? sunDir : -sunDir, 0.5);
     sunTint /= max(max(sunTint.r, sunTint.g), max(sunTint.b, 1.0e-3));
     vec3 warmColor = sunTint;
 
-    // ---- 海面（Minecraft 海平面 y=63）----
-    // 预览原来在这个方向直接输出天空，等于把水面整块删掉了。接上之后，
-    // 日落能看到海面反照天空 + 太阳镜面高光，和游戏里对得上。
     const float SEA_LEVEL = 63.0;
     if(dir.y <= 0.0 && params.cameraPosition.y < bottom)
     {
@@ -372,19 +309,16 @@ void main()
             float tHit = (params.cameraPosition.y - SEA_LEVEL) / max(-dir.y, 1.0e-5);
             vec3 hitPos = vec3(params.cameraPosition.x, SEA_LEVEL,
                 params.cameraPosition.z) + dir * tHit;
-            // 游戏端的水波场（water_noise_wave.glsl，水面 pass 同一套）
             vec2 grad = waterNoiseWaveGradient(hitPos.xz, params.layer.z);
             vec3 n = normalize(vec3(-grad.x * 0.06, 1.0, -grad.y * 0.06));
             vec3 r = reflect(dir, n);
-            r.y = max(r.y, 0.02);          // 反射不能打到水面以下
+            r.y = max(r.y, 0.02);
             vec3 reflSky = previewSky(normalize(r), sunDir, params.sky.rgb);
             float cosV = clamp(dot(-dir, n), 0.0, 1.0);
             float fresnel = 0.02 + 0.98 * pow(1.0 - cosV, 5.0);
             vec3 water = mix(vec3(0.016, 0.040, 0.058), reflSky, fresnel);
-            // 太阳镜面高光（游戏里是 GGX，这里一个窄 pow 够看）
             float spec = pow(max(dot(r, sunDir), 0.0), 800.0);
             water += warmColor * params.sunDirection.w * 0.85 * spec * 6.0;
-            // 空气透视：远处水面必须渐渐融进天空，否则水面与天空在视界线上会有一条缝
             float waterFog = clamp(1.0 - exp(-tHit * 4.0e-4), 0.0, 0.85);
             water = mix(water, skyRay, waterFog);
             imageStore(outImage, pixel, vec4(water, 0.0));
@@ -398,39 +332,20 @@ void main()
     }
 
     BevyCloudConfig cfg;
-    // bevy 的 base_scale 默认 1.0；我们的滑条 0.25..2 先按 0.125 缩放对齐
-    // 与游戏 volumetric_clouds_v4.comp 的 cfg 映射**逐项一致**（滑条单位也一致）
     cfg.baseScale = max(params.shape.z, 0.05);
     cfg.raymarchSteps = int(clamp(params.light.x, 8.0, 256.0));
     cfg.bottomHeight = bottom;
     cfg.topHeight = top;
-    // bevy 的 coverage 语义是"1.0 = 满"，公式里会减 1；滑条 0..1 直接当它会导致
-    // 几乎没有云，这里映射到 0.55..1.0。密度再抬一个量级（bevy 出厂更密）。
-    // 归一化后（见 bevyGetDensity 里的 m = (m-0.30)*2.5）覆盖度≈被遮挡的天空比例，
-    // 滑条直接就是它，不再做 0.2+0.8x 的偏移。
     cfg.coverage = clamp(params.shape.x, 0.0, 1.0);
-    // Hillaire：σtBase（每格）。0.002 ⇒ 满密度 1800 层厚 τ≈3.6
     cfg.density = params.shape.y * 0.002;
-    // 我们的世界尺度比参考大：细节尺度按 30× 放大，否则 32³ worley 会被放大成巨块
-    // 上限 4 → 12：参考的 detail 周期应约为云半径的 1/3，现有 24（周期 ~925 格）
-    // 比云团还大，出不了絮状边缘。允许扫到 96 来验证。
     cfg.detailScale = clamp(params.shape.w, 0.1, 12.0) * 8.0;
-    // 与游戏一致：本项现在是**竖向拉伸**（0~1 → hn 倍率 1.0~5.0）
     cfg.detailStrength = clamp(params.extras.x, 0.0, 1.0);
-    cfg.baseEdgeSoftness = 0.65;   // 2D 模型的「云量阈值」基准
-    // 2026-10-19：extras.y → 逆光银边强度；extras.z → 凝聚度
+    cfg.baseEdgeSoftness = 0.65;
     cfg.silver = clamp(params.extras.y, 0.0, 1.0);
     cfg.cohesion = clamp(params.extras.z, 0.0, 1.0);
-    // 参考 config.rs：shadow_steps 6、step_size 10.0、multiply 1.3 ⇒ 只覆盖太阳方向
-    // 前方 ~138 格的**局部自遮挡**（团块之间的凹槽、云底暗部）。
-    // 之前写成 (top-bottom)/48：层厚 1200 时是 25 格 × 8 步覆盖 1100 格，相当于把
-    // 自遮挡糊成全局 AO，菜花状的沟壑全部被抹平 ⇒ 近处云永远像"烟"。
     cfg.shadowSteps = int(clamp(params.light.y, 1.0, 32.0));
-    // 与游戏一致：阴影步长按云的水平尺度（baseScale × 1400 / 12）
     cfg.shadowStepSize = clamp(cfg.baseScale * 1400.0 / 12.0, 20.0, 120.0);
     cfg.shadowStepMultiply = 1.3;
-    // 3D 形状体（mode 2 烘焙的 64^3 Perlin-Worley）：黑屏修好后按滑条给值。
-    // shapeWorldScale = 一个 3D 体素周期的世界尺度(格)；1200 格 ≈ 一个"云团"。
     cfg.shapeAmount = clamp(params.steps.x, 0.0, 1.0);
     cfg.shapeWorldScale = max(params.steps.y, 1.0) * 8000.0;
     cfg.shapeScale = max(params.steps.y, 0.01);
@@ -439,106 +354,48 @@ void main()
     cfg.forwardG = 0.6;
     cfg.backwardG = -0.2;
     cfg.scatteringLerp = 0.5;
- // 外形旋钮（预览固定为调好的值；游戏端由设置面板给）
- // 「云型」= 高度梯度。注意它只决定**云在哪个高度出现**，
-    // 不改变云的主体形状 —— 实测把两端硬编码，画面差异也只有 0.28/255。
     cfg.cloudType = clamp(params.steps.x, 0.0, 1.0);
-    // 2026-10-19：侵蚀幅度接上 CLI/UI（params.light.w 原来硬编码 3.0、没人读）
     cfg.erosionScale = clamp(params.light.w, 0.0, 2.0);
     cfg.weatherPeriod = 18000.0;
-    // 2026-10-19：与游戏一致（120000）。之前是 1e9「不裁视距」，
-    // 导致预览能看到 12 万格外的云、而游戏在 12 万处就被裁断 —— 远景表现不同。
     cfg.viewDistance = 120000.0;
-    // 2026-10-19：远处淡出起点（与游戏出厂一致）
     cfg.fadeStart = 0.75;
-    // 2026-10-19：本字段复用为**多次散射强度**（0~1，出厂 0.45）。
-    // 银边已退役，这个 lane 空出来接 Hillaire 的 msOctave 权重。
     cfg.sunGlow = clamp(params.flags.y, 0.0, 1.0);
     cfg.sunDir = sunDir;
-    // 预览用的太阳/天光。
-    // 夕阳红移：太阳越低，直射光越红（火烧云就是这一项 + 前向散射）
     float sunUp = clamp(sunDir.y, 0.0, 1.0);
-    // 0.85 是**预览端的辐亮度标定**（自创，参考库里没有这个系数）：参考的 sun_color
-    // 直接来自 bevy 方向光辐照度 + 自动曝光，预览是固定曝光，只能用标定代替。
-    // 标定依据（`--probe` 实测）：云峰值 ≈ 1.2 线性辐亮度，配合 exposure=1.2 出中间调。
-    // 试过把天光抬到参考 config.rs 的原始色（top 0.99/1.11/1.33）——整片发灰发平，
-    // 因为天光项不受 shadow/phase 衰减、每步都全额累加，抬它就是抬底噪。
-    // params.light.z 保留为天光倍率，供对比度调试（默认 1）。
-    // 0.85 → 0.5：原系数是"曝光乘两遍"时代标定的，现在云普遍过曝、没有暗部。
-    // 降下来的能量补到下面的 ambientBottom，总亮度不变、对比度上来。
-    // 2026-10-18：实测把整段散射置零，画面只暗 6/255 ⇒ 云几乎全靠"天空被遮暗"呈现，
-    // 比天空还暗，所以像雪地/冰面。真实积云亮部应接近天空。这里把能量抬回 1.2 倍标定。
-    // ===== 2026-10-19 **完全按游戏口径** =====
-    // 之前这里用 warmColor × 强度滑条（一套独立标定），游戏用的是
-    //   sunColor = directLightColor * directLightEnergy
-    // 两者亮度/色温都不同 ⇒ "预览和游戏货不对板"。现在直接照搬游戏公式：
-    //   directLightEnergy = mix(1.5*(0.05/1.22077)*elevMag, 1.5, dayAmount) × 太阳滑条
     float elevMagMain = abs(sunDir.y) / 0.81915204429;
     float dayAmountMain = smoothstep(-0.03, 0.03, sunDir.y);
-    // 2026-10-19：能量系数 1.5 → **0.75**。
-    // 之前云整片过曝（p95=237，接近饱和），任何暗部都会被压平；
-    // 降一半后亮部回到 ~0.6 的线性区间，自阴影和多散射的差异才显示得出来。
     float gameEnergy = mix(0.75 * (0.05 / 1.22077458876) * elevMagMain, 0.75, dayAmountMain) *
         clamp(params.sunDirection.w, 0.0, 3.0);
     vec3 directLightColorMain = mix(vec3(0.46, 0.56, 1.00),
         skyModelSunColor(sunDir.y > 0.0 ? sunDir : -sunDir, 0.5), dayAmountMain);
     cfg.sunColor = directLightColorMain * gameEnergy;
-    // 天光：白天顶部偏蓝白、底部偏冷蓝；**日落时反过来** —— 云底被地平线那片
-    // 金橙照亮（照片里云海就是靠这一项发光的），顶部则压暗发紫。
-    // 原来的天光是固定蓝色，日落时云被"蓝顶光 + 橙太阳"照成浑浊的灰紫。
     float dayAmount = smoothstep(0.03, 0.42, sunUp);
-    // ambient 现在会乘 (0.30 + 0.70*shadow)，平均约 0.79，所以基数上调约 40%
     vec3 ambTopDay = vec3(0.42, 0.56, 0.92) * 0.26;
     vec3 ambBotDay = vec3(0.26, 0.34, 0.52) * 0.32;
     vec3 ambTopSet = vec3(0.26, 0.18, 0.30) * 0.06;
     vec3 ambBotSet = vec3(1.00, 0.46, 0.16) * 0.16;
-    // 游戏：skyColor = 三方向 clearSkyInscatter 加权（天顶/向阳/背阳）× 天光滑条，
-    //       ambient = skyColor * 0.11 / 0.08。
-    // 预览直接调同一个 sky 函数取天顶方向，公式与游戏逐项一致。
     vec3 gameSkyColor = previewSky(vec3(0.0, 1.0, 0.0), sunDir, vec3(1.0)) *
         clamp(params.light.z, 0.0, 3.0);
-    // 2026-10-19：天光系数 0.11/0.08 → **0.035/0.025**。
-    // 实测降太阳能量对云亮度几乎无影响 ⇒ 云亮主要由 ambient 兜底。
-    // 云内 skyVis 只有 0.06，但 0.11 的天光乘上它仍足以把云内抬到 0.6+。
-    // v5.1（Continuum 模型）：sky 项 = T_sky·0.25（核心内），ambient 传
-    // **未缩放**的天空辐亮度——云底的深浅由 T_sky march 塑造，不靠系数压。
     cfg.ambientTop = gameSkyColor;
     cfg.ambientBottom = gameSkyColor;
-    // sky.w 当"帧种子"喂给 ray 起点的 hash 抖动（参考是 fract(time)）。
-    // 抖动必须逐帧变，时域累积才有新样本可平均；否则每帧采到同一组位置，
-    // TAA 只是把同一张噪声图叠一遍。
     cfg.time = params.layer.z + params.sky.w * 0.6180339887;
 
-    // 参考 get_ray_origin: origin.y = 相机高度 + 行星半径（不能再减云底，否则
-    // intersect_planet_sphere 里的 ray_origin.y - planet_radius 变成负数 ⇒ sqrt 出 NaN）
-    // 2026-10-18 **修 bug**：这里原来只用了 anchor，**完全没加相机 xz** ——
-    // 所以云被钉死在相机上（相机平移 3000 格画面几乎不变）。这正是
-    // "云看起来在重复/镜像"的来源之一：图案不随世界移动。
-    // 正确写法与游戏端一致：origin.xz = camera.xz - anchor.xz。
     vec3 origin = vec3(params.cameraPosition.x - params.flags.z,
         params.cameraPosition.y + cfg.planetRadius,
         params.cameraPosition.z - params.flags.w);
     vec2 atlasSize = vec2(textureSize(atlasTex, 0));
 
-    // A 方案原型（--puffs）：覆盖度改走 core.glsl 的有限云团分支。
-    // 默认 false ⇒ 与原来逐字一致，游戏端也不受影响（那边不设置这个全局）。
-    // flags.x 三态：0 = 2D FBM（上线版）、1 = 有限云团原型、2 = 3D 体积实验
     gBevyPuffMode = abs(params.flags.x - 1.0) < 0.5;
     gBevyUse3D = params.flags.x > 1.5;
-    // B 方案（--vol）：覆盖度改采样烘好的 3D 云团体积（一次 texture，成本≈图集）
     gBevyVolumeMode = params.flags.y > 0.5;
 
-    // 云距（视距）：layer.w > 0 时作为 raymarch 的最远距离，越小云越"近"越薄
     float maxDistance = params.layer.w > 1.0 ? params.layer.w : 1.0e9;
     float hitDistance;
     vec4 march;
 
-    // ---- 模型选择：mode 8 = v5 重写版，mode 6 = UE 风格，其余 = bevy（旧模型） ----
-    // 三套共用同一批资产纹理与相机/太阳/天空/海面/雾/TAA。
     if(mode == 8)
     {
         HPCloudConfig hp = hpPreviewShapeConfig(bottom, top, cfg.planetRadius);
-        // [HanPi] AmbientTopMultiplier 固定 1.5(Bottom 在面板 hpH.w)
         hp.ambientTop = gameSkyColor * 1.5;
         hp.ambientBottom = gameSkyColor * clamp(params.hpH.w, 0.0, 2.0);
         hp.viewSteps = int(clamp(params.light.x, 8.0, 256.0));
@@ -554,28 +411,19 @@ void main()
         hp.sunColor = cfg.sunColor;
         hp.groundAlbedo = vec3(0.0);
         hp.groundBounce = 0.0;
-        // 视距 / 淡出：--view-dist（layer.w）>1 时用它，否则 60 km 上限。
-        // 与游戏端同口径（v5 的可用远场就 60 km，见 cloud_v5_core.glsl 的距离淡出）。
         hp.viewDistance = params.layer.w > 1.0
             ? clamp(params.layer.w, 4000.0, 60000.0) : 60000.0;
-        // 淡出起点比例（hpD.w，0=按出厂 0.30）：0.30×60km ⇒ 18 km 起淡、60 km 归零。
         hp.fadeStart = params.hpD.w > 0.01 ? clamp(params.hpD.w, 0.02, 0.95) : 0.30;
         hp.minTransmittance = 0.003;
         hp.atmosphereDensity = 0.0;
         hp.time = params.layer.z;
         float ingn = fract(52.9829189 * fract(dot(vec2(pixel),
             vec2(0.06711056, 0.00583715))));
-        // 与游戏端口径一致：**静态**每像素抖动（不随帧变化）。
-    // 预览用 --shot 时本来就是单帧，看不出差别；但交互式跑的时候
-    // 两边必须一样，否则又会出现"预览稳、游戏闪"。
     hp.jitter = fract(ingn);
 
         march = hpTraceVolumetricRay(origin, dir, maxDistance, hp, atlasTex, baseTex,
             worleyTex, hitDistance);
 
-        // --hp-debug <k>：把 gHpDebugInfo 的第 k 个分量画成全屏灰度（诊断用）。
-        // 通道：1=marchStart 2=totalDist 3=iterCount 4=hit，归一化尺度见下。
-        // 约定：volume.w ∈ 1..4 且远小于体积边长（10000）⇒ 与 B 方案复用同一 lane 不冲突。
         int hpCh = int(params.volume.w + 0.5);
         if(params.volume.w > 0.5 && hpCh <= 4)
         {
@@ -596,8 +444,6 @@ void main()
             shapeTex, hitDistance);
     }
 
-    // ---- 诊断：steps.w > 0.5 时把"命中点的自阴影 / 归一化高度"直接写成像素 ----
-    // r = volumetric shadow（1=全亮, 0=全遮蔽）, g = normalizedHeight, b = 密度
     if(params.steps.w > 0.5)
     {
         vec3 p = origin + dir * hitDistance;
@@ -610,40 +456,17 @@ void main()
     }
 
     float transmittance = clamp(march.a, 0.0, 1.0);
-    // 这里输出的是**辐亮度**（HDR），曝光只在 tonemap 里乘一次。
-    // 之前这里又乘了一遍 extras.w（= 曝光），等于曝光被平方（2.2² = 4.84×），
-    // 云顶整片糊成白色。见 viewer_tonemap.comp 的 push.skyColor.a。
     vec3 color = march.rgb;
 
-    // ---- 空气透视（clouds_compute.wgsl:294-304 的 fog_factor，逐字移植）----
-    // 远处云要逐渐融进天空，否则 2D 图集每 2000 格的重复在地平线附近会投影成
-    // 一圈放射状条纹（HANDOFF 第 8 节第 2 条）。
-    // 与 tonemap 的 "color + sky * transmittance" 自洽：命中点透射率→0 时这里
-    // 补上 sky*(1-T)，tonemap 再补 sky*T，两者相加正好是纯天空色。
-    // 与参考的差别（都是尺度适配，不是随手调数值）：
-    //  1) 参考不夹下界（dist<2231 时 fogFactor 为负，等于往天空色反方向外插、
-    //     略微压暗近处云）；这里夹到 [0, 0.85]，避免负值出怪色。
-    //  2) 衰减系数 4e-4 → 1.2e-4：4e-4 是旧几何（云层 1200..1600、相机 500，
-    //     掠射云 ~4e3）标定的；game-save 几何（层 1200..3000、相机 70）下最近
-    //     的云也在 1.2e3 格外、构图主体在 3e3~1e4 —— 4e-4 在 4km 处就替换 80%
-    //     云色，对比度全被洗掉（实测第三/四版整屏灰雾的元凶之一）。
-    //     1.2e-4：3km 处 0.30、10km 0.70、40km 0.99 —— 近云保对比、远云融天。
     const float fogFalloff = 1.2e-4;
     float fogFactor = clamp(0.85 - exp(-fogFalloff * hitDistance), 0.0, 0.85);
-    // 地平线附近：光学路径趋于无穷，云必须**完全**融进天空，否则 dir.y=0 那条界线
-    // 会露成一条硬接缝（上边有云、下边纯天空，早期截图里非常明显）。
-    // 预览专有 —— 游戏里那个方向是真实地形/海面。
     fogFactor = mix(1.0, fogFactor, smoothstep(0.0, 0.05, abs(dir.y)));
     color = mix(color, skyRay * (1.0 - transmittance), fogFactor);
 
-    // 太阳盘/光晕在**无穷远**，不能被上面这条"云距离"衰减吃掉 ⇒ 放在雾混合之后。
-    // 只按云的透射率遮挡（逆光时云缘透出的光）。
     float sunAlign = max(dot(dir, sunDir), 0.0);
     float glow = pow(sunAlign, 900.0) * 9.0 + pow(sunAlign, 40.0) * 0.35;
     color += warmColor * glow * params.steps.z * transmittance * params.sunDirection.w * 0.25;
 
-    // 背景天空（预乘）：云之后露出来的部分。tonemap 那边已经不再补天空了，
-    // 所以这里必须自己补上，否则透射率高的像素会是黑的。
     color += skyRay * transmittance;
 
     imageStore(outImage, pixel, vec4(color, transmittance));

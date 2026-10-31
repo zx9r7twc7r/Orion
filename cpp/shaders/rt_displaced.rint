@@ -98,9 +98,6 @@ layout(
 ) uniform sampler2D normalAtlas;
 
 
-// Procedural attributes:
-// x = quad-local S
-// y = quad-local T
 hitAttributeEXT vec2 attribs;
 
 
@@ -111,9 +108,6 @@ const float AABB_EPSILON =
     0.001;
 
 
-// =====================================================
-// Device address
-// =====================================================
 
 uint64_t makeDeviceAddress(
     uint lo,
@@ -128,13 +122,6 @@ uint64_t makeDeviceAddress(
 }
 
 
-// =====================================================
-// Quad UV:
-// p0=(0,0)
-// p1=(1,0)
-// p2=(1,1)
-// p3=(0,1)
-// =====================================================
 
 vec2 interpolateQuadUV(
     vec2 uv0,
@@ -167,9 +154,6 @@ vec2 interpolateQuadUV(
 }
 
 
-// =====================================================
-// Ray / AABB slab helper
-// =====================================================
 
 bool clipLinearRange(
     float value0,
@@ -219,14 +203,6 @@ bool clipLinearRange(
 }
 
 
-// =====================================================
-// Evaluate signed distance-like field:
-//
-// field < 0 : ray point is outside/front of height surface
-// field > 0 : ray point is behind/inside height surface
-//
-// Root == displaced surface.
-// =====================================================
 
 bool evaluateHeightFieldFast(
     float rayT,
@@ -278,7 +254,6 @@ bool evaluateHeightFieldFast(
         );
 
 
-    // 与 B8C-1 rchit 的 Quad 三角划分保持一致。
     vec2 atlasUV;
 
 
@@ -353,9 +328,6 @@ bool evaluateHeightFieldFast(
 
     return true;
 }
-// =====================================================
-// Main procedural intersection
-// =====================================================
 
 void main()
 {
@@ -479,9 +451,6 @@ void main()
         );
 
 
-    // =================================================
-    // Quad basis
-    // =================================================
 
     vec3 edgeS =
         p1 -
@@ -550,16 +519,6 @@ void main()
     {
         return;
     }
-    // =====================================================
-// B8C-P1
-// Ray expressed directly in local heightfield space:
-//
-// S(t)     = stOrigin.x + stSlope.x * t
-// T(t)     = stOrigin.y + stSlope.y * t
-// Depth(t) = depthOrigin + depthSlope * t
-//
-// All expensive world->quad transforms happen once.
-// =====================================================
 
 vec3 originRelative =
     gl_WorldRayOriginEXT -
@@ -640,9 +599,6 @@ float depthSlope =
     );
 
 
-    // =================================================
-    // Atlas-safe bounds
-    // =================================================
 
     vec2 spriteMin =
         min(
@@ -709,15 +665,7 @@ float depthSlope =
         );
 
 
-    // =================================================
-    // Reconstruct same tight B5 AABB.
-    // =================================================
 
-    // =====================================================
-// Tight oriented heightfield prism clipping.
-// Hardware already intersected the AABB.
-// This further reduces the actual march interval.
-// =====================================================
 
 float tEnter =
     gl_RayTminEXT;
@@ -772,12 +720,6 @@ if(tExit <= tEnter)
     }
 
 
-    // =================================================
-    // Adaptive coarse march:
-    //
-    // perpendicular = 32
-    // grazing       = 64
-    // =================================================
 
 float facing =
     abs(
@@ -840,9 +782,6 @@ coarseSteps =
         vec2(0.0);
 
 
-    // =================================================
-    // Find FIRST field sign crossing.
-    // =================================================
 
 for(
     int i = 0;
@@ -899,7 +838,6 @@ for(
         }
 
 
-        // Exact / near-exact root.
         if(abs(currentField) <= 1.0e-5)
         {
             attribs =
@@ -934,9 +872,6 @@ for(
 
             if(crossed)
             {
-                // =====================================
-                // Binary refinement
-                // =====================================
 
                 float lowT =
                     previousT;
@@ -972,7 +907,6 @@ for(
 
     if(abs(denominator) > 1.0e-7)
     {
-        // Secant / regula-falsi estimate.
         candidateT =
             (
                 lowT * highField -
@@ -981,7 +915,6 @@ for(
             denominator;
 
 
-        // 防止高度图不连续时 secant 贴死某一端。
         float guard =
             (
                 highT -

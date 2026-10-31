@@ -82,16 +82,10 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class DhLodMeshSink {
     private static final String TAG = "[DH-SINK]";
 
-    /**
-     * Java 侧暂存区总字节软上限。
-     *
-     * <p>09-30 实机读数：DH 一局构建 1409 个 section、累计 <b>1.0 GB</b> 顶点数据
-     * （DH 自己的视距）。全留会 OOM，所以给软上限；超限时优先淘汰"不在本轮启用清单里"
-     * 的那些——它们本来就不参与本帧的 TLAS。</p>
-     */
+    
+
     private static final long MAX_STORED_BYTES = 512L * 1024 * 1024;
 
-    /** 超上限后收缩到的比例：留出余量，避免每帧都在淘汰边缘抖动。 */
     private static final float EVICT_TARGET_RATIO = 0.85f;
 
     private static final ConcurrentHashMap<Long, Section> SECTIONS = new ConcurrentHashMap<>();
@@ -102,15 +96,11 @@ public final class DhLodMeshSink {
     private static final AtomicLong EVICTED = new AtomicLong();
     private static final AtomicLong DROPPED = new AtomicLong();
 
-    /** {@link #renderCut()} 这一次真正送出去的 section 落在哪些 level（索引 = level）。 */
     private static final AtomicIntegerArray EMITTED_LEVELS = new AtomicIntegerArray(32);
-    /** DH 这一局总共建过哪些 level 的 section（含已被淘汰的）。索引 = level。 */
     private static final AtomicIntegerArray BUILT_LEVELS = new AtomicIntegerArray(32);
 
-    /** DH 本轮启用的 section pos（由 {@code DhRenderListHookMixin} 每 tick 整体替换）。 */
     private static volatile long[] enabled = new long[0];
 
-    /** 视图中心与内洞半径（渲染线程发布；淘汰用中心，内洞只影响"画不画"）。 */
     private static volatile int centerX;
     private static volatile int centerZ;
     private static volatile int innerBlocks;
@@ -125,15 +115,10 @@ public final class DhLodMeshSink {
         public final int blockWidth;
         public final int minBlockX;
         public final int minBlockZ;
-        /** 该 level 的最低方块 y（DH 的 y 基准）。 */
         public final int minHeight;
-        /** 不透明段 + 半透明段，按 DH 原始字节序拼接。 */
         public final byte[] quads;
-        /**
-         * 单调递增的版本号：DH 重构建会换一个新的 {@link Section} 对象 ⇒ 新 serial。
-         * {@code DhFarFieldUploader} 用它做"这个 section 是否需要重新上传"的判据，
-         * 比按字节算哈希便宜且无碰撞。
-         */
+        
+
         public final long serial;
 
         Section(long pos, int blockWidth, int minBlockX, int minBlockZ, int minHeight,
@@ -152,9 +137,6 @@ public final class DhLodMeshSink {
         }
     }
 
-    //=====================================================================//
-    // 渲染线程：发布视图 / 取快照 / 清理                                    //
-    //=====================================================================//
 
     /**
      * 发布本轮视图（格，切比雪夫）。
@@ -235,7 +217,6 @@ public final class DhLodMeshSink {
         final LongOpenHashSet live = new LongOpenHashSet(enabled);
 
         final List<Section> byPriority = new ArrayList<>(SECTIONS.values());
-        // 排序键：先"不在启用清单里"，同组内按离玩家的切比雪夫距离从远到近。
         byPriority.sort(Comparator
                 .comparingInt((Section s) -> live.contains(s.pos) ? 1 : 0)
                 .thenComparing(Comparator.comparingInt(DhLodMeshSink::distance).reversed()));
@@ -263,9 +244,6 @@ public final class DhLodMeshSink {
         viewReady = false;
     }
 
-    //=====================================================================//
-    // DH 构建线程：入口                                                    //
-    //=====================================================================//
 
     /**
      * 由 {@code DhLodBufferHookMixin} 在 {@code tryMakeAndUploadBuffersAsync} 的 HEAD 调用。
@@ -279,7 +257,6 @@ public final class DhLodMeshSink {
                                List<ByteBuffer> opaque, List<ByteBuffer> transparent) {
         if (!DhFlags.LOD_HOOK) return;
         BUILDS.incrementAndGet();
-        // blockWidth = 2^level（DhSectionPos.getDetailLevelWidthInBlocks），所以 level 直接数尾零。
         if (blockWidth > 0) {
             final int level = Integer.numberOfTrailingZeros(blockWidth);
             if (level > 0 && level < 32) BUILT_LEVELS.incrementAndGet(level);
@@ -294,7 +271,6 @@ public final class DhLodMeshSink {
         final Section previous = SECTIONS.get(pos);
         final int previousBytes = previous == null ? 0 : previous.quads.length;
         if (STORED_BYTES.get() - previousBytes + bytes > MAX_STORED_BYTES) {
-            // 超预算：先腾地方（淘汰不在启用清单里的），腾不出来才丢本节。
             makeRoom(pos, previousBytes, bytes);
             if (STORED_BYTES.get() - previousBytes + bytes > MAX_STORED_BYTES) {
                 DROPPED.incrementAndGet();
@@ -310,9 +286,6 @@ public final class DhLodMeshSink {
         KEPT.incrementAndGet();
     }
 
-    //=====================================================================//
-    // 内部                                                                //
-    //=====================================================================//
 
     /**
      * 为即将入表的一节腾出空间：反复淘汰"不在启用清单里、且离玩家最远"的一个，
@@ -382,7 +355,6 @@ public final class DhLodMeshSink {
         for (int i = 0; i < buffers.size(); i++) {
             ByteBuffer buffer = buffers.get(i);
             if (buffer == null) continue;
-            // duplicate() 共享内容但独立 position/limit ⇒ 读它不会扰动 DH 的池化 buffer。
             ByteBuffer view = buffer.duplicate();
             final int n = view.remaining();
             view.get(out, at, n);

@@ -38,67 +38,17 @@ import org.lwjgl.system.MemoryUtil;
 
 /** Captures 26.2 entity-model batches and the explicit experience-orb quad. */
 public final class EntityRtCapture {
-    // 2026-10-06：16 → 32。必须与 VulkanCore.cpp 的 ENTITY_RT_TEXTURE_SLOT_COUNT
-    // 以及 rt_test.rchit / rt_test.rahit 里的 `sampler2D entityAtlases[N]` 一致。
-    //
-    // 2026-10-13：32 → 64。城市地图（Broville v11.4.4）下 31 个常规槽被打满，一帧
-    // 内 evictInUse=2736 次 —— 被抢占的槽号已被本帧早先上传的顶点写进 pad2，于是
-    // 那些几何改采到新贴图（"文字错乱 / 旗帜图案闪烁"），同时每次 evict 都让
-    // entityPbrSettled[victim]=false ⇒ 下一次命中重跑 publishEntityPbrTexture() 的
-    // JNI 重推（约 130ms/帧的渲染线程 CPU）。扩容后文字/实体贴图同时驻留，slotFor
-    // 走命中路径，两个症状一起消失。native 侧同名的常量与描述符池已同步。
-    //
-    // 2026-10-24：64 → 128。同样的病灶又到顶了：63 个常规槽被城市图的实体纹理
-    // （旗帜图案 / 展示框物品 / 掉落物精灵 / 玩家皮肤 / 盔甲 / 地图）占满后 LRU
-    // 抢占本帧在用槽 ⇒ 串图（"旗帜图案错乱 / 掉落物贴图时不时错乱"），图集槽
-    // 被换人后几何采到透明区域被 alpha 裁切（"展示框物品不显示"）。描述符池
-    // （主 256→512、ring 128→512）与 shader 数组（64→128 case）已同步。
     private static final int MAX_TEXTURE_SLOTS = 128;
-    // 最后一格（MAX_TEXTURE_SLOTS）留给本地玩家身体代理（它用 MAX_TEXTURE_SLOTS
-    // 当自己的槽号，见 publishProxyTexture），普通实体纹理用 1..MAX-1 ——
-    // 否则最后一个纹理会把代理的皮肤顶掉，主光线看到的自己就成了别人。
     private static final int MAX_REGULAR_TEXTURE_SLOTS = MAX_TEXTURE_SLOTS - 1;
-    // Match the pre-existing global RT vertex ABI: 12 floats / 48 bytes.
-    // pad2 carries the entity texture slot; translucent shader modules retain
-    // their original compatible layout.
     private static final int BYTES_PER_VERTEX = 12 * Float.BYTES;
     private static final Identifier EXPERIENCE_ORB_TEXTURE =
             Identifier.withDefaultNamespace("textures/entity/experience/experience_orb.png");
-    // 2026-10-21 闪电：RenderTypes.lightning() 是纯色管线（没有 Sampler0），
-    // 而且原版几何走 addVertex(pose,…)+setColor 链，不经过
-    // BufferBuilder.addVertex(FFFIFFIIFFF) 的全格式钩子 ⇒ 通用捕获完全收不到。
-    // 这里由 Java 侧合成几何 + 一张 8 列闪电精灵图（每列 64px，512×512）。
-    // 贴图来源：OpenGameArt "lightnings" by hdst，CC0 / 无需署名：
-    //   https://opengameart.org/content/lightnings
-    //   https://opengameart.org/sites/default/files/lighting_0.png
-    // 透明像素依赖 rt_test.rahit 的 combinedAlpha < 0.1 裁切，否则会画成整块卡片。
     private static final Identifier LIGHTNING_TEXTURE =
             Identifier.fromNamespaceAndPath("orion", "textures/rt_lightning.png");
-    // Entity batches support at most 16 texture slots. A fixed table is both
-    // faster at this size and avoids per-model Identifier.toString()/HashMap
-    // churn on the render thread.
-    //
-    // Slots are deliberately persistent across frames. Native code bakes each
-    // vertex's slot index (pad2) into the entity BLAS, which is rebuilt on a
-    // 2-frame cadence, while the slot -> texture descriptors are published as
-    // soon as they change. Per-frame capture-order allocation let slot indices
-    // churn faster than the BLAS rebuild, so a moving entity population kept
-    // sampling another entity's texture for up to the rebuild interval -- the
-    // classic "texture flashes while entities move" artifact. A stable
-    // Identifier -> slot table keeps pad2 and the descriptor set in agreement,
-    // lets sameVertexPayload dedup go quiet, and turns the per-frame
-    // FGDeviceWaitIdle descriptor stall into a rare event.
     private static final Identifier[] frameTextureSlots = new Identifier[MAX_TEXTURE_SLOTS];
     private static final String[] frameTextureLabels = new String[MAX_TEXTURE_SLOTS];
     private static int frameTextureSlotCount;
     private static final int[] slotLastSeenFrame = new int[MAX_TEXTURE_SLOTS];
-    // Material class per slot, so armour can carry a real F0/roughness instead of
-    // the flat entity response. It rides in the fractional part of the pad2
-    // texture-slot value (slot + class / 32) because the 48-byte vertex ABI has
-    // no spare field: materialId (index 9) belongs to the translucent glass
-    // profile logic and pad1 (index 10) is the proxy/emissive marker. Every
-    // existing reader recovers the slot with round() and only positive entity
-    // slots receive a fraction, so slot 0 still means "no entity texture".
     private static final float MATERIAL_CLASS_SCALE = 32.0f;
     private static final int MATERIAL_CLASS_DEFAULT = 0;
     private static final int MATERIAL_CLASS_IRON = 1;
@@ -107,185 +57,54 @@ public final class EntityRtCapture {
     private static final int MATERIAL_CLASS_NETHERITE = 4;
     private static final int MATERIAL_CLASS_COPPER = 5;
     private static final int MATERIAL_CLASS_SOFT = 6;
-    /**
-     * 2026-10-06 类 7 = <b>不裁切</b>。给"大片透明但必须整体可见"的贴图用 ——
-     * 目前只有末地传送门的星幕（{@code end_portal.png}）。
-     *
-     * <p>为什么需要它：entity/自定义几何这条路走的是 opaque + alpha cutout，而星幕
-     * 绝大部分纹素是透明的 ⇒ 全被判透明丢掉 ⇒ 观感就是"门没渲染"。而实测日志证明
-     * 捕获链路全对（geometry captured / 贴图正确 / 槽位 28 / 无丢弃）⇒ 只剩裁切这一环。
-     * 消费端见 {@code rt_test.rahit}：类 7 直接放行，不做 alpha 测试。</p>
-     *
-     * <p>⚠ 这一档必须<b>绕开</b> {@code entityArmorMetal} 开关（{@link #classifyEntityMaterial}
-     * 在关闭时直接返回 DEFAULT）—— 否则"末地门能不能看见"会随盔甲设置变化。</p>
-     */
+    
+
     private static final int MATERIAL_CLASS_UNCUTOUT = 7;
     private static final int[] frameTextureClasses = new int[MAX_TEXTURE_SLOTS];
     private static int captureFrameSerial;
-    // An evicted slot can still be referenced by the previous BLAS for up to
-    // the native rebuild cadence. Wait longer than that before reusing a slot
-    // so stale geometry never samples a repurposed texture.
     private static final int SLOT_EVICTION_GRACE_FRAMES = 3;
-    // =====================================================================
-    // 2026-10-11 旗帜图案闪烁：实体层共面重合 quad 的稳定层序
-    //
-    // 原版把"底色 quad + 图案 overlay quad"画在**同一平面**上，靠画序 + 深度
-    // 测试(LEQUAL) 让后画的图案盖住底色；而 RT 的 TLAS 实例全部双面
-    // (FACING_CULL_DISABLE)，两份共面 quad 变成 t 完全相等的命中，谁被提交由
-    // 遍历顺序决定 ⇒ 逐像素/逐帧随机显示底色或图案 —— 用户报告的"旗帜上图案
-    // 会闪"。这与块网格 cutout 层沿法线外扩 2mm 是同一类竞态（见
-    // VulkanCore.cpp 的 CUTOUT_NORMAL_OFFSET）。
-    //
-    // 修法：同一批次内凡是**质心重合**（量化到 1/256 格内）的 quad，按出现
-    // 顺序沿自身几何法线递增外移 dup × STEP —— 底色(先画)不动，图案(后画)
-    // 依次外移，平局变成确定性结果（图案恒在底色之前）。非重合 quad 一个
-    // 字节都不动，普通实体模型完全不受影响。量化键只覆盖本批次，因此必须
-    // 底色与图案落在同一 submit（26.3 的 banner_patterns 图集把两者并到一个
-    // RenderType，正是为此）。
-    //
-    // 2026-10-12：这条只作用于**模型**批次（ActiveBatch.coplanarLayering，由
-    // acquireBatch 置位）。文字批次共用同一个 capture()，而字形 quad 只有
-    // 0.05~0.1 格，STEP/MAX 这套按方块尺寸定的外移量对它是几何尺寸的几分之一，
-    // 会把字形推离自己的阴影面；文字也不存在"底色 + overlay"这类共面重合。
-    // =====================================================================
     private static final float ENTITY_COPLANAR_LAYER_STEP = 0.002f;
     private static final float ENTITY_COPLANAR_LAYER_MAX = 0.02f;
     private static final long[] publishedEntityViews = new long[MAX_TEXTURE_SLOTS];
     private static final long[] publishedEntitySamplers = new long[MAX_TEXTURE_SLOTS];
-    // Per-slot latch: set once a slot has a real (non-zero) Vulkan view+sampler
-    // pair published.  slotFor no longer re-resolves the texture through the
-    // TextureManager every frame for latched slots; the retry-until-view-exists
-    // semantics are preserved because the latch only turns on after a
-    // successful publish, and a resource reload clears it wholesale.
     private static final boolean[] slotTexturePublished = new boolean[MAX_TEXTURE_SLOTS];
-    // =====================================================================
-    // 2026-10-09 实体 LabPBR（`_n`/`_s`）
-    //
-    // 与上面的 albedo 槽一一对应：Java 按"同一 Identifier 加 `_n`/`_s`"在
-    // ResourceManager 里查表（缓存，不逐帧扫资源包），命中就取该贴图的 MC Vulkan
-    // 句柄推给 binding 63/64；没命中就推 0，native 侧绑回中性 1×1 兜底。
-    //
-    // 0 = "这一槽没有该贴图"（也等于"尚未推送"）——与 native 的初值一致，所以
-    // 逐槽去重用的就是这四个 long 数组本身。
-    // =====================================================================
     private static final java.util.HashMap<Identifier, Identifier[]> ENTITY_PBR_SIBLINGS =
             new java.util.HashMap<>();
     private static final long[] publishedEntityNormalViews = new long[MAX_TEXTURE_SLOTS];
     private static final long[] publishedEntityNormalSamplers = new long[MAX_TEXTURE_SLOTS];
     private static final long[] publishedEntitySpecularViews = new long[MAX_TEXTURE_SLOTS];
     private static final long[] publishedEntitySpecularSamplers = new long[MAX_TEXTURE_SLOTS];
-    // 解析 + 推送是否已完成（含"确认没有 `_n`/`_s`"这一结论）。false 时 slotFor
-    // 每帧重试一次；贴图视图是异步加载的，所以"有文件但视图还是 0"必须能重来。
     private static final boolean[] entityPbrSettled = new boolean[MAX_TEXTURE_SLOTS];
-    // 老 DLL 没有这个导出：一旦 UnsatisfiedLinkError 就永久关掉这条路，避免每帧抛。
     private static boolean entityPbrNativeAvailable = true;
     private static final ThreadLocal<ActiveBatch> activeBatch = new ThreadLocal<>();
     private static final ThreadLocal<ActiveBatch> reusableBatch =
             ThreadLocal.withInitial(ActiveBatch::new);
-    // Feature preparation is deferred in 26.2.  Keep a small identity window
-    // of synthetic states instead of relying on a frame-local boolean or the
-    // AvatarRenderState id field, either of which can be stale by the time
-    // ModelFeatureRenderer receives the submit.
     private static final Set<Object> localPlayerProxyStates =
             Collections.newSetFromMap(new IdentityHashMap<>());
-    // Fallback for render-state copies made by the deferred feature pipeline.
-    // In first person the local player is absent from vanilla's entity list,
-    // so the only Avatar submit armed here is the synthetic RT proxy.
     private static boolean localPlayerProxyAvatarPending;
     private static Identifier localPlayerProxyBodyTexture;
-    // 26.3 把告示牌/名牌文字交给 SubmitNodeCollector.submitText → TextFeatureRenderer，
-    // 不是 ModelFeatureRenderer 的模型提交，所以模型捕获路径收不到它；而原版光栅
-    // 世界输出整帧被原生交换链替换掉，文字就彻底消失。这里在字形真正发射顶点时
-    // 把同一批顶点录进实体批次，字体图集按普通实体纹理槽发布，复用现有的
-    // alpha cutout 与逐顶点着色，不需要任何原生/着色器改动。
-    //
-    // 文本走**独立的** ThreadLocal 批次，不碰 activeBatch：字形镜像期间原版仍会
-    // 往它自己的 BufferBuilder 里画同一批字，那些顶点经由 BufferBuilderMixin 会撞见
-    // 一个打开的 activeBatch，被重复录进来；而且 captureExperienceOrb 把
-    // "activeBatch 非空" 当嵌套错误抛异常。分开之后 captureVertex 看到的仍是
-    // activeBatch==null，与改动前完全一致。
     private static final ThreadLocal<ActiveBatch> textBatch = ThreadLocal.withInitial(ActiveBatch::new);
     private static int textBatchSlot;
     private static boolean captureFrameActive;
 
-    // =====================================================
-    // 2026-10-03 文字捕获成本读数（先量再改）
-    //
-    // 告示牌/名牌文字是**每帧**从零重抓的：每个字形走一次
-    // TextRenderable.render（PlainTextRenderable 是"阴影 sprite + 主体 sprite"
-    // 两个 quad），顶点经 CapturingVertexConsumer 逐顶点写进批次，再整批经
-    // uploadEntityBatch 送进 native。原版侧的这次渲染对画面是纯浪费（世界输出已
-    // 被原生交换链替换），所以这里量的就是"镜像这份文字要付多少"。
-    //
-    // 取样策略：只在 isDiagnosticFrame()（每 64 帧一帧）做 nanoTime 计时，其余帧
-    // 只累加整数计数 —— 每字形两次 nanoTime × 上千字形会自己变成被测对象。
-    // 打印在 endFrame()，与 [RTX-PROXY] 那套诊断同频。
-    // =====================================================
-    // 2026-10-03 逐字形查表去重。
-    //
-    // 同一段文字（一个告示牌界面 / 一条名牌）的连续字形共用同一个 RenderType，
-    // 而 slotFor() 对每个字形都要重做三件与字形无关的事：
-    //   ① resolveSampler0：RenderSetup 的 textures Map 里取 "Sampler0"；
-    //   ② classifyEntityMaterial（经 assignTextureClass）：对纹理**路径**做若干次
-    //      String.contains（gold / copper / iron / chainmail …）；
-    //   ③ publishTexture：TextureManager.getTexture（Identifier 哈希 + 查表）+ 取
-    //      view/sampler。
-    // 一帧上千字形时这就是上千次重复。这里缓存"上一个 RenderType → slot"。
-    //
-    // ⚠ 必须**每帧清空**：slotFor 里的 slotLastSeenFrame 刷新与 publishTexture 的
-    //   "每帧重试一次（Vulkan view 可能上一帧还是 0）"语义都要求每帧至少真走一次。
-    //   只比 RenderType 身份，命中失败只是退回原路径，不会错。
     private static RenderType lastGlyphRenderType;
     private static int lastGlyphSlot;
 
     private static boolean textPerfFrame;
     private static long textCaptureNanos;
     private static long textUploadNanos;
-    // 2026-10-13：查表 + 贴图发布（slotFor/publishTexture）的耗时。原先这段没有
-    // 计时，正是它让 130ms 在 [TEXT PERF] 里看不见（见 captureTextGlyph 的说明）。
     private static long textLookupNanos;
     private static int textGlyphs;
     private static int textVertices;
     private static int textBytes;
     private static int textUploads;
-    // 2026-10-13：**原版文字路径**的墙钟。做法是累加"相邻两次逐字形回调之间的间隔"——
-    // 我们的钩子是被原版每个字形各调一次的，所以这些间隔之和≈原版 Text 这一遍的总耗时
-    // （含它自己的顶点发射与两次回调之间的任何工作）。
-    //
-    // 为什么必须要它：原版 profiler 只给一个不可再分的叶子 `Text - 91.37%/74.44%`
-    // （见 debug\profiling\2026-10-13_21_44_54-...zip 的 client/profiling.txt），
-    // 而这一遍里**包含我们自己的钩子**（captureUs 只有 ~0.9ms），所以需要把
-    // "摊在字形之间"与"在进入字形循环之前"分开：
-    //   · textPathUs ≈ 原版 Text 总耗时 ⇒ 成本摊在每个字形上（逐字形发射/绘制）；
-    //   · textPathUs ≪ 原版 Text 总耗时 ⇒ 成本在循环之外（文本布局/测量），
-    //     那么"取消原版逐字形发射"这类做法救不了它。
     private static long textEmitNanos;
     private static long textGapNanos;
     private static long lastGlyphHeadNanos;
     private static long lastGlyphTailNanos;
 
-    /**
-     * 2026-10-13：是否**跳过原版世界文字的顶点发射**（默认关，用
-     * {@code ORION_SKIP_VANILLA_WORLD_TEXT=1} 打开）。
-     *
-     * <p>依据：原版 {@code acceptRenderable} 造出来的那份顶点，在 RT 模式下是
-     * 整帧被替换掉的（见 TextGlyphRendererMixin 的说明），而我们已经用
-     * {@link #captureTextGlyph} 把同一批字形镜像进实体批次。</p>
-     *
-     * <p><b>实测依据（2026-10-13 21:51，城市图招牌区）</b>：把这一遍切成"原版函数体内"
-     * 与"两次字形之间的间隙"两个分项后 ——</p>
-     * <pre>
-     *   glyphs=6027  textEmitUs=89623  textGapUs=3363  textPathUs=92987
-     *   glyphs=5034  textEmitUs=63906  textGapUs=2558  textPathUs=66464
-     *   glyphs=2301  textEmitUs=15126  textGapUs=1541  textPathUs=16668
-     * </pre>
-     * <p>原版函数体占 96%，间隙只有 1.5~3.4ms；同期原版 profiler 报 {@code Text} = 整帧
-     * 76.24%，而我们自己的分项合计只有 2.3ms ⇒ 这一遍几乎全是"造一份马上被整帧替换掉的
-     * 顶点"。所以默认**打开**：镜像成功就取消原版那一遍；镜像失败的路径不取消，原版照旧画。</p>
-     *
-     * <p>只对世界文字生效：GUI/HUD 文字不在本帧捕获窗口内（{@code captureFrameActive}
-     * 为假），一律不取消。{@code ORION_SKIP_VANILLA_WORLD_TEXT=0} 可一键回退。</p>
-     */
+    
+
     public static final boolean SKIP_VANILLA_WORLD_TEXT = resolveSkipVanillaWorldText();
 
     private static boolean resolveSkipVanillaWorldText() {
@@ -293,26 +112,14 @@ public final class EntityRtCapture {
         if (raw == null) {
             raw = System.getenv("ORION_SKIP_VANILLA_WORLD_TEXT");
         }
-        // 默认打开；显式 =0 才关。
         return raw == null || !"0".equalsIgnoreCase(raw.trim());
     }
 
-    /** 相邻两次逐字形回调之间的墙钟累计（见 captureTextGlyph 顶部的说明）。 */
     private static long textPathNanos;
     private static long lastGlyphEntryNanos;
 
-    // 2026-10-13：串图（用户报的"物品展示框里的物品贴图错乱"）做成**累计**计数。
-    // 原有的 evictionsInUse 每帧清零、且只在被 64 帧门控的诊断帧才打印 ⇒ 只看得到
-    // 1/64 的帧，正好可能漏掉串图发生的那一刻。这个总数永不清零：只要它涨过 0，
-    // 就证明"slotFor 抢占了本帧已经用过的槽"这条路径真的被走到过。
     private static long evictionsInUseTotal;
 
-    // 2026-10-12 判"文字翻槽"是哪一种：每字形真的对应不同纹理，还是 31 槽被打满后
-    // slotFor 的 LRU 抢占把本帧已用的槽换了人（后者会让本帧早先上传的几何串到别的
-    // 贴图上 = 用户报的旗帜/文字"贴图错乱"）。两者修法相反，必须先分开。
-    //   · textDistinctTextures = 本帧文字实际解析出多少种 Sampler0；
-    //   · textSlotChanges      = 本帧文字批次因 textureSlot 变化而 flush 的次数；
-    //   · evictionsInUse       = 本帧抢占"本帧已经用过的槽"的次数（唯一会串图的那条）。
     private static int textSlotChanges;
     private static int evictionsInUse;
     private static final java.util.HashSet<Identifier> textFrameTextures =
@@ -320,7 +127,6 @@ public final class EntityRtCapture {
 
     private EntityRtCapture() {}
 
-    /** 本帧的实体捕获窗口是否已经打开（{@link #beginEarlyFrame()} 的幂等依据）。 */
     private static boolean entityFrameOpen;
 
     /**
@@ -356,9 +162,6 @@ public final class EntityRtCapture {
         if (entityFrameOpen) {
             return;
         }
-        // 2026-10-09 运动矢量：帧序号推进（配对表按它判"上一帧"），并定期清理
-        // 太久没出现的记录（见 entityMotionTrackers / pruneEntityMotionTrackers）。
-        // 这里每帧**恰好一次**（上面的 entityFrameOpen 把着关），正是帧序号该在的位置。
         ++entityMotionFrame;
         if (--entityMotionLogCountdown <= 0) {
             entityMotionLogCountdown = 600;
@@ -368,7 +171,6 @@ public final class EntityRtCapture {
         NativeVulkan.beginEntityFrame();
     }
 
-    /** 第一人称手部/手持物的提交阶段（见 {@link #beginEarlyFrame()}）。 */
     private static boolean handPhase;
 
     /**
@@ -401,13 +203,9 @@ public final class EntityRtCapture {
 
     private static boolean handPhaseLogged;
     private static boolean endPortalLogged;
-    /** 末地门诊断：上传出口只打一次（证明顶点真的进了批次）。 */
     private static boolean endPortalBatchLogged;
-    /** 末地门自合成路线的探针（一次性）。 */
     private static boolean endPortalSyntheticLogged;
     private static boolean endPortalSyntheticSlotLogged;
-    // 2026-10-21 闪电/信标是新增的合成路径，本机无法起游戏 ⇒ 各留一条一次性探针，
-    // 用户实机日志里能直接区分"没走到 / 贴图槽没拿到 / 已上传"。
     private static boolean lightningSyntheticLogged;
     private static boolean lightningSyntheticSlotLogged;
     private static boolean beaconSyntheticLogged;
@@ -419,18 +217,14 @@ public final class EntityRtCapture {
     }
 
     public static void beginFrame() {
-        // 2026-10-03 实体可见性剔除：每帧驱动一次（内部按 tick 自节流）。
         com.example.client.cull.EntityVisibilityCuller.tick();
         if (activeBatch.get() != null) throw new IllegalStateException("Entity model capture leaked across frames");
         ++captureFrameSerial;
         entityFrameOpen = true;
-        // 文字是纯外观：万一上一帧在异常里中断，静默丢弃比抛异常好。
         textBatchSlot = 0;
         captureFrameActive = true;
 
-        // 文字读数（见 textPerfFrame 的注释）：本帧是否采样 + 清计数。
         textPerfFrame = isDiagnosticFrame();
-        // 逐字形查表缓存必须每帧失效（见 lastGlyphRenderType 的注释）。
         lastGlyphRenderType = null;
         lastGlyphSlot = 0;
         textCaptureNanos = 0L;
@@ -461,16 +255,6 @@ public final class EntityRtCapture {
         entityFrameOpen = false;
         flushTextBatch();
 
-        // =====================================================
-        // 2026-10-03 文字捕获读数（每 64 帧一行，见 textPerfFrame）。
-        //
-        // 读法：
-        //   glyphs/verts/bytes = 本帧镜像了多少文字几何（bytes 就是要过 JNI 的量）；
-        //   captureUs          = 逐字形重抓（render + 逐顶点写入）占用的渲染线程时间；
-        //   uploadUs/uploads   = 整批 JNI 上传（uploadEntityBatch，含 native memcmp）。
-        // 若 captureUs 可观，下一步才值得做批次复用；若只有 uploadUs 大，那说明
-        // 应该合并/降频上传而不是改抓取。
-        // =====================================================
         if (textPerfFrame && (textGlyphs != 0 || textUploads != 0)) {
             System.out.println(
                     "[TEXT PERF]"
@@ -481,25 +265,12 @@ public final class EntityRtCapture {
                             + " lookupUs=" + (textLookupNanos / 1000L)
                             + " captureUs=" + (textCaptureNanos / 1000L)
                             + " uploadUs=" + (textUploadNanos / 1000L)
-                            // 原版 Text 这一遍的墙钟（相邻字形回调之间的间隔之和）。
-                            // 与同期的原版 profiler Text 节点对账：两者接近 ⇒ 这一遍
-                            // 就是热点。跳过原版发射（SKIP_VANILLA_WORLD_TEXT=1）后
-                            // 这个数应当塌到几毫秒。
                             + " textPathUs=" + (textPathNanos / 1000L)
-                            // 判翻槽成因（见 textSlotChanges 的声明）：
-                            //   tex 小(2~3) 而 changes 大 ⇒ 真的在两张表之间交替，
-                            //     属于分批问题，抢占无关；
-                            //   tex 大 / tableSize 顶到 MAX_REGULAR_TEXTURE_SLOTS 且
-                            //     evictInUse>0 ⇒ 槽被打满后本帧抢占，串图就是它。
-                            // evictInUseTotal 是永不清零的累计值：>0 即"串图那条路
-                            // 真的被走到过"（用户报的物品展示框贴图错乱就是它）。
                             + " tex=" + textFrameTextures.size()
                             + " changes=" + textSlotChanges
                             + " evictInUse=" + evictionsInUse
                             + " evictInUseTotal=" + evictionsInUseTotal
                             + " tableSize=" + frameTextureSlotCount
-                            // 2026-10-13：关档时 glyphs 仍有数、其余分项恒 0 —— 这是
-                            // "开关生效且此刻确实在招牌区"的判据（见 TEXT_CAPTURE_ENABLED）。
                             + " disabled=" + (TEXT_CAPTURE_ENABLED ? 0 : 1));
         }
     }
@@ -525,30 +296,14 @@ public final class EntityRtCapture {
      */
     public static void finishEntityFrame() {
         if (!entityFrameOpen) {
-            // 已经收过（手路径 + renderLevel 兜底会各调一次）。原生 endEntityFrame 自身
-            // 也按 g_entityFrameOpen 幂等，但这里早退可以避免 text perf 行重复打印。
             return;
         }
         endFrame();
         NativeVulkan.endEntityFrame();
     }
 
-    /**
-     * 2026-10-13 归因开关：{@code ORION_TEXT_CAPTURE=0}（或
-     * {@code -Dorion.textCapture=0}）直接跳过文字捕获。
-     *
-     * <p>为什么需要：城市图（Broville v11.4.4）里走进招牌密集区时实测帧时间从
-     * 24ms 涨到 92ms（[PERF L10 CPU] avg，41fps → 10.8fps，单帧最大 503ms），而
-     * 同一窗口内 [TEXT PERF] 的 glyphs 从 256 涨到 5066/帧、changes 从 152 涨到
-     * 3357/帧，但我们自己的分项 lookup+capture+upload 只有 2.5ms、C++ work 只有
-     * 12ms —— 那 ~55ms 落在我们**所有仪器之外**。这个开关给出唯一干净的二分：</p>
-     * <ul>
-     *   <li>关掉后帧时间掉回 ~24ms ⇒ 成本是**我们的捕获**（那就优化捕获：分批/降频）；</li>
-     *   <li>关掉后仍是 ~90ms ⇒ 成本是**原版自己的 Text 渲染**（那我们只能减少镜像量
-     *       或不镜像文字，优化捕获无用）。</li>
-     * </ul>
-     * <p>只在排查时用：关掉后招牌文字不再进光追（画面里看不到招牌字）。</p>
-     */
+    
+
     private static final boolean TEXT_CAPTURE_ENABLED = resolveTextCaptureEnabled();
 
     private static boolean resolveTextCaptureEnabled() {
@@ -572,9 +327,6 @@ public final class EntityRtCapture {
             Font.DisplayMode displayMode) {
         if (!captureFrameActive) return false;
 
-        // 2026-10-13：原版 Text 这一遍的墙钟（相邻两次逐字形回调之间的间隔之和）。
-        // 放在**关档早退之前**，所以两个臂都能量到。只在诊断帧做（每 64 帧一次），
-        // 稳态零开销。见 Log 里 textPathUs 的读法。
         if (textPerfFrame) {
             final long glyphEntryNanos = System.nanoTime();
             if (lastGlyphEntryNanos != 0L) {
@@ -584,10 +336,6 @@ public final class EntityRtCapture {
         }
 
         if (!TEXT_CAPTURE_ENABLED) {
-            // 关档时**仍然数字形**：第一次 textcap0 A/B（2026-10-13 21:33 那局）就是
-            // 因为连"人在不在招牌区、招牌多密"都读不出来而作废的 —— 只有帧时间没有
-            // 场景密度，读不出任何结论。计数是 O(1)，不碰槽表、不碰批次、不碰 JNI，
-            // 不会污染这一臂的帧时间。返回 false：关档时原版必须照旧画。
             textGlyphs += 1;
             return false;
         }
@@ -598,16 +346,8 @@ public final class EntityRtCapture {
         int textureSlot;
 
         if (renderType == lastGlyphRenderType) {
-            // 同一段文字里第 2..N 个字形：查表结果与发布状态本帧已经算过（见
-            // lastGlyphRenderType 的注释），直接复用。
             textureSlot = lastGlyphSlot;
         } else {
-            // 2026-10-13：这一段**必须**计时。原注释把它记成"廉价路径，不单列"，
-            // 结果就是 2026-10-13 那次城市地图排查里，[TEXT PERF] 只报
-            // captureUs 1.5ms 而原版 profiler 报 Text 占整帧 85.6% —— 差额全在
-            // 这里：slotFor() 的 evict 分支会调 publishTexture() ⇒
-            // publishEntityPbrTexture() ⇒ NativeVulkan.updateEntityPbrTexture()
-            // （JNI + native 重推 binding 63/64）。实测 evictInUse=2736/帧。
             final long textLookupStartNanos = textPerfFrame ? System.nanoTime() : 0L;
 
             Identifier texture = resolveSampler0(renderType);
@@ -625,8 +365,6 @@ public final class EntityRtCapture {
             lastGlyphSlot = textureSlot;
         }
 
-        // A font's glyphs can span several sheets (256 glyphs each), so the
-        // atlas changes mid-run; flush and reopen on a slot change.
         ActiveBatch batch = textBatch.get();
         if (textBatchSlot != 0 && textureSlot != textBatchSlot) {
             if (textPerfFrame) ++textSlotChanges;
@@ -637,15 +375,11 @@ public final class EntityRtCapture {
             textBatchSlot = textureSlot;
         }
 
-        // 发射计时与上面的查表/发布计时分开：captureUs 只含"重抓顶点"，
-        // lookupUs 含 resolveSampler0 + slotFor（含 evict 时的 publishTexture）。
-        // 两者分开才能一眼看出贵在"查表+发布"还是贵在"重抓顶点"。
         final long textStartNanos = textPerfFrame ? System.nanoTime() : 0L;
         final int textVerticesBefore = batch.vertexCount;
 
         CapturingVertexConsumer consumer = batch.captureConsumer();
         try {
-            // Same call vanilla makes, minus its own (discarded) vertex builder.
             glyph.render(pose, consumer, lightCoords, false);
         } finally {
             consumer.finish();
@@ -658,7 +392,6 @@ public final class EntityRtCapture {
             textCaptureNanos += System.nanoTime() - textStartNanos;
         }
 
-        // 镜像成功 ⇒ 调用方可以跳过原版那一份（内容不变：RT 那份在）。
         return true;
     }
 
@@ -697,9 +430,6 @@ public final class EntityRtCapture {
         Arrays.fill(publishedEntityViews, 0L);
         Arrays.fill(publishedEntitySamplers, 0L);
         Arrays.fill(slotTexturePublished, false);
-        // 实体 LabPBR：资源包换过 ⇒ `_n`/`_s` 的解析结论可能全变，连同句柄去重
-        // 状态一起清掉，下一帧重新解析、重新推送（native 侧槽位保持不变，但旧句柄
-        // 可能已被复用 ⇒ 必须重推）。
         ENTITY_PBR_SIBLINGS.clear();
         Arrays.fill(publishedEntityNormalViews, 0L);
         Arrays.fill(publishedEntityNormalSamplers, 0L);
@@ -715,8 +445,6 @@ public final class EntityRtCapture {
     public static void markLocalPlayerProxyState(Object state) {
         if (localPlayerProxyStates.size() >= 8) localPlayerProxyStates.clear();
         localPlayerProxyStates.add(state);
-        // 不依赖 skin 填充时机:26.3 的皮肤可能走 PlayerSkinRenderCache,
-        // extract 阶段 skin 未必就绪;id 回退只需要状态是 Avatar。
         localPlayerProxyAvatarPending = state instanceof AvatarRenderState;
         localPlayerProxyBodyTexture = null;
         if (state instanceof AvatarRenderState avatarState && avatarState.skin != null) {
@@ -730,19 +458,9 @@ public final class EntityRtCapture {
     }
 
     public static boolean isLocalPlayerProxyState(ModelFeatureRenderer.Submit<?> submit) {
-        // ⚠ 2026-10-06 手部阶段绝不能当成"身体代理"。
-        // 第一人称手/手持物在 GameRenderer 里**先于**世界渲染提交，而身体代理的
-        // "armed" 标记（localPlayerProxyAvatarPending）是上一帧 submitEntities 留下的
-        // ⇒ 手的提交会命中 id 回退，被判成代理、进 LOCAL_PLAYER 层（主相机 mask 0x02
-        // 看不到）⇒ 手永远不显示。手部阶段直接放行为普通实体。
         if (handPhase) return false;
         if (localPlayerProxyStates.contains(submit.state())) return true;
         if (!localPlayerProxyAvatarPending) return false;
-        // 延迟特性管线会拷贝渲染状态,身份集合失效时退回实体 id 匹配:
-        // id 是拷贝后仍保留的稳定字段。旧版曾用 skin 身体贴图匹配,但 26.3
-        // 的皮肤走 PlayerSkinRenderCache,Sampler0 的 location 与
-        // skin.body().texturePath() 不再相等,回退必然 miss —— 这正是
-        // 玩家模型漏进普通实体层、主光线打到脸的原因。
         var player = Minecraft.getInstance().player;
         boolean idHit = player != null
                 && submit.state() instanceof AvatarRenderState avatarState
@@ -817,63 +535,12 @@ public final class EntityRtCapture {
         );
     }
 
-    // =====================================================
-    // 2026-10-09 运动矢量（DLSS-RR）：实体层的"上一帧世界位置"。
-    //
-    // ★ 用什么做身份：javap 实测 `EntityRenderState`（基类）**没有 id** —— 它的
-    //   字段只有 entityType / x / y / z / ageInTicks / …；`id` 只出现在
-    //   `AvatarRenderState`（玩家）上。所以身份只能取
-    //   **(entityType, 位置就近匹配)**：状态里的 x/y/z 是**插值后的世界位置**，
-    //   同一实体相邻两帧必然贴得很近 ⇒ "同类型里离得最近的那条记录"就是它的上一帧。
-    //
-    // ★ 为什么不读实体的 xo/yo/zo：那个 API 本版本不保证可用（粒子层已经被
-    //   `Particle` 没有 getX() 坑过一次），而且口径不同会带来整整一个 tick 的误差
-    //   （位移一跳一跳）。直接用渲染状态的位置，与画面**严格同源**。
-    //
-    // ★ 就近匹配的风险有界：同类型多个实体（一群僵尸）时，万一配错，错的也是
-    //   同类型、同一区域、运动相近的另一个 ⇒ 误差不会变成"乱跳的残影"。
-    //
-    // ★ 内存有界：每条记录 37 个 double；同类型超上限或太久没被匹配到就清理
-    //   （见 pruneEntityMotionTrackers）⇒ 不存在"玩久了涨内存"。
-    //
-    // =====================================================
-    // ★★ 2026-10-17：从"整批一个平移常量"升级为"整批一个根位姿增量矩阵" ★★
-    //
-    // 旧口径的病灶：位移只取 `renderState.x/y/z` 的帧间差 ⇒ **只覆盖根的平移**。
-    // 而实体的像素位移有两项来源：
-    //   ① 根平移（走路、飞行、掉落）；
-    //   ② 根旋转（转身、低头抬头、展示框/船随波摆动）。
-    // ② 完全不进 MV ⇒ "原地转身的怪"、"跟着鼠标转的自己身体"拿到 MV=0，
-    // 屏幕像素却在动 ⇒ DLSS 按 0 重投影 ⇒ 拖影/抖动。转身时平移恰好为 0，
-    // 所以这不是"误差小"，是"整项缺失"。
-    //
-    // 新口径：存**上一帧的根位姿矩阵**，逐顶点算
-    //     p_prev = prevPose · curPose⁻¹ · p_cur
-    // 于是 MV 同时含平移与旋转，且对纯平移与旧口径**数值等价**
-    // （delta = 纯平移时，逐顶点结果恰好等于那个平移常量）。
-    //
-    // ⚠ 2026-10-26 更新：setupAnim 摆动的四肢 / 尾巴 / 披风形变现在**有** MV 了
-    //   —— 不靠根位姿，而是缓存上一帧同批次的逐顶点位置直接做差（见下面的
-    //   LIMB_MV_ENABLED / entityVertexHistories）。拿不到可信历史时（首帧 /
-    //   顶点数变了 / 上一帧没提交）仍退回这里的根位姿增量。
-    // =====================================================
     private static final java.util.HashMap<
             net.minecraft.world.entity.EntityType<?>, java.util.ArrayList<double[]>>
             entityMotionTrackers = new java.util.HashMap<>();
 
-    /**
-     * 2026-10-26 四肢摆动 / 披风 / 尾巴等**逐顶点姿态动画**进 MV。
-     *
-     * <p>根位姿增量只能表达"整个实体怎么动"，setupAnim 摆动的四肢在它看来是不动的。
-     * 这里按 Remix 的做法（geometry_resolver 用上一帧蒙皮顶点位置）缓存上一帧同一
-     * (模型, RenderType) 提交的顶点位置，本帧同下标相减：
-     * {@code motion = p_prev − p_cur}。顶点顺序由模型结构决定（同一模型逐帧不变），
-     * 所以下标就是对应关系；顶点数变了（部件显隐 / 换模型）或上一帧没提交这批判次
-     * 时返回 null，整批退回根位姿增量 —— 与旧口径逐位相同，不会产生错配的运动。</p>
-     *
-     * <p>键里的 {@code RenderType} 用身份相等（RenderTypes 的工厂是记忆化的，
-     * 同一贴图逐帧返回同一实例）；{@code Model} 同理是渲染器持有的单例。</p>
-     */
+    
+
     private static final boolean LIMB_MV_ENABLED = resolveLimbMvEnabled();
 
     private static boolean resolveLimbMvEnabled() {
@@ -884,15 +551,12 @@ public final class EntityRtCapture {
         return raw == null || !"0".equalsIgnoreCase(raw.trim());
     }
 
-    /**
-     * 顶点位置历史表：键是 tracker 记录（{@code double[]}，数组的 equals/hashCode
-     * 就是身份语义），与记录同生命周期 —— 记录被 prune 掉时这里一起删。
-     */
+    
+
     private static final java.util.HashMap<
             double[], java.util.HashMap<ModelBatchKey, VertexHistory>>
             entityVertexHistories = new java.util.HashMap<>();
 
-    /** 单个实体最多缓存多少条 (模型, RenderType) 历史；超了整体清空、下一帧重建。 */
     private static final int ENTITY_VERTEX_HISTORY_MAX_KEYS = 32;
 
     /** 一批模型几何的稳定身份：同一实体的同一提交逐帧对应。 */
@@ -900,40 +564,22 @@ public final class EntityRtCapture {
 
     /** 一条 (模型, RenderType) 批次的上一帧顶点位置（相机相对，与顶点缓冲同序）。 */
     private static final class VertexHistory {
-        /** 采样的帧号；只有恰好上一帧的数据才能当 p_prev 用。 */
         private int frame = Integer.MIN_VALUE;
         private float[] positions;
     }
 
-    /** 本帧序号（beginFrame 自增），同时充当记录的"最后匹配帧"。 */
     private static int entityMotionFrame;
 
-    /** 配对容差，平方值。8 格足以覆盖绝大多数帧位移（箭约 3 格/tick），又远小于实体间距。 */
     private static final double ENTITY_MOTION_MATCH_RADIUS_SQ = 64.0;
 
-    /** 超过这么多帧没被匹配到的记录视为"已消失"。 */
     private static final int ENTITY_MOTION_MAX_AGE_FRAMES = 60;
 
-    /** 同一类型保留的记录上限。 */
     private static final int ENTITY_MOTION_MAX_TRACKERS_PER_TYPE = 192;
 
     private static int entityMotionLogCountdown;
 
-    /**
-     * 记录布局（2026-10-17 起，长度 {@link #T_LEN}）：
-     * <pre>
-     *   0..2   T_X..       本帧位置（世界减相机，与 EntityRenderState.x/y/z 同源）
-     *   3      T_FRAME     最后匹配帧
-     *   4..6   T_MOTION    该帧的**平移**分量（prev − cur，相机相对）；仅供诊断与匹配
-     *   7..18  T_DELTA     该帧的 3×4 位姿增量（**行主序**：r0x r0y r0z tx / r1… / r2…）
-     *   19..34 T_POSE      上一帧的根位姿（4×4，JOML 列主序）
-     *   35     T_DELTA_VALID  delta 是否可用（0 = 恒等 / 首帧 / 没配上）
-     *   36     T_POSE_VALID   T_POSE 是否可用
-     * </pre>
-     * 为什么增量存"行主序 3×4"而不是直接存矩阵：消费端（{@code uploadBatch}）要按
-     * 顶点做一次仿射变换，行主序的 12 个 float 正好就是
-     * {@code x' = d0*x + d1*y + d2*z + d3}，没有转置歧义。
-     */
+    
+
     private static final int T_X = 0;
     private static final int T_Y = 1;
     private static final int T_Z = 2;
@@ -945,7 +591,6 @@ public final class EntityRtCapture {
     private static final int T_POSE_VALID = 36;
     private static final int T_LEN = 37;
 
-    /** 复用的 16 float 暂存（JOML {@code get}/{@code set} 的列主序中转）。 */
     private static final ThreadLocal<float[]> poseScratch =
             ThreadLocal.withInitial(() -> new float[16]);
 
@@ -1094,9 +739,6 @@ public final class EntityRtCapture {
         final double y = renderState.y;
         final double z = renderState.z;
 
-        // 本帧根位姿：与顶点同一空间（世界减相机），含平移 + 整体旋转。
-        // setupAnim 的逐骨动画不在根位姿里，由顶点位置历史单独覆盖（见
-        // LIMB_MV_ENABLED）；这里是拿不到历史时的兜底。
         final com.mojang.blaze3d.vertex.PoseStack.Pose rootPose = submit.pose();
         final Matrix4f currentPose = rootPose != null ? rootPose.pose() : null;
 
@@ -1104,8 +746,6 @@ public final class EntityRtCapture {
                 entityMotionTrackers.computeIfAbsent(
                         renderState.entityType, key -> new java.util.ArrayList<>());
 
-        // ① 先只在"本帧已认领"的记录里找：同一实体一帧内会被提交多次（身体 / 披风 /
-        //    盔甲是不同批次），沿用第一次算出的增量，否则第二批判出来是恒等。
         double[] best = null;
         double bestDistance = Double.MAX_VALUE;
 
@@ -1127,7 +767,6 @@ public final class EntityRtCapture {
             return;
         }
 
-        // ② 再在"上一帧留下的"记录里找最近的（跳过本帧已认领的）。
         double[] candidate = null;
         double candidateDistance = Double.MAX_VALUE;
 
@@ -1158,14 +797,10 @@ public final class EntityRtCapture {
                 age <= ENTITY_MOTION_MAX_AGE_FRAMES
                         && candidateDistance <= ENTITY_MOTION_MATCH_RADIUS_SQ;
 
-        // 平移三元组继续记着（诊断用；匹配仍按位置，不按它）。
-        // ⚠ 必须在覆盖 candidate 的位置**之前**算。
         final float motionX = paired ? (float)(candidate[T_X] - x) : 0.0F;
         final float motionY = paired ? (float)(candidate[T_Y] - y) : 0.0F;
         final float motionZ = paired ? (float)(candidate[T_Z] - z) : 0.0F;
 
-        // 增量必须用"上一帧的位姿"和"本帧的位姿"算 —— 而 candidate[T_POSE] 此刻
-        // 还正是上一帧那份，所以先算增量、再 writePose 覆盖。
         if (paired) {
             writePoseDelta(candidate, currentPose);
         } else {
@@ -1238,16 +873,7 @@ public final class EntityRtCapture {
             boolean localPlayerProxy) {
         if (activeBatch.get() != null) throw new IllegalStateException("Nested entity model capture");
         Identifier texture = resolveSampler0(submit.renderType());
-        // ⚠ 2026-10-25：handPhase 恒为 false（beginHandPhase 无调用者），本段是死代码。
-        // 且"把手贴图换成方块图集"的诊断前提已不成立 —— 手看不见不是贴图解不出来，
-        // 而是手在 endEntityFrame 之后提交、被原生门禁丢弃（见 beginEarlyFrame）。
         if (handPhase) {
-            // 2026-10-06 诊断：第一人称手的贴图是玩家皮肤。本仓库注释里记过
-            // "26.3 的皮肤走 PlayerSkinRenderCache，Sampler0 的 location 与
-            // skin.body().texturePath() 不再相等" ⇒ 很可能 publishTexture 拿不到
-            // view/sampler（静默返回），该槽描述符保持兜底、几何就成了黑块。
-            // 这里**临时**把手的贴图换成方块图集：若手因此出现（贴图很怪），
-            // 就证明是贴图解析问题；若仍不出现，则是位置/变换问题。仅诊断用。
             if (!handTextureSubstituted) {
                 handTextureSubstituted = true;
                 System.out.println("[RTX-HAND] texture probe: original="
@@ -1255,16 +881,11 @@ public final class EntityRtCapture {
             }
             texture = BLOCKS_ATLAS_TEXTURE;
         }
-        // The synthetic first-person proxy is submitted after the normal
-        // entity list.  Publishing its body texture directly into the final
-        // existing slot leaves the ordinary entity slot allocation unchanged.
         if (localPlayerProxy && isLocalPlayerBodyTexture(submit, texture)) {
             int textureSlot = MAX_TEXTURE_SLOTS;
             publishTexture(textureSlot, texture);
             ActiveBatch proxyBatch = acquireBatch(textureSlot, true, false);
             activeBatch.set(proxyBatch);
-            // 2026-10-09 运动矢量：本地玩家**身体代理**同样要有位移（玩家在走/跑/
-            // 飞行时，第一人称下自己的身体仍可能入镜——例如低头或第三人称）。
             resolveBatchMotion(proxyBatch, submit);
             return;
         }
@@ -1281,8 +902,6 @@ public final class EntityRtCapture {
         if (textureSlot != 0) {
             ActiveBatch batch = acquireBatch(textureSlot, localPlayerProxy, false);
             activeBatch.set(batch);
-            // 2026-10-09 运动矢量：**这是全工程唯一能拿到"顶点属于哪个实体"的地方**
-            // （captureVertex 的调用栈上没有实体上下文），位移在这里算好挂到批次上。
             resolveBatchMotion(batch, submit);
         }
     }
@@ -1311,20 +930,9 @@ public final class EntityRtCapture {
             System.err.println("[RTX-PROXY] proxy upload slot=" + batch.textureSlot
                     + " vertices=" + batch.vertexCount);
         }
-        // 2026-10-06 手部诊断（整个会话只打一次）。把这一批的槽位 / 顶点数 / 包围盒
-        // 与玩家坐标放在一起：如果顶点数 > 0 但包围盒远离玩家坐标，说明"捕获到了但
-        // 位置不对"（第一人称的手是相机相对空间，与实体层同空间，理论应贴近玩家）；
-        // 如果压根没有这一行，说明手根本没被捕获。
-        // ⚠ 2026-10-25：handPhase 恒 false ⇒ 这条 [RTX-HAND] 读数永远不会打印。
-        // 要确认"手是否进了 RT"，不要再等这条日志，直接看 [RTX-HAND] 的替代物：
-        // 手批次现在与实体同窗口，若仍看不见，先查 handRotation 是否被误开、以及
-        // 相机近平面/实例 mask，而不是贴图。
         if (handPhase && !handBatchLogged) {
             handBatchLogged = true;
             Minecraft minecraft = Minecraft.getInstance();
-            // 顶点是"相机相对 + 世界朝向"，所以和玩家的视线方向直接可比：
-            // offAxisDeg 小 = 落在视野里（垂直半角约 FOV/2 ≈ 35°），
-            // 接近 90°/更大 = 变换方向错了（手被放到侧面或背后）。
             final float cx = (batch.minX + batch.maxX) * 0.5f;
             final float cy = (batch.minY + batch.maxY) * 0.5f;
             final float cz = (batch.minZ + batch.maxZ) * 0.5f;
@@ -1342,8 +950,6 @@ public final class EntityRtCapture {
             final double offAxis = dist > 1.0e-4
                     ? Math.toDegrees(Math.acos(Math.max(-1.0, Math.min(1.0, along / dist))))
                     : -1.0;
-            // 一次性判定：旋转前 / 旋转后，哪个更朝向视线前方。当前这批是"原始"
-            // 上传的（判定之前不旋转），所以只影响一帧。
             final float rx = handRotation[0] * cx + handRotation[4] * cy + handRotation[8] * cz;
             final float ry = handRotation[1] * cx + handRotation[5] * cy + handRotation[9] * cz;
             final float rz = handRotation[2] * cx + handRotation[6] * cy + handRotation[10] * cz;
@@ -1352,7 +958,6 @@ public final class EntityRtCapture {
             final float sy = handRotation[4] * cx + handRotation[5] * cy + handRotation[6] * cz;
             final float sz = handRotation[8] * cx + handRotation[9] * cy + handRotation[10] * cz;
             final double alongT = sx * lx + sy * ly + sz * lz;
-            // 只有明显更朝前（0.05 余量）才换模式，避免噪声里来回跳。
             handTransformMode = (alongM > along + 0.05 && alongM >= alongT)
                     ? 1
                     : (alongT > along + 0.05 ? 2 : 0);
@@ -1378,23 +983,15 @@ public final class EntityRtCapture {
         return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
     }
 
-    /** 方块图集（无条件可解析）。诊断期用来替代手的皮肤贴图，见 beginModel。 */
     private static final Identifier BLOCKS_ATLAS_TEXTURE =
             Identifier.withDefaultNamespace("textures/atlas/blocks.png");
 
-    /**
-     * 手部顶点的变换模式：-1 = 未判定，0 = 不转（原始）、1 = M·v、2 = Mᵀ·v。
-     *
-     * <p>缺的这一步只能靠实测分辨（MC 视图空间的手性 / pose 里是否已含相机旋转）：
-     * 三种候选的中心分别与玩家视线做点积，取最朝前的那个。整个会话只判一次，
-     * 用当前这批判定，从下一批开始生效。</p>
-     */
+    
+
     private static int handTransformMode = -1;
 
-    /**
-     * 相机视图旋转的逆（view → world），由 {@code VulkanCameraMixin} 每帧写入。
-     * 只用于把第一人称手的视图空间顶点旋到世界朝向（见 captureVertex 的说明）。
-     */
+    
+
     private static final float[] handRotation = new float[] {
             1.0f, 0.0f, 0.0f, 0.0f,
             0.0f, 1.0f, 0.0f, 0.0f,
@@ -1407,15 +1004,8 @@ public final class EntityRtCapture {
         System.arraycopy(columnMajor, 0, handRotation, 0, 16);
     }
 
-    /**
-     * 2026-10-18 末地传送门贴图随相机滑动：本帧相机世界原点，由
-     * {@code VulkanCameraMixin} 每帧写入（与 native 用来把实体顶点从"世界减相机"
-     * 还原到世界的 {@code viewInverse[12..14]} 同源同帧）。
-     *
-     * <p>投影 UV 必须用**世界**坐标合成才有"贴图钉在世界里"的观感；此前直接用了
-     * 顶点里那份"世界减相机"坐标 ⇒ 贴图整体随相机平移，就是用户报的"随相机移动
-     * 而变化"。这里把相机加回去，公式与缩放不变，相邻方块依旧连续。</p>
-     */
+    
+
     private static float cameraWorldX;
     private static float cameraWorldY;
     private static float cameraWorldZ;
@@ -1427,18 +1017,8 @@ public final class EntityRtCapture {
     }
 
     private static void uploadBatch(ActiveBatch batch) {
-        // ModelFeatureRenderer may leave 1..3 non-face vertices at the end of
-        // a submission (for example an auxiliary feature).  They cannot form
-        // a triangle pair in this quad-to-triangle capture path, so discard
-        // only that incomplete tail.  All completed quads remain intact.
         batch.pendingQuadVertexCount = 0;
         batch.buffer.flip();
-        // 2026-10-06 末地门诊断（整个会话一次）：这是 "captured" 那行的**下半句**。
-        // "captured" 只证明批次被打开；这里证明顶点**真的**写进了批次并要上传。
-        //   · 出现且 vertices>0 ⇒ 几何确实在 TLAS 里，问题在下游（路由 / 裁切 / 层）；
-        //   · vertices=0 或压根没有这一行 ⇒ RenderTypeFeatureRendererMixin 的顶点钩子
-        //     没有覆盖这条提交链（captureVertex 没被调用），问题在**捕获**这一层。
-        // 上一次只改了裁切与类判定却仍看不见，就是缺这句才在盲试。
         if (!endPortalBatchLogged && batch.textureSlot >= 1
                 && batch.textureSlot <= MAX_TEXTURE_SLOTS) {
             final String endPortalLabel = frameTextureLabels[batch.textureSlot - 1];
@@ -1449,23 +1029,6 @@ public final class EntityRtCapture {
                         + " label=" + endPortalLabel);
             }
         }
-        // =====================================================
-        // 2026-10-17 运动矢量：位移通道（逐顶点）。
-        //
-        // 旧口径是"整批一个平移常量"，因为位移只来自根位置差。现在位移按顶点算。
-        //
-        // 2026-10-26：优先用**上一帧同批次顶点位置**做差（四肢摆动 / 披风形变进
-        // MV，见 LIMB_MV_ENABLED 与 attachVertexHistory）。只有拿不到可信历史
-        // （新实体 / 顶点数变了 / 上一帧没提交这一批 / 开关关闭）时，才退回根位姿
-        // 增量 `p_prev = delta · p_cur` —— 那条路与旧实现逐位相同。
-        //
-        // 位置直接从**已经写好的顶点缓冲**里读（绝对下标 getFloat，不改 position），
-        // 所以与上传给 native 的几何**逐顶点同源**：不可能出现"位移按另一份坐标算"
-        // 这种错位（这正是本通道历史上最容易踩的坑）。
-        //
-        // 成本：每顶点 3 次减法 + 3 次数组写（原来就是每顶点 9 乘 6 加）；
-        // 内存：每实体每 (模型, RenderType) 一份 float[3N]，随 tracker 记录一起回收。
-        // =====================================================
         long motionPointer = 0L;
         if (batch.vertexCount > 0) {
             final int motionFloats = batch.vertexCount * 3;
@@ -1509,7 +1072,6 @@ public final class EntityRtCapture {
                 if (positionStore != null) {
                     batch.storeVertexHistory(positionStore);
                 }
-                // 全 0 时不传：native 会补 0，语义相同，也避免静止实体白白多传 12B/顶点。
                 if (needMotion && anyMotion) {
                     motion.flip();
                     motionPointer = MemoryUtil.memAddress(motion);
@@ -1535,21 +1097,9 @@ public final class EntityRtCapture {
     }
 
     public static void captureVertex(float x, float y, float z, int color, float u, float v) {
-        // Section compilation can invoke BufferBuilder on worker threads while
-        // the render thread ends a model.  Capture only the current thread's
-        // model batch and retain one local reference for the whole call.
         ActiveBatch batch = activeBatch.get();
         if (batch == null) return;
-        // ⚠ 2026-10-25：handPhase 恒 false ⇒ 本段不执行，而且**不应该**执行。
-        // GameRenderer.renderItemInHand 已把 viewRotationMatrix.invert() 乘进 PoseStack
-        // （GameRenderer.java:384），传到这里的手顶点已经是"世界朝向 + 相机相对"，
-        // 与 ENTITY 层同口径；再乘一次 handRotation 会把手转到侧面/背后。
-        // 下面的 M·v / Mᵀ·v 三选一属于 26.2 的旧空间假设，保留只为历史可读。
         if (handPhase && handTransformMode != 0) {
-            // 2026-10-06 第一人称手：顶点是**视图空间**的（手臂相对眼睛的偏移，没有
-            // 相机旋转），而实体层用的是"世界朝向 + 相机相对"。缺的这一步只能是
-            // M·v 或 Mᵀ·v（差一个转置 = 旋转方向相反），静态推不出来 ⇒ 三种候选
-            // （不转 / M·v / Mᵀ·v）由 endModel 里按"谁更朝视线前方"选一次。
             final float rx;
             final float ry;
             final float rz;
@@ -1567,14 +1117,6 @@ public final class EntityRtCapture {
             z = rz;
         }
         if (batch.projectiveUv) {
-            // 末地门没有顶点 UV（见 beginCustomSubmit 的说明）：用几何自身坐标合成。
-            // ⚠ 必须**先缩放再取小数**：方块立方体的顶点都在整数角点上，直接
-            // fract(坐标) 恒为 0 ⇒ 整个面只采纹理的 (0,0) 一个像素，而
-            // end_portal.png 的 (0,0) 是黑的 ⇒ 整片黑、在暗房间里就是"看不见"
-            //（实测症状）。缩放 0.25 后每个方块面跨 1/4 张贴图（256px 贴图约 64
-            // 像素），且始终落在 [0,1) 内，不依赖采样器的 wrap 模式。
-            // ⚠ 顶点是"世界减相机"（native 上传前才加回相机），所以这里必须先加回
-            // 本帧相机原点再合成 —— 否则贴图整体随相机平移（见 setCameraOrigin）。
             final float wx = x + cameraWorldX;
             final float wy = y + cameraWorldY;
             final float wz = z + cameraWorldZ;
@@ -1583,10 +1125,6 @@ public final class EntityRtCapture {
         }
         final int incomingColor = color;
         if (batch.projectiveUv || handPhase) {
-            // （末地门：buffer.addVertex(pose, vec3) 只有位置；第一人称手：颜色位是
-            // 缓冲默认值，不是我们这套 VertexConsumer 的 0xFFFFFFFF），拿到 0 之后
-            // RT 的 albedo = texture × color = 0 ⇒ 几何"黑掉"，在暗环境里就等于
-            // 看不见（手和门实测都如此）。贴图本身已经带了明暗，这里不需要顶点色。
             color = 0xFFFFFFFF;
         }
         if ((batch.projectiveUv || handPhase) && !vertexColorLogged) {
@@ -1648,10 +1186,6 @@ public final class EntityRtCapture {
      * ⇒ 覆盖 [0,1]²。UV 按顶点世界坐标合成（projectiveUv 路径）。</p>
      */
     public static void captureEndPortal(PoseStack.Pose pose) {
-        // 2026-10-06 一次性探针（整个会话一次）。上一版改了路线却仍看不见、日志里既没有
-        // 上传行也没有异常 ⇒ 必须先把"走到哪一步"分清楚，否则又是盲试：
-        //   reached ⇒ 混入命中了 submitSpecial；
-        //   nested / slot=0 ⇒ 命中了但在这里早退（分别指向批次嵌套、贴图标签没登记）。
         if (!endPortalSyntheticLogged) {
             endPortalSyntheticLogged = true;
             System.out.println("[RTX-ENTITY] end portal synthetic reached: activeBatch="
@@ -1670,13 +1204,10 @@ public final class EntityRtCapture {
             return;
         }
         ActiveBatch batch = acquireBatch(textureSlot, false, true);
-        // 与原版几何同源：UV 由顶点世界坐标合成（见 CapturingVertexConsumer.flush），
-        // 相邻方块因此连续，而不是每方块重置一次平铺。
         batch.projectiveUv = true;
         activeBatch.set(batch);
         CapturingVertexConsumer consumer = batch.captureConsumer();
         try {
-            // 原版盒体的上/下水平面（见函数上的说明）。各自正反两遍。
             emitPortalHorizontalQuad(consumer, pose, 0.75F, true);
             emitPortalHorizontalQuad(consumer, pose, 0.375F, true);
             emitPortalHorizontalQuad(consumer, pose, 0.75F, false);
@@ -1753,9 +1284,6 @@ public final class EntityRtCapture {
             }
             final float finalXOffset = xOffset;
             final float finalZOffset = zOffset;
-            // RT 实体层没有加色混合：原版 4 层是"由细到粗的同心壳 + alpha 0.3"
-            // 叠加出来的辉光，照搬会只剩最外层 ⇒ 变成一根 2.4 格粗的实心绳。
-            // 只发最内层壳（layer 0），并把半径略放大补偿辉光缺失。
             final float radiusScale = 1.8F;
             for (int layer = 0; layer < 1; ++layer) {
                 final RandomSource layerRandom = RandomSource.createThreadLocalInstance(seed);
@@ -1820,7 +1348,6 @@ public final class EntityRtCapture {
             boolean leftZPositive,
             int column) {
         final int color = 0xFFB9C8FF;
-        // 8 列精灵图：每列 64px。取列内 2px 内缩，避开线性过滤在列边界的串色。
         final float u0 = (column + 0.03F) * 0.125F;
         final float u1 = (column + 0.97F) * 0.125F;
         consumer.addVertex(pose,
@@ -1911,8 +1438,6 @@ public final class EntityRtCapture {
         poseStack.translate(0.5F, 0.0F, 0.5F);
         poseStack.rotateDegrees(Axis.YP, animationTime * 2.25F - 45.0F);
         final PoseStack.Pose pose = poseStack.last();
-        // 原版实心柱的四个面：(0,+r)→(+r,0)、(-r,0)→(0,-r)、
-        // (+r,0)→(0,-r)、(0,-r)→(0,+r)。
         emitBeaconQuad(consumer, pose, color, beamStart, beamEnd,
                 0.0F, radius, radius, 0.0F, 0.0F, 1.0F, vv1, vv2);
         emitBeaconQuad(consumer, pose, color, beamStart, beamEnd,
@@ -1975,18 +1500,9 @@ public final class EntityRtCapture {
             if (texture.equals(frameTextureSlots[index])) {
                 slotLastSeenFrame[index] = captureFrameSerial;
                 assignTextureClass(index, texture);
-                // Retry the publish until it succeeds: a texture captured while
-                // its Vulkan view was still 0 stays unpublished until the view
-                // exists.  The per-slot latch skips the TextureManager lookup
-                // in the steady state; invalidateTextureCache clears it on
-                // resource reloads, so handle churn across a reload is still
-                // picked up.
                 if (!slotTexturePublished[index]) {
                     publishTexture(index + 1, texture);
                 }
-                // 2026-10-09 LabPBR：`_n`/`_s` 的视图是异步加载的，可能比 albedo 晚
-                // 一帧才就绪，所以它有自己的 settle 位与重试（albedo 一旦 latched
-                // 就不再走上面那条路，不能顺带把它也钉死）。
                 if (!entityPbrSettled[index]) {
                     publishEntityPbrTexture(index + 1, texture);
                 }
@@ -1997,13 +1513,6 @@ public final class EntityRtCapture {
         if (frameTextureSlotCount < MAX_REGULAR_TEXTURE_SLOTS) {
             victim = frameTextureSlotCount;
         } else {
-            // 2026-10-06：满了不再"丢弃几何"，改成 LRU 抢占。
-            // 旧逻辑只肯回收"连续 SLOT_EVICTION_GRACE_FRAMES 帧没出现"的槽（本意是
-            // 给延迟特性管线留宽限），代价是一帧内新出现的纹理**必然**拿不到槽 ——
-            // 第一人称的手（帧首提交）与末地传送门就是这样整片消失的（实测日志：
-            // `slot table full, dropping texture .../netherite.png`）。
-            // 现在取"最久未被看见"的槽，优先本帧还没用过的；实在都在用才动本帧
-            // 用过的（那会短暂串一下纹理，也好过让几何直接不见）。
             victim = -1;
             int bestAge = -1;
             for (int index = 0; index < MAX_REGULAR_TEXTURE_SLOTS; ++index) {
@@ -2023,13 +1532,8 @@ public final class EntityRtCapture {
                 }
                 return 0;
             }
-            // 抢占"本帧已经用过"的槽 = 本帧早先上传、顶点里仍写着这个槽号的几何，会
-            // 改采样到新贴图。这是实体层"串图"的唯一来源，所以单独计数（永远打，
-            // 不受 isDiagnosticFrame 门控的原来那句在这里抓不到）。
             if (slotLastSeenFrame[victim] == captureFrameSerial) {
                 ++evictionsInUse;
-                // 永不清零的累计值：>0 即"串图那条路真的被走到过"（用户报的物品展示框
-                // 贴图错乱就是它）。见 evictionsInUseTotal 的声明。
                 ++evictionsInUseTotal;
             }
         }
@@ -2038,21 +1542,12 @@ public final class EntityRtCapture {
         assignTextureClass(victim, texture);
         slotLastSeenFrame[victim] = captureFrameSerial;
         if (victim == frameTextureSlotCount) ++frameTextureSlotCount;
-        // 槽被换人 ⇒ 上一张的 `_n`/`_s` 结论作废（新贴图可能没有，必须显式把
-        // native 那一槽推回中性兜底，否则会沿用旧句柄 = 串图）。
         entityPbrSettled[victim] = false;
         publishTexture(victim + 1, texture);
         return victim + 1;
     }
 
-    // Records the slot's material class and reports the ones that are not the
-    // default. The print exists because the classifier keys off texture paths:
-    // if 26.2's equipment textures are named differently the class silently stays
-    // default (armour looks unchanged) rather than breaking anything, and this
-    // line is the only way to tell which of the two happened.
     private static void assignTextureClass(int index, Identifier texture) {
-        // 2026-10-06：不裁切档优先，且**不经过** classifyEntityMaterial（那条路在
-        // entityArmorMetal 关闭时直接返回 DEFAULT ⇒ 会让末地门的可见性跟着盔甲设置变）。
         final int materialClass = isUncutoutTexture(texture)
                 ? MATERIAL_CLASS_UNCUTOUT
                 : classifyEntityMaterial(texture);
@@ -2075,15 +1570,6 @@ public final class EntityRtCapture {
         }
     }
 
-    // Armour and other equipment get a metal or soft-dielectric response; plain
-    // mob skins deliberately stay MATERIAL_CLASS_DEFAULT so their appearance does
-    // not change. The metals follow vanilla's equipment materials, and a metal
-    // takes its F0 from the albedo (the same LabPBR convention the block path
-    // already uses), so iron reads grey-white, gold yellow, copper orange.
-    // Material classification is a pure function of the texture Identifier, so
-    // memoize it per Identifier.  The opt-in switch below is part of the
-    // effective input; flipping it invalidates the whole cache, preserving the
-    // "setting takes effect on the next captured batch" behaviour.
     private static final java.util.HashMap<Identifier, Integer> MATERIAL_CLASS_CACHE =
             new java.util.HashMap<>();
     private static boolean materialClassCacheMetalEnabled;
@@ -2094,11 +1580,6 @@ public final class EntityRtCapture {
         }
 
 
-        // A glossy entity hit costs an extra full-resolution reflection ray per
-        // pixel, and armour that fills the screen pays it on almost every pixel,
-        // so the metal response is opt-in and switched off by default. Read from
-        // the capture thread each time, so flipping the setting takes effect on
-        // the next captured batch without a restart.
         boolean metalEnabled = RTXSettingsConfig.isEntityArmorMetalEnabled();
         if (!metalEnabled) {
             if (materialClassCacheMetalEnabled) {
@@ -2127,9 +1608,6 @@ public final class EntityRtCapture {
                 texture.toString().toLowerCase(Locale.ROOT);
 
 
-        // Only equipment textures carry a class. This keeps the change strictly
-        // to armour/equipment: mob skins, particles and weather keep the flat
-        // response they have today.
         if (!path.contains("/equipment/")
                 && !path.contains("armor")
                 && !path.contains("elytra")) {
@@ -2158,7 +1636,6 @@ public final class EntityRtCapture {
         }
 
 
-        // Leather, turtle shell and elytra: a plain dielectric, not a metal.
         return MATERIAL_CLASS_SOFT;
         }
 
@@ -2172,9 +1649,6 @@ public final class EntityRtCapture {
         return texture != null && texture.toString().contains("end_portal");
         }
 
-    // prepareModel() runs before LevelRenderer executes its frame graph.  Bind
-    // the exact resource texture here instead of waiting for a later RenderPass
-    // bind, which can happen after the native RT pass has already been recorded.
     private static void publishTexture(int slot, Identifier textureId) {
         AbstractTexture texture = Minecraft.getInstance()
                 .getTextureManager()
@@ -2185,18 +1659,9 @@ public final class EntityRtCapture {
                 && sampler instanceof VulkanGpuSampler vulkanSampler) {
             publishTextureHandle(slot, vulkanView.vkImageView(), vulkanSampler.vkSampler());
         }
-        // 2026-10-09 同一槽的 LabPBR（`_n`/`_s`）一起解、一起推。
         publishEntityPbrTexture(slot, textureId);
     }
 
-    // =====================================================================
-    // 2026-10-09 实体 LabPBR（`_n`/`_s`）解析与上传
-    //
-    // 与方块图集的路子（SpriteLoaderMixin 在 stitch 阶段把 `_n`/`_s` 读成
-    // NativeImage、TextureAtlasPBRMixin 拼进全局 PBR 图集）不同：实体贴图**不在任何
-    // 图集里**，RenderType 的 Sampler0 直接指向 TextureManager 里的独立贴图，所以只能
-    // 单独查表 + 单独上传，用与 albedo 同构的一组 sampler2D 数组（binding 63/64）。
-    // =====================================================================
 
     /** 一次解析并推送一个槽的 `_n`/`_s`；没有贴图/视图未就绪时会保持 unsettled 以便重试。 */
     private static void publishEntityPbrTexture(int slot, Identifier albedoTexture) {
@@ -2219,8 +1684,6 @@ public final class EntityRtCapture {
             if (handle == null) pending = true;
             else { specularView = handle[0]; specularSampler = handle[1]; }
         }
-        // 有文件但 Vulkan 视图还没建好：这一帧别推 0（那会被 native 当成"没有贴图"
-        // 而绑回兜底，且句柄一旦记下就不再重试），等下一帧。
         if (pending) return;
 
         entityPbrSettled[index] = true;
@@ -2242,8 +1705,6 @@ public final class EntityRtCapture {
             NativeVulkan.updateEntityPbrTexture(
                     slot, normalView, normalSampler, specularView, specularSampler);
         } catch (UnsatisfiedLinkError staleNative) {
-            // 先落的 spv、后落的 DLL：老 DLL 没有这个导出。永久关掉这条路，
-            // 着色器侧因为整槽都是中性兜底 ⇒ 自动回落类别值，不会乱。
             entityPbrNativeAvailable = false;
         }
     }
@@ -2295,7 +1756,6 @@ public final class EntityRtCapture {
                 }
             }
         } catch (RuntimeException ignored) {
-            // 视图未就绪时 Blaze3D 可能抛异常；当作"还没有"，下一帧再来。
         }
         return null;
     }
@@ -2304,8 +1764,6 @@ public final class EntityRtCapture {
         if (slot < 1 || slot > MAX_TEXTURE_SLOTS || imageView == 0L || sampler == 0L) return;
         int index = slot - 1;
         if (publishedEntityViews[index] == imageView && publishedEntitySamplers[index] == sampler) {
-            // Already current; the latch may still be unset (first frame this
-            // handle pair was seen), so turn it on here.
             slotTexturePublished[index] = true;
             return;
         }
@@ -2315,24 +1773,6 @@ public final class EntityRtCapture {
         NativeVulkan.updateEntityTexture(slot, imageView, sampler);
     }
 
-    // =====================================================================
-    // 2026-10-06 通用 RenderType 几何捕获（Custom / Item / BlockModel / MovingBlock）
-    //
-    // 26.3 的几何有好几条提交链，mod 原来只钩了 ModelFeatureRenderer（实体模型）
-    // 与 TextFeatureRenderer（告示牌/名牌字形）：
-    //   CustomFeatureRenderer      → 画、地图、**末地传送门**、末地折跃门、
-    //                                信标光柱、物品展示实体、守卫者光束、龙……
-    //   ItemFeatureRenderer        → **物品展示框里的物品**、掉落物、手持物品
-    //   BlockModelFeatureRenderer  → **物品展示框的框体**、移动方块模型……
-    //   MovingBlockFeatureRenderer → 活塞推动中的方块
-    // 这些几何原来一条都没进 RT，而原版光栅世界输出又被整帧替换 ⇒ 直接消失
-    // （用户报的"画、物品展示框这些实体没渲染，末地传送门也没渲染"）。
-    //
-    // 四条链共用基类 RenderTypeFeatureRenderer，都通过 getVertexBuilder(RenderType)
-    // 取得写入目标 ⇒ 在这一个点上开批次即可全覆盖。模型路径不受影响：
-    // ModelFeatureRendererMixin 已在 prepareModel HEAD 打开批次，这里见到
-    // activeBatch 非空就让路，原逻辑一字未动。
-    // =====================================================================
     private static RenderType customRenderType;
     private static boolean customBatchOpen;
 
@@ -2349,19 +1789,12 @@ public final class EntityRtCapture {
             return;
         }
         final String typeName = renderTypeName(renderType);
-        // ⚠ 2026-10-06 实体影子必须拒绝：ShadowFeatureRenderer **也**继承
-        //   RenderTypeFeatureRenderer，它的几何是贴地的一整块黑色四边形（光追里
-        //   alpha cutout 之后就是硬边黑盘）⇒ 玩家脚下会冒出黑色圆斑（实测）。
-        //   影子本来就该由光追自己算，绝不能当世界几何收进来。
         if (typeName != null && typeName.contains("shadow")) {
             return;
         }
         if (isScreenOverlayRenderType(typeName)) {
             return;
         }
-        // ⚠ 2026-10-06 末地传送门：它的 Sampler0 是 end_sky（近乎全黑的星幕），
-        //   原版观感来自 Sampler1 的紫色漩涡 + 专用管线。按 Sampler0 取只会得到
-        //   一片黑，看起来正好像"门没渲染"。所以这一档改取 Sampler1。
         final boolean endPortal = typeName != null && typeName.contains("end_portal");
         Identifier texture = endPortal ? resolveSampler(renderType, "Sampler1") : null;
         if (texture == null) {
@@ -2376,12 +1809,6 @@ public final class EntityRtCapture {
         }
         ActiveBatch customBatch = acquireBatch(textureSlot, false,
                 endPortal || isEmissiveGeometry(texture));
-        // 2026-10-06 末地门 / 末地折跃门：原版几何是 submitCube 的
-        // `buffer.addVertex(pose, faceVertex)` —— **只有位置、没有 UV**，贴图在原版
-        // 着色器里走 textureProj(texProj0) 的**屏幕空间投影**（见
-        // rendertype_end_portal.fsh）。RT 里没有那个投影，照抄顶点 UV 只会恒采纹理
-        // 的 (0,0) 一角 ⇒ 渲染成一片黑 ⇒"末地传送门看不见"。这里改成用顶点自身坐标
-        // 合成 UV（下面 captureVertex 里做），观感是"门内一片紫色星海"。
         customBatch.projectiveUv = endPortal;
         if (endPortal && !endPortalLogged) {
             endPortalLogged = true;
@@ -2428,10 +1855,6 @@ public final class EntityRtCapture {
      */
     private static boolean isEmissiveGeometry(Identifier texture) {
         final String path = texture.toString();
-        // 2026-10-06 实测修正：末地门的 Sampler1 是
-        // minecraft:textures/**entity**/end_portal/end_portal.png（不是
-        // environment/end_portal）⇒ 原来那条判据永远不命中，门被当成普通漫反射面，
-        // 不发光。改成按子串 end_portal / end_sky 匹配，两个命名变体都覆盖。
         return path.contains("end_sky")
                 || path.contains("end_portal")
                 || path.contains("end_gateway")
@@ -2454,9 +1877,6 @@ public final class EntityRtCapture {
     private static ActiveBatch acquireBatch(
             int textureSlot, boolean localPlayerProxy, boolean emissive) {
         ActiveBatch batch = reusableBatch.get().reset(textureSlot, localPlayerProxy, emissive);
-        // 只有模型批次需要共面层序。文字没有"底色 + overlay"这类共面重合，
-        // 而 STEP/MAX 是按方块尺寸定的，加到字形上就是错的（见
-        // ENTITY_COPLANAR_LAYER_STEP 的说明）。
         batch.coplanarLayering = true;
         return batch;
     }
@@ -2465,12 +1885,9 @@ public final class EntityRtCapture {
         private int textureSlot;
         private boolean localPlayerProxy;
         private boolean emissive;
-        /**
-         * 2026-10-06 末地门 / 折跃门：原版几何没有顶点 UV，贴图靠屏幕空间投影
-         * （rendertype_end_portal.fsh 的 textureProj）。本批次改为用几何坐标合成 UV。
-         */
+        
+
         private boolean projectiveUv;
-        // 诊断用包围盒：只写不读，成本是每个顶点 6 次比较。
         private float minX = Float.MAX_VALUE;
         private float minY = Float.MAX_VALUE;
         private float minZ = Float.MAX_VALUE;
@@ -2479,29 +1896,12 @@ public final class EntityRtCapture {
         private float maxZ = -Float.MAX_VALUE;
         private ByteBuffer buffer = ByteBuffer.allocateDirect(768 * BYTES_PER_VERTEX).order(ByteOrder.nativeOrder());
 
-        // =====================================================
-        // 2026-10-17 运动矢量：这一批的**根位姿增量**（3×4，行主序）。
-        //
-        // 语义：对顶点 p（世界减相机空间），`p_prev = delta · p`。
-        // 一个批次 = 一个模型的一次 submit ⇒ 整批共用同一个增量（同一个刚体）。
-        // 含平移与整体旋转。这是**兜底**增量：模型批次若有上一帧顶点位置历史，
-        // 逐顶点运动由那份历史给出（含 setupAnim 的四肢摆动），不再用这个矩阵。
-        //
-        // 为什么增量在 beginModel 处算、却在这里逐顶点应用：
-        //   · 只有 beginModel 的 submit 里有实体上下文（身份 + 根位姿）；
-        //   · 而顶点坐标要到这一批全部捕获完才齐（captureVertex 的栈上没有实体）。
-        // 于是"算增量"与"应用增量"必然分在两处，中间靠批次字段传。
-        // =====================================================
         private final float[] poseDelta = new float[12];
         private boolean hasPoseDelta;
-        /** 平移三元组（诊断/日志用；真正的 MV 由 {@link #poseDelta} 逐顶点算）。 */
         private float motionX, motionY, motionZ;
-        /** 位移通道暂存（每顶点 3 个 float）。只在需要时才填、才上传。 */
         private ByteBuffer motionScratch;
-        /**
-         * 2026-10-26 四肢摆动 MV：该批次所属实体的顶点位置历史表 + 本批判次的键。
-         * 两者为 null（文字 / 通用几何 / 开关关闭）⇒ 退回 {@link #poseDelta}。
-         */
+        
+
         private java.util.HashMap<ModelBatchKey, VertexHistory> vertexHistory;
         private ModelBatchKey vertexHistoryKey;
 
@@ -2511,9 +1911,7 @@ public final class EntityRtCapture {
         private final CapturingVertexConsumer consumer = new CapturingVertexConsumer(this);
         private int pendingQuadVertexCount;
         private int vertexCount;
-        /** 本批次内"质心重合"的 quad 重数（量化质心 key → 已出现次数）。见 applyCoplanarLayerOffset。 */
         private final java.util.HashMap<Long, Integer> coplanarQuadCounts = new java.util.HashMap<>();
-        /** 本批次是否做共面层序。只有模型批次要（{@link #acquireBatch} 置位），文字批次不做。 */
         private boolean coplanarLayering;
 
         private ActiveBatch reset(int textureSlot, boolean localPlayerProxy, boolean emissive) {
@@ -2528,10 +1926,6 @@ public final class EntityRtCapture {
             pendingQuadVertexCount = 0;
             vertexCount = 0;
             coplanarQuadCounts.clear();
-            // 2026-10-09 运动矢量：批次复用 ⇒ 位移必须一起复位。不复位会让"上一批
-            // （比如远处静止的实体）"的位移落到本批上 —— 表现是静止物也拖影。
-            // 2026-10-17：位姿增量同理会跨批残留，一起复位（并把增量归零而不是
-            // 留一份旧矩阵 —— hasPoseDelta 已经挡掉了，但归零能防止将来有人只读矩阵）。
             hasPoseDelta = false;
             java.util.Arrays.fill(poseDelta, 0.0F);
             motionX = motionY = motionZ = 0.0F;
@@ -2576,8 +1970,6 @@ public final class EntityRtCapture {
         private void storeVertexHistory(float[] positions) {
             VertexHistory entry = vertexHistory.get(vertexHistoryKey);
             if (entry == null) {
-                // 键数有上限：宁可整表清空（下一帧全部退回根增量），也不让异常模型
-                // 无限攒内存。
                 if (vertexHistory.size() >= ENTITY_VERTEX_HISTORY_MAX_KEYS) {
                     vertexHistory.clear();
                 }
@@ -2688,14 +2080,10 @@ public final class EntityRtCapture {
                     .putFloat(pendingQuadVertices[offset + 4]);
             buffer.putFloat(((color >>> 16) & 0xFF) / 255.0f).putFloat(((color >>> 8) & 0xFF) / 255.0f);
             buffer.putFloat((color & 0xFF) / 255.0f).putFloat(((color >>> 24) & 0xFF) / 255.0f);
-            // 必须对齐原生 Vertex ABI: materialId(9), pad1(10), pad2(11)。
-            // 曾把 proxy 标记误写在 index 9(materialId 位),原生端读 pad1 时
-            // 拿到的是 emissive 标记,代理批次全部漏进普通实体层导致脸挡屏。
             buffer.putFloat(0.0f)
                     .putFloat(localPlayerProxy ? 1.0f : emissive ? -1.0f : 0.0f)
                     .putFloat(encodedTextureSlot());
             ++vertexCount;
-            // 诊断包围盒（对照相机位置就能判断一批几何落在哪，见 endModel 的打印）。
             final float px = pendingQuadVertices[offset];
             final float py = pendingQuadVertices[offset + 1];
             final float pz = pendingQuadVertices[offset + 2];
@@ -2707,10 +2095,6 @@ public final class EntityRtCapture {
             if (pz > maxZ) maxZ = pz;
         }
 
-        // Slot plus the material class in the fraction, so the closest-hit
-        // shader can pick a real F0/roughness for armour with no ABI change.
-        // Slot 0 stays exactly 0: that value is what marks a vertex as "not
-        // entity geometry" in every shader that reads pad2.
         private float encodedTextureSlot() {
             if (textureSlot < 1 || textureSlot > MAX_TEXTURE_SLOTS) {
                 return 0.0f;
@@ -2766,13 +2150,9 @@ public final class EntityRtCapture {
         private void reset() { hasVertex = false; }
         private void flush() {
             if (hasVertex) {
-                // 投影 UV 批次（末地门）：原版几何没有顶点 UV，改用顶点世界坐标合成，
-                // 与 captureVertex 的短格式路径同一公式/缩放，相邻方块因此连续。
                 final float cu;
                 final float cv;
                 if (batch.projectiveUv) {
-                    // 顶点是"世界减相机"⇒ 加回相机原点，贴图才会钉在世界里
-                    //（否则随相机平移，见 setCameraOrigin）。
                     final float wx = x + cameraWorldX;
                     final float wy = y + cameraWorldY;
                     final float wz = z + cameraWorldZ;

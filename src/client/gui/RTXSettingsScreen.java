@@ -131,9 +131,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.list.addBig(
                 reflexButton
         );
-        // =====================================================
-// DLSS Ray Reconstruction quality
-// =====================================================
 
         final int currentRRMode =
                 this.pendingRRMode;
@@ -189,13 +186,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.list.addBig(
                 rrQualityButton
         );
-        // =====================================================
-// No-direct-light ambient brightness
-//
-// range: 0.00 - 1.00
-// step : 0.01
-// default: 0.10
-// =====================================================
 
         AbstractSliderButton ambientBrightnessSlider =
                 new AbstractSliderButton(
@@ -254,14 +244,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                 ambientBrightnessSlider
         );
 
-        // =====================================================
-        // POM parallax depth
-        //
-        // range: 0.00 - 0.20
-        // step : 0.01
-        // default: 0.10
-        // Applied when the existing Confirm button is pressed.
-        // =====================================================
 
         AbstractSliderButton pomDepthSlider =
                 new AbstractSliderButton(
@@ -362,9 +344,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                 true;
 
 
-        // =====================================================
-        // NVIDIA Reflex
-        // =====================================================
 
         final boolean reflexAvailable =
                 NativeVulkan.isLoaded()
@@ -394,9 +373,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         }
 
 
-        // =====================================================
-        // DLSS Ray Reconstruction
-        // =====================================================
 
         if(
                 NativeVulkan.setRRMode(
@@ -418,9 +394,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         }
 
 
-        // =====================================================
-        // No-direct-light ambient
-        // =====================================================
 
         if(
                 NativeVulkan.setNoDirectLightAmbient(
@@ -443,9 +416,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
 
 
-        // =====================================================
-        // POM parallax depth
-        // =====================================================
 
         if(
                 NativeVulkan.setPOMDepth(
@@ -466,12 +436,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                     false;
         }
 
-        // =====================================================
-        // HDR
-        //
-        // HDR native output is connected in HDR-2.
-        // For HDR-1 this only commits the confirmed setting.
-        // =====================================================
 
         RTXSettingsConfig.setHDREnabled(
                 this.pendingHDR

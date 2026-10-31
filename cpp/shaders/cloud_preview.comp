@@ -1,34 +1,22 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-// ===========================================================================
-// 体积云离线预览（不进游戏）
-//
-// 与游戏内 volumetric_clouds_v3.comp **共用 cloud_v3_core.glsl** —— 同一份密度场、
-// 同一份光照、同一份 march。差别只有外壳与相机：
-//   · 游戏里是球壳 + 场景深度裁剪 + 太阳/月光/天光颜色链
-//   · 这里是平面层（云底/云顶两个水平面）+ 固定相机 + 单一日照颜色
-// 因此预览图能如实反映"形状/密度/明暗"，只有大气/时域/平面云不在这里。
-//
-// 输出：binding 5 的 rgba16f 图（rgb = 预乘辐亮度，a = 透射率），由 preview.cpp 存盘。
-// ===========================================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform PreviewParams
 {
-    vec4 cameraPosition;      // xyz = 相机位置（格），w = 垂直 FOV（弧度）
-    vec4 cameraForward;       // xyz = 视线方向（单位），w = 未用
-    vec4 cameraRight;         // xyz = 右向量，w = 未用
-    vec4 cameraUp;            // xyz = 上向量，w = 未用
-    vec4 sunDirection;        // xyz = 太阳方向（单位），w = 太阳强度
-    vec4 layer;               // x = 云底, y = 云顶, z = 世界时间(s), w = frameIndex
-    vec4 shape;               // x=coverage, y=densityFactor, z=noiseScale, w=typeInfluence
-    vec4 light;               // x=brightness, y=silver, z=heightSkew, w=sunColorR?
-    vec4 extras;              // x=erosionAmount, y=erosionScale, z=curlStrength, w=weatherScale
-    vec4 steps;               // x=viewSteps, y=lightSamples, z=windSpeed, w=extinction
+    vec4 cameraPosition;
+    vec4 cameraForward;
+    vec4 cameraRight;
+    vec4 cameraUp;
+    vec4 sunDirection;
+    vec4 layer;
+    vec4 shape;
+    vec4 light;
+    vec4 extras;
+    vec4 steps;
 } params;
-
 layout(set = 0, binding = 1) uniform sampler3D shapeTex;
 layout(set = 0, binding = 2) uniform sampler3D detailTex;
 layout(set = 0, binding = 3) uniform sampler2D curlTex;
@@ -58,11 +46,6 @@ void main()
     float topAltitude = params.layer.y;
     float layerThickness = max(topAltitude - baseAltitude, 1.0);
 
-    // 平面层求交（预览专用；游戏里是球壳）
-    // 平面层求交。2026-10-18 修：相机在层内且视线接近水平时，原来用
-    // `(base-y)/max(|dir.y|,1e-4)` 会算出 -2e6 这样的负距离 ⇒ march 直接跳过
-    // （"层内视角 / 云顶视角看不到云"就是这个）。这里改成：层内从 0 起、以
-    // 一个最远距离封顶，再按上下界面裁剪。
     const float previewMaxDistance = 30000.0;
     float startT = 0.0;
     float endT = 0.0;
@@ -88,7 +71,6 @@ void main()
     }
     else
     {
-        // 层外且与层平行：永远碰不到
         startT = 1.0;
         endT = 0.0;
     }
@@ -140,14 +122,11 @@ void main()
     vec3 sunColor = vec3(params.sunDirection.w);
     vec3 rgb = march.rgb * opacity * sunColor;
 
-    // 调试视图（params.light.w > 0.5）：直接输出不透明度，用来核对密度场
     if(params.light.w > 0.5 && params.light.w < 1.5)
     {
         rgb = vec3(opacity);
     }
 
-    // 探针（params.light.w >= 1.5）：在视线中点直接采样一次密度场，
-    //   r = 区间是否有效(0/1)，g = 该点 baseDensity × 4，b = 该点相对高度
     if(params.light.w >= 1.5)
     {
         float midT = 0.5 * (startT + endT);

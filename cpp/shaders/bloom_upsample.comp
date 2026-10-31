@@ -1,24 +1,9 @@
 #version 460
 
-// ===============================================================
-// 2026-10-07 泛光第 3 步：mip 链升采样（**累加**回细一级）
-//
-// 方向与降采样相反：输入 = 粗一级的 mip（更小），输出 = 细一级（更大，2×）。
-// 每个目标纹素把粗一级的 3×3 帐篷滤波结果**加**到自己已有的内容上 —— 于是第 i-1 级
-// 最终 = 它自己的降采样结果 + 从更粗各级传上来的光晕，逐级叠加成一条宽而连续的
-// 光带。这正是泛光"宽"的来源：最粗那级虽然只有几十个纹素，叠回来时已经铺满屏幕。
-//
-// 为什么用"目标读自己 + 加"（gather）而不是定点混合（scatter/blend）：
-// 固定功能混合要逐级换 attachment 或开 blend 状态，而 gather 版只需要两个 storage
-// 绑定、且在同一个 dispatch 里完成 —— 与本草所有 pass 的形状一致（也省掉一组状态）。
-// 同一纹素在同一 dispatch 里先读后写是安全的：读写的是同一个像素。
-// ===============================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-// 粗一级的 mip（更小，2× 关系）。
 layout(binding = 0, set = 0) uniform sampler2D bloomSourceMip;
-// 细一级的 mip：先 imageLoad 自己的降采样结果，再加上帐篷结果后写回。
 layout(binding = 1, set = 0, rgba16f) uniform image2D bloomTargetMip;
 
 void main()
@@ -31,10 +16,8 @@ void main()
     }
 
     vec2 srcTexel = 1.0 / vec2(textureSize(bloomSourceMip, 0));
-    // 目标纹素中心 → 源 uv（源是目标的一半）。
     vec2 uv = (vec2(pixel) + 0.5) / vec2(dstSize);
 
-    // 3×3 帐篷：中心 4、上下左右 2、四角 1，合计 16（半径 = 源的一个纹素）。
     vec3 tent = textureLod(bloomSourceMip, uv, 0.0).rgb * 4.0;
     tent += (
         textureLod(bloomSourceMip, uv + srcTexel * vec2(-1.0,  0.0), 0.0).rgb +

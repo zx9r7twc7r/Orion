@@ -1,10 +1,5 @@
 #version 460
 
-// Standalone compiler/driver probe for VK_EXT_ray_tracing_invocation_reorder.
-// This file is intentionally not loaded by VulkanCore.cpp.  It only verifies
-// that the selected shader toolchain accepts every EXT reorder intrinsic the
-// production funnel (rt_test.rgen serTraceRay) depends on.  Run it through
-// tools/ser/verify_ser_toolchain.bat; see that directory's README.
 #extension GL_EXT_ray_tracing : require
 #extension GL_EXT_shader_invocation_reorder : require
 
@@ -13,14 +8,10 @@ layout(location = 0) rayPayloadEXT vec4 probePayload;
 
 void main()
 {
-    // The call is a legal reorder point. A zero hint keeps this probe free of
-    // scene-specific policy; the production shader will use a material/path
-    // hint after the compiler and device support are verified.
     reorderThreadEXT(0u, 0u);
 
     hitObjectEXT probeObject;
 
-    // The funnel's workhorse: buffered traversal.
     hitObjectTraceRayEXT(
         probeObject,
         probeTopLevel,
@@ -36,18 +27,15 @@ void main()
         0
     );
 
-    // Mode 1 (custom key) + the SBT query it needs.
     uint sbt = hitObjectGetShaderBindingTableRecordIndexEXT(probeObject);
     hitObjectReorderExecuteEXT(probeObject, (sbt & 0x3u), 4u, 0);
 
-    // Mode 2 (driver key) and mode 3 (execute only).
     hitObjectTraceRayEXT(
         probeObject, probeTopLevel, gl_RayFlagsNoneEXT, 0xff, 0, 0, 0,
         vec3(0.0), 0.001, vec3(0.0, 1.0, 0.0), 10000.0, 0);
     hitObjectReorderExecuteEXT(probeObject, 0);
     hitObjectExecuteShaderEXT(probeObject, 0);
 
-    // Mode 4: post-trace queries (2026-10-07 -- miss, instance class, SBT).
     hitObjectTraceRayEXT(
         probeObject, probeTopLevel, gl_RayFlagsNoneEXT, 0xff, 0, 0, 0,
         vec3(0.0), 0.001, vec3(0.0, 1.0, 0.0), 10000.0, 0);
@@ -58,8 +46,6 @@ void main()
         hitObjectReorderExecuteEXT(probeObject, 1u + ((slot & 0x3u) << 2u | (sbt2 & 0x3u)), 5u, 0);
     }
 
-    // Mode 5: the fully fused trace + reorder + execute, driver key
-    // (2026-10-07).  Both spec overloads are exercised.
     hitObjectTraceReorderExecuteEXT(
         probeObject, probeTopLevel, gl_RayFlagsNoneEXT, 0xff, 0, 0, 0,
         vec3(0.0), 0.001, vec3(0.0, 1.0, 0.0), 10000.0, 0);
@@ -67,8 +53,6 @@ void main()
         probeObject, probeTopLevel, gl_RayFlagsNoneEXT, 0xff, 0, 0, 0,
         vec3(0.0), 0.001, vec3(0.0, 1.0, 0.0), 10000.0, 7u, 4u, 0);
 
-    // Probe arm 6 helper pair: rgen-side occlusion query without any hit
-    // shader invocation (rt_test.rgen DISTANCE_ONLY water-guide probe).
     hitObjectTraceRayEXT(
         probeObject, probeTopLevel, gl_RayFlagsNoneEXT, 0xff, 0, 0, 0,
         vec3(0.0), 0.001, vec3(0.0, 1.0, 0.0), 10000.0, 0);

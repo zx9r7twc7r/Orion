@@ -12,11 +12,6 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 @Mixin(ParticleEngine.class)
 public abstract class ParticleEngineMixin {
-    // Custom RT weather never uses ParticleEngine.  Suppress any residual
-    // vanilla rain-particle creation so it cannot appear as a raster overlay.
-    // Vanilla water bubbles are suppressed for the same reason: the RT water
-    // surface renders its own foam/wake, and the raster bubble quads pop
-    // through it as flat billboard artifacts.
     private static boolean rtx$isSuppressedVanillaParticle(ParticleOptions options) {
         String name = BuiltInRegistries.PARTICLE_TYPE.getKey(options.getType()).getPath();
         return "rain".equals(name)

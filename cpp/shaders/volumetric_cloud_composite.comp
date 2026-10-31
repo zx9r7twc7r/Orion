@@ -1,33 +1,17 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-// Cloud upscaling composite. The expensive cloud march stays at 80% resolution
-// while terrain keeps the unmodified primary ray-traced lighting result.
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform sampler2D cloudInput;
 layout(rgba16f, set = 0, binding = 1) uniform image2D sceneOutputNear;
-// 2026-10-06 远云分带：远带那趟的**固定**目标 = RR 的输出图（输出分辨率）。
-// 两趟各有一个固定目标，而不是每帧改绑同一个描述符 —— 描述符集可能仍被在途帧
-// 使用，那时 vkUpdateDescriptorSets 是未定义行为（模组在 atlas 发布处有同类警告）。
 layout(rgba16f, set = 0, binding = 6) uniform image2D sceneOutputFar;
-// Kept bound for descriptor-layout stability.  The occlusion test moved into
-// volumetric_clouds.comp, which clips the march to the scene depth instead of
-// letting this pass decide per pixel whether the clouds are allowed to exist.
 layout(set = 0, binding = 2) uniform sampler2D sceneDepth;
-// 2026-10-06 远云分带合成：云层自己的距离图（rg32f，.r = 首个云命中距离；空像素
-// = CLOUD_DEPTH_EMPTY 哨兵）。用来把云层按距离切成近/远两带：
-//   · 近带 → 在 RR **之前**合成（保留 RR 的时域去噪与上采样）；
-//   · 远带 → 在 RR **之后**按输出分辨率合成（绕过 RR 的上采样 ⇒ 远云清晰度
-//            不再被 RR 档位反查出的渲染分辨率限死）。
 layout(set = 0, binding = 5) uniform sampler2D cloudDepthImage;
 
-// 分带参数（8 字节，与 C++ 的 CloudCompositePush 逐字段对应）。
 layout(push_constant) uniform CloudCompositePush
 {
-    // splitDistance <= 0 ⇒ 不做分带（整层合成 = 旧档逐位不变）。
     float splitDistance;
-    // 0 = 近带那趟（pre-RR），1 = 远带那趟（post-RR）。
     float mode;
 } pc;
 layout(set = 0, binding = 3) uniform CameraProperties
@@ -35,10 +19,6 @@ layout(set = 0, binding = 3) uniform CameraProperties
     #include "camera_ubo.glsl"
 } cam;
 
-// Shared with rr_ae_adapt.comp (writer) and the two display transforms
-// (readers).  cloudWhite is the linear radiance that lands exactly on display
-// white once exp2(currentEV) has been applied, so the rolloff below can be
-// expressed in display terms without this pass knowing the output path.
 layout(set = 0, binding = 4) readonly buffer AeState
 {
     float currentEV;
@@ -48,30 +28,6 @@ layout(set = 0, binding = 4) readonly buffer AeState
     float cloudWhite;
 };
 
-// ---------------------------------------------------------------
-// Cloud-layer highlight rolloff.
-//
-// The composite adds this layer to the scene as `scene * a + rgb`, and the
-// display transform multiplies the result by exp2(currentEV) before a bare
-// power curve, so every linear value above display white is hard-clipped.  The
-// deck reaches 1.5-3.0 by construction -- CLOUD_SUN_LIGHT_SCALE is 6.0 in
-// volumetric_clouds.comp and the twilight fire term adds up to 3 more on top
-// of the ambient -- so its tops were already sitting on the clip before auto
-// exposure existed, and a raised exposure turned the whole deck into a flat
-// white sheet by pushing its mid-tones over as well.
-//
-// A C1 shoulder below display white keeps everything under the knee untouched
-// and asymptotes to it exactly, so the deck keeps its shading at any exposure
-// instead of collapsing to 1.0.  Clouds are rolled off on their own because
-// the rest of the frame is tuned against the hard clip; only the deck is
-// brighter than the display can hold by construction.
-//
-// The whole block is one frame old here: this pass runs before rr_ae_adapt.comp
-// in the frame, so the white level it reads follows the exposure by one frame.
-// The exposure moves by at most a few percent per frame at the adaptation rates
-// in use, so the lag is invisible; a hard scene cut can flash one frame of
-// clipping.
-// ---------------------------------------------------------------
 const float CLOUD_SHOULDER_KNEE = 0.75;
 
 vec3 cloudShoulder(vec3 radiance, float displayWhite)
@@ -88,39 +44,18 @@ vec4 reconstructCloud(vec2 uv, bool oneToOne, bool downsampling)
     vec4 centerSample = textureLod(cloudInput, uv, 0.0);
     if(oneToOne)
     {
-        // 2026-10-06 远云剥离 RR：云层与目标同分辨率（都在输出分辨率）时是 1:1
-        // 合成，下面的 unsharp 是为"80% 云图 → 100% 场景"的上采样配的，这里用会
-        // 过冲出振铃。直接取样即可。
         centerSample.a = clamp(centerSample.a, 0.0, 1.0);
         return centerSample;
     }
     if(downsampling)
     {
-        // 2026-10-06 远云分带：云图**大于**目标（云分辨率下限把云 march 抬到渲染
-        // 分辨率之上）时，近带这一趟是在做降采样。unsharp 的负瓣是为上采样配的，
-        // 降采样时用它会过冲/振铃 ⇒ 这里直接线性取样（交给 RR 去重建细节）。
         centerSample.a = clamp(centerSample.a, 0.0, 1.0);
         return centerSample;
     }
     vec2 texel = 1.0 / vec2(textureSize(cloudInput, 0));
 
-    // =====================================================================
-    // 2026-10-22 **双边重建**（替换原来的纯 unsharp 锐化）。
-    //
-    // 原来的 `centerSample * 1.42 - cross * 0.105` 只做空间锐化、**完全不看深度**：
-    //   · 云缘跨过地形边界时，会把邻居的"天空像素"一起锐化进来 ⇒ 云渗到物体轮廓外；
-    //   · 远处的云会被近处云的邻域权重拉糊。
-    //
-    // 双边权重 = 空间核 × 颜色差 × **相对深度差**，照
-    // jiaozi158/UnityVolumetricCloudsURP（MIT, 2024）VolumetricCloudsUpscale.hlsl:16-45，
-    // 在其基础上多一项深度（我们的云图带首个命中距离）。
-    //
-    // 零新增资源：binding 5 的 cloudDepthImage 本来就绑着（远云分带在用），
-    // 格式 rg32f，.r = 首个云命中距离。
-    // =====================================================================
-    const int K = 2;   // 5x5
+    const int K = 2;
     const float centerZ = min(textureLod(cloudDepthImage, uv, 0.0).r, 1.0e6);
-
     vec4 sum = vec4(0.0);
     float weightSum = 0.0;
 
@@ -133,7 +68,6 @@ vec4 reconstructCloud(vec2 uv, bool oneToOne, bool downsampling)
             const float z = min(textureLod(cloudDepthImage, ouv, 0.0).r, 1.0e6);
 
             const float wSpatial = exp(-float(i * i + j * j) * 0.35);
-            // 颜色差把 RGB 散射与 A 透射率一起比 —— 云缘的真正标志是透射率跳变
             const float colorDiff = length(c.rgb - centerSample.rgb) +
                 abs(c.a - centerSample.a);
             const float wColor = 1.0 / (colorDiff + 1.0e-3);
@@ -147,8 +81,6 @@ vec4 reconstructCloud(vec2 uv, bool oneToOne, bool downsampling)
 
     vec4 result = sum / max(weightSum, 1.0e-5);
 
-    // 双边本身是 25 邻居加权，会轻微平滑。混入 25% 的原 unsharp 补回边缘锐度，
-    // 又不至于像满强度那样在云缘出振铃（旧档 full unsharp 的问题是过冲）。
     const vec4 cross = textureLod(cloudInput, uv + vec2(texel.x, 0), 0.0) +
                        textureLod(cloudInput, uv - vec2(texel.x, 0), 0.0) +
                        textureLod(cloudInput, uv + vec2(0, texel.y), 0.0) +
@@ -159,46 +91,13 @@ vec4 reconstructCloud(vec2 uv, bool oneToOne, bool downsampling)
     result.rgb = max(result.rgb, vec3(0.0));
     result.a = clamp(result.a, 0.0, 1.0);
     return result;
-    /*
-    // Subpixel-aware cubic reconstruction. Fixed weights at floored texels
-    // made every output pixel within a source texel identical (visible blocks).
-    vec2 size = vec2(textureSize(cloudInput, 0));
-    vec2 position = uv * size;
-    vec2 center = floor(position - 0.5) + 0.5;
-    vec2 f = position - center;
-    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
-    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
-    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
-    vec2 w3 = f * f * (-0.5 + 0.5 * f);
-    vec2 w12 = w1 + w2;
-    vec2 p12 = center + w2 / w12;
-    vec3 px = vec3(center.x - 1.0, p12.x, center.x + 2.0) / size.x;
-    vec3 py = vec3(center.y - 1.0, p12.y, center.y + 2.0) / size.y;
-    vec3 wx = normalize(vec3(0.10, 0.80, 0.10));
-    vec3 wy = normalize(vec3(0.10, 0.80, 0.10));
-    vec4 result = vec4(0.0);
-    vec4 lower = vec4(1.0e20);
-    vec4 upper = vec4(-1.0e20);
-    for(int y = 0; y < 3; ++y)
-    for(int x = 0; x < 3; ++x)
-    {
-        vec4 sampleCloud = textureLod(cloudInput, vec2(px[x], py[y]), 0.0);
-        result += sampleCloud * wx[x] * wy[y];
-        lower = min(lower, sampleCloud);
-        upper = max(upper, sampleCloud);
-    }
-    // Cubic negative lobes must not create HDR ringing or negative opacity.
-    result = clamp(result, lower, upper);
-    result.rgb = max(result.rgb, vec3(0.0));
-    result.a = clamp(result.a, 0.0, 1.0);
-    return result; */
+    
+
 }
 
 void main()
 {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-    // 本趟的目标图由 mode 决定：0 = 近带（pre-RR，渲染分辨率），1 = 远带（post-RR，
-    // 输出分辨率）。两者都是固定绑定 ⇒ 不需要每帧改绑描述符。
     bool farPass = pc.mode >= 0.5;
     ivec2 size = farPass ? imageSize(sceneOutputFar) : imageSize(sceneOutputNear);
     if(any(greaterThanEqual(pixel, size)))
@@ -207,10 +106,6 @@ void main()
     }
     vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
 
-    // 2026-10-06 远云分带：本趟只负责自己那一带（近带在 RR 前、远带在 RR 后）。
-    // splitDistance <= 0 ⇒ 不做分带，整层都合成（旧档逐位不变）。
-    // 空云像素的距离是 CLOUD_DEPTH_EMPTY 哨兵（很大）⇒ 归入"远带"；在近带那趟被
-    // 跳过（本来也没东西可合成），在远带那趟合成后是 `scene * 1 + 0` = 恒等，无害。
     if(pc.splitDistance > 0.0)
     {
         float cloudDistance = textureLod(cloudDepthImage, uv, 0.0).r;
@@ -225,15 +120,8 @@ void main()
     vec4 scene = farPass
         ? imageLoad(sceneOutputFar, pixel)
         : imageLoad(sceneOutputNear, pixel);
-    // Unconditional.  The old sky-only gate existed because the cloud march had
-    // no idea how far away the scene was, so it had to refuse to touch any
-    // pixel that carried geometry.  volumetric_clouds.comp now clips both the
-    // deck and the fog layer to the scene depth, which makes the blend valid
-    // everywhere and is what lets the ground fog reach the terrain.
     ivec2 cloudSize = textureSize(cloudInput, 0);
     vec4 cloud = reconstructCloud(uv, cloudSize == size, cloudSize.x > size.x);
-    // Only the cloud layer is rolled off: `scene * cloud.a` is the terrain and
-    // sky seen through the deck, and that stays on the normal path.
     cloud.rgb = cloudShoulder(cloud.rgb, cloudWhite);
     scene.rgb = scene.rgb * cloud.a + cloud.rgb;
     if(farPass)

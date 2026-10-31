@@ -177,3 +177,46 @@ transmittanceAccum / glassSurfaceWeightAccum / glassBlendAlpha`。
 
 正确顺序应该是：先做一次「今天所有会改画面的改动」的**批量关闭对照**（一次 env 组合），
 再逐个放开。这次是单点试了四轮才想到批量关。
+
+---
+
+## 10. payload 瘦身：124 B → 64 B（**已落地**）
+
+`HitPayload` 是每个在飞射线都要跨 traversal 保留的 live state。官方量化（Indiana Jones,
+RTX 5080）：live state 222 B → 84 B 时，SER 的加速从 11% 升到 24%。
+
+### 三个阶段的实测
+
+| 阶段 | 改动 | payload | 结果 |
+|---|---|---|---|
+| 原始 | 21 字段 | 124 B | 基准 |
+| **1** | 删玻璃链 10 字段（`prevOffset×3` / `lastGlassFaceT` / `glassFaceBudget` / `glassInside` / `glassEntryT` / `transmittanceAccum` / `glassSurfaceWeightAccum` / `glassBlendAlpha`） | **68 B** | ✅ 画面正常，用户报告「明显更流畅」 |
+| **2** | `albedo` vec3 → unorm8x4 | **64 B** | ✅ 画面正常（源贴图本就是 8 bit，无损） |
+| 3 | `normal` vec3 → 八面体 2×16 bit | 56 B | ❌ **全屏变黑**，已回退 |
+
+### 阶段 1 的代价：玻璃退化到单片
+
+10 个字段是「跨 anyhit 保持的多层玻璃累积状态」（面序重置 / 穿层预算 / 介质进出 /
+薄片透射累积 / alpha blend 加权）。删掉后：
+
+- 读取点按常量处理（预算 0 ⇒ 不穿层 ⇒ 第一片玻璃就被接受）
+- 写点整行删除
+- 净效果 = **单片近似**：单片玻璃正确，多层叠加偏淡、链式透射不再累积
+
+这符合「玻璃要重做」的计划。**玻璃重做时不要原样恢复这 10 个字段**——它们正是那 56 B，
+应走「玻璃独立 payload location=1」或「per-ray SSBO」。
+
+### 阶段 3 失败与遗留
+
+八面体编解码用的是标准实现（`packNormalOctahedral` / `unpackNormalOctahedral`，
+按 Narkowicz 的 `octEncode`/`octDecode`），但实测全屏变黑，原因**未定位**。
+因为脚本对 `normal` 有 14 处写点、46 处读取，漏掉任写点都会让法线读到未播种值。
+收益只有 8 B ⇒ 暂不追。
+
+### 踩到的两个工程坑（重要）
+
+1. **两个字段一起改 = 无法定位**。第一版同时改 `normal` + `albedo` 导致全黑，
+   排查时无法区分是哪一个。**一次只改一个字段**，每次都验画面。
+2. **`Copy-Item` 恢复源码会保留备份的旧 mtime** ⇒ 构建脚本判定「未过期」不重编 ⇒
+   **实际部署的仍是坏版本的 SPV**。审计把它报成「漂移 5」才发现。
+   回退源码后必须 `touch`（或删除对应 `.spv`）强制重编。

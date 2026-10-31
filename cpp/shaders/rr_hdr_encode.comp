@@ -1,22 +1,8 @@
 #version 460
 
-// RR-6.6 HDR10 display transform.
-//
-// Same shape as rr_sdr_post.comp on purpose: an in-place compute pass over
-// the RR linear-HDR output, 8x8 groups, one rgba16f storage image.  The two
-// pipelines share a descriptor set layout, so this file may only ever change
-// the transfer function, never the bindings or the group size.
-//
-// The RR output is linear with 1.0 == SDR reference white.  BT.2408 puts that
-// reference white at 203 cd/m2, so the encoder scales by it before applying
-// the ST2084 (PQ) inverse EOTF, whose output is an absolute-light code value.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-// Analytic pane radiance that the raygen withheld from DLSS RR, added back
-// here.  See RR_STABLE_GLASS_RADIANCE in rt_test.rgen.  Must match
-// rr_sdr_post.comp: the two files share one descriptor set layout, so the
-// bindings and the group size have to stay identical.
 #ifndef RR_STABLE_GLASS_RADIANCE
 #define RR_STABLE_GLASS_RADIANCE 0
 #endif
@@ -24,7 +10,6 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(binding = 0, set = 0, rgba16f)
 uniform image2D rrOutputImage;
 
-// Render resolution -- the same grid as rrOutputImage only at DLAA.
 #if RR_STABLE_GLASS_RADIANCE
 layout(binding = 2, set = 0)
 uniform sampler2D rrStableRadianceImage;
@@ -33,37 +18,25 @@ uniform sampler2D rrStableRadianceImage;
 layout(binding = 1, set = 0)
 buffer AeState
 {
-    // Running exposure in log2, produced by rr_ae_adapt.comp.  Shared with
-    // rr_sdr_post.comp so the two transforms stay exposure-consistent.
     float currentEV;
 
     float targetEV;
     float avgLogLuma;
     uint sampleCount;
 
-    // Not read here, but this block is shared byte-for-byte with
-    // rr_sdr_post.comp, volumetric_cloud_composite.comp and
-    // rr_ae_adapt.comp.  See rr_ae_adapt.comp for what it carries.
     float cloudWhite;
 };
 
-// Partial exposure correction, identical to rr_sdr_post.comp's.  The two
-// display paths have to agree on what exposure means, otherwise the SDR and
-// HDR10 outputs drift apart as soon as auto exposure is on.
 const float AE_EXPOSURE_STRENGTH = 0.6;
 
-// ST2084 / BT.2100 constants.
-const float PQ_M1 = 0.1593017578125;   // 2610 / 16384
-const float PQ_M2 = 78.84375;          // 2523 / 32
-const float PQ_C1 = 0.8359375;         // 3424 / 4096
-const float PQ_C2 = 18.8515625;        // 2413 / 128
-const float PQ_C3 = 18.6875;           // 2392 / 128
-
+const float PQ_M1 = 0.1593017578125;
+const float PQ_M2 = 78.84375;
+const float PQ_C1 = 0.8359375;
+const float PQ_C2 = 18.8515625;
+const float PQ_C3 = 18.6875;
 const float PQ_PEAK_NITS = 10000.0;
 const float PQ_REFERENCE_WHITE_NITS = 203.0;
 
-// The RR output is authored in Rec.709 primaries; BT.2087 gives the
-// linear-light matrix that brings it into the Rec.2020 container.
 const mat3 REC709_TO_REC2020 = mat3(
     0.6274040, 0.0690970, 0.0163916,
     0.3292820, 0.9195400, 0.0880132,
@@ -101,22 +74,13 @@ void main()
 
     vec4 color = imageLoad(rrOutputImage, p);
 
-    // Denormals, inf and NaN all reach here from the path-traced frame and
-    // would survive the pow() chain as NaN once written to the target.
     vec3 linear =
         max(
             mix(color.rgb, vec3(0.0), isnan(color.rgb)),
             vec3(0.0)
         );
 
-    // RR-7 auto exposure, applied in linear light before the absolute PQ
-    // mapping.  currentEV is 0 on the first frame, which leaves the frame
-    // exactly where it was before auto exposure existed.
 #if RR_STABLE_GLASS_RADIANCE
-    // Analytic pane radiance, withheld from RR by the raygen and restored
-    // here.  Same size-selection rule as rr_sdr_post.comp; the second NaN
-    // scrub matters because the mix() below happens before the exposure
-    // multiply, so a bad texel must not reach it.
 #ifndef POST_SKIP_STABLE
 #define POST_SKIP_STABLE 0
 #endif

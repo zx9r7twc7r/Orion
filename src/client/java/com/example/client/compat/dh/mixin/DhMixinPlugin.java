@@ -22,7 +22,6 @@ import java.util.Set;
  * 绝不能引用 Minecraft 或 DH 自己的类型。</p>
  */
 public final class DhMixinPlugin implements IMixinConfigPlugin {
-    /** DH 的 Fabric mod id（API jar 的 id 是 {@code dh-api}，它的 parent 才指向这里）。 */
     private static final String DH_MOD_ID = "distanthorizons";
 
     private static boolean present() {

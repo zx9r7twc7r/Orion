@@ -33,13 +33,7 @@ public abstract class VulkanDeviceMixin {
             at = @At("RETURN")
     )
     private void onDeviceInit(VulkanInstance i, VulkanPhysicalDevice pd, FeatureSet enabledFeatures, VkDevice d, long vma, CheckpointExtension ce, CallbackInfo ci) {
-        try {// =====================================================
-// FG-2.3
-// Runtime Vulkan queue-family capacity probe.
-//
-// Diagnostic only.
-// Does NOT modify VkDevice / queues.
-// =====================================================
+        try {
 
             final Int2IntMap hostQueueMap =
                     pd.queueFamilyCreateInfoMap();
@@ -163,8 +157,6 @@ public abstract class VulkanDeviceMixin {
                             (flags & VK10.VK_QUEUE_TRANSFER_BIT) != 0;
 
 
-                    // VK_QUEUE_OPTICAL_FLOW_BIT_NV
-                    // Vulkan specification value = 0x00000100.
                     final boolean opticalFlow =
                             (flags & 0x00000100) != 0;
 
@@ -195,7 +187,6 @@ public abstract class VulkanDeviceMixin {
             System.err.println(
                     "========== [FG-2.3 QUEUE PROBE END] =========="
             );
-            // 物理防线：直接通过底层 vkDevice 反向溯源，彻底避开 pd 包装类被 close() 的问题
             VkPhysicalDevice rawPhysDevice = this.vkDevice.getPhysicalDevice();
 
             long deviceHandle = this.vkDevice.address();

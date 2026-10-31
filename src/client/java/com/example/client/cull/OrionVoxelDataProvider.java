@@ -21,7 +21,6 @@ import net.minecraft.world.level.chunk.LevelChunk;
  */
 public final class OrionVoxelDataProvider implements DataProvider {
 
-    /** 上一次 prepareChunk 命中的区块，避免同一区块内每步都走一次查找。 */
     private LevelChunk cachedChunk;
     private int cachedChunkX = Integer.MIN_VALUE;
     private int cachedChunkZ = Integer.MIN_VALUE;
@@ -48,7 +47,6 @@ public final class OrionVoxelDataProvider implements DataProvider {
 
     @Override
     public boolean isOpaqueFullCube(int x, int y, int z) {
-        // y 越界（世界外）按"不遮挡"处理：宁可多画不可错剔。
         if(y < -64 || y > 319)
         {
             return false;
@@ -60,7 +58,6 @@ public final class OrionVoxelDataProvider implements DataProvider {
         }
         final BlockPos pos = new BlockPos(x, y, z);
         final BlockState state = level.getBlockState(pos);
-        // canOcclude() = 该方块对 AO/邻面遮挡是全不透明实心（树叶/玻璃/水都返回 false）。
         return state.canOcclude();
     }
 

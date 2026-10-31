@@ -1,25 +1,5 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
-// ===========================================================================
-// 2026-10-03 FFT 频谱海面（方案 B）—— **单条 compute 管线、4 个模式**
-//
-// 为什么合成一条管线：整条链（谱生成 → 行蝶形 ×8 → Y 位反转 → 列蝶形 ×8 →
-// finalize）共用同一个描述符集与同一个 push 块，靠 fftPush.mode 分支 ⇒ 只需 1 个
-// VkPipeline / 1 个 descriptor set，宿主侧极大简化，且每趟调度开销最低。
-//
-// 描述符集（宿主 WaterFft 模块，只有这一个 set）：
-//   binding 0  image2DArray  rg32f   双缓冲状态（基础层 0/1、细节层 2/3 各自乒乓）
-//   binding 1  image2D       rgba16f 输出：斜率图（.rg = 基础层斜率 xz，.ba = 细节层斜率 xz）
-//
-// 位反转约定（radix-2 就地蝶形要求输入按变换轴位反转）：
-//   · mode 0 写谱时按 **X 位反转**落位（省一趟显式 X 位反转 pass）
-//   · mode 2 在行蝶形之后、列蝶形之前把 **Y 位反转**一次
-//   · 输出为自然序，finalize 直接按自然序取邻域（周期性 ⇒ 索引取模环绕 =
-//     平铺无缝）
-//
-// 性能：N=256 ⇒ 65536 线程/趟；mode 1 每趟只做 2 次 imageLoad + 1 次 imageStore
-// 与一次复数乘。基础层 19 趟 + 细节层 18 趟，默认 30 Hz。
-// ===========================================================================
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0, rg32f) uniform image2DArray waterFftState;
@@ -42,7 +22,6 @@ vec2 waterFftLoadState(uvec2 index, int layer)
 // ---------------------------------------------------------------------------
 void waterFftSpectrumPass(uvec2 store)
 {
-    // 存储位置 → 真实格点索引：X 位反转（给行蝶形用），Y 自然序
     uvec2 trueIndex = uvec2(waterFftBitReverse(store.x), store.y);
     vec2 gridIndex = waterFftGridIndex(trueIndex);
 
@@ -82,7 +61,6 @@ void waterFftButterflyPass(uvec2 index)
     vec2 lowerValue = lower ? mine : other;
     vec2 upperValue = lower ? other : mine;
 
-    // 旋转因子：组内第 j 个（j = within % halfLength）
     float twiddleIndex = float(within % halfLength);
     float twiddleAngle = 2.0 * WATER_FFT_PI * twiddleIndex / float(fftPush.stageLength);
     vec2 twiddle = vec2(cos(twiddleAngle), sin(twiddleAngle));
@@ -134,7 +112,6 @@ vec2 waterFftSlopeFromField(uvec2 index, int layer, float texelWorldSize, float 
     vec2 slope = vec2(heightRight - heightLeft, heightUp - heightDown) *
         (0.5 * normalization / texel);
 
-    // 波峰锐化：斜率幅值越大越陡（0 = 纯正弦，1~2 = 明显尖峰）
     if(fftPush.choppiness > 0.0)
     {
         slope *= 1.0 + fftPush.choppiness * length(slope);
@@ -144,15 +121,9 @@ vec2 waterFftSlopeFromField(uvec2 index, int layer, float texelWorldSize, float 
 
 void waterFftFinalizePass(uvec2 index)
 {
- // 2026-10-17： FFT 不做 1/N² 归一化
-    // （Tessendorf.glsl/FFT.glsl 无缩放），故这里也**不除 N²**；visualScale 直接充当
- // WAVE_HEIGHT_MULT（其 GetWavesHeight 里 height·WAVE_HEIGHT_MULT−1，
-    // 减 1 是纯直流、对梯度无影响）。梯度取相邻纹素的中心差分，纹素世界尺寸 =
- // 平铺周期/N（对应采样 fract(worldXZ·0.1) ⇒ 平铺 10 格）。
     vec2 slope = waterFftSlopeFromField(
         index, fftPush.sourceLayer, fftPush.texelWorldSize, fftPush.visualScale);
 
-    // 细节层：独立的世界纹素尺寸与输出倍率；detailVisualScale <= 0 = 关闭。
     vec2 detailSlope = vec2(0.0);
     if(fftPush.detailVisualScale > 0.0)
     {

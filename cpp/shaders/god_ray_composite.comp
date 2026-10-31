@@ -1,49 +1,18 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-// ===============================================================
-// 体积光合成（2026-10-04，P1+P2）
-//
-// 体积光 march 现在跑在 1/2 分辨率上，输出
-//     rgb = 沿视线的入散射辐亮度
-//     a   = 该段介质的透射率
-// 本 pass 在全分辨率上把它**合成**进场景：
-//     scene = scene * a + rgb
-//
-// 两个要点：
-//   1. `* a` 是这次重构的核心。旧档把光柱**纯加法**叠在场景上，介质没有自己的
-//      消光 ⇒ 与天空大气二次计数、且光柱不会遮挡背景，表现就是"整屏发白"。
-//      现在光柱有自己的透射率，束内发光、束外压暗，体积感来自这里。
-//   2. 上采样是**深度感知**的（双边）：把 1/2 分辨率的散射按深度相似度加权重建，
-//      否则前景的光柱会被拖到背景上（远处山体上出现一层雾状光晕）。
-// ===============================================================
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-// 1/2 分辨率的 {辐射, 透射率}。
 layout(set = 0, binding = 0) uniform sampler2D godRayInput;
-// 全分辨率场景色（读+写）。
 layout(rgba16f, set = 0, binding = 1) uniform image2D sceneOutput;
-// 全分辨率 reverse-Z 深度，用于双边上采样的深度权重。
 layout(set = 0, binding = 2) uniform sampler2D sceneDepth;
-// 只需要投影逆矩阵来把深度还原成线性距离，所以声明 UBO 的前缀即可
-// （std140 下声明前缀合法，与本树其它 pass 的"声明但不读"桥接同一手法）。
 layout(set = 0, binding = 3) uniform CameraProperties
 {
     #include "camera_ubo.glsl"
 } cam;
 
-// 深度权重**不对称**，分近侧 / 远侧两档（2026-10-06）。
-//
-// 远侧（tap 的几何比本像素**更远**）必须硬：那种 tap 的散射里含有一段"本像素
-// 几何**之后**"的介质（开阔水域 / 天空 / 墙后的空气）—— 按对称权重把它混进来，
-// 等于把那段光贴到近处物体的**正面**上。水下最明显：墙面前后都是水、介质散射又
-// 强（waterGodRayShimmer 聚焦增益 + 密集介质），旧档 1/(1+Δd) 在仅 1 格深度差上
-// 还有 1/2 权重，于是墙面被身后开阔水域的光"染亮"，看起来就是光穿过墙照到墙上。
-// 近侧（更近的几何）保持软：它的介质是本像素这一段的子集，不产生漏光，压太狠
-// 反而会把同一物体表面内本应连续的散射切出硬边。
 const float VL_UPSAMPLE_DEPTH_SHARPNESS_NEAR = 1.0;
 const float VL_UPSAMPLE_DEPTH_SHARPNESS_FAR = 6.0;
-// 深度为 0（天空）时 sceneDistanceForDepth 返回的哨兵值。
 const float VL_NO_GEOMETRY_DISTANCE = 1.0e30;
 
 float sceneDistanceForDepth(vec2 ndc, float depthValue)
@@ -73,26 +42,6 @@ vec4 bilateralGodRay(vec2 uv, float centerDistance)
     vec2 inputSize = vec2(textureSize(godRayInput, 0));
     vec2 texel = 1.0 / inputSize;
     vec2 position = uv / texel - 0.5;
-    // 2026-10-05：核从 2×2 双边扩到 3×3（绕最近的输入纹素），不再是双线性权重。
-    //
-    // 现象：树干/竹杆这类**薄几何的剪影边缘**逐帧闪（帧间差异全部集中在这些细条上），
-    // 因为光柱跑在 1/2 分辨率上、march 的步位置又逐帧抖动，边缘那一两像素的值每帧
-    // 都在变；而 2×2 只覆盖一个输入纹素，深度加权又把取样约束在同深度侧 ⇒ 噪声原样
-    // 透传（时域那边又被 history.a 的 ±0.25 钳制限制住）。
-    //
-    // 3×3 仍在同深度侧加权，但同一侧现在有最多 9 个半分辨率样本可以平均，边缘的
-    // 逐帧方差直接降一个量级。光柱本身是低频量，多这一点空域平滑不影响观感，而深度
-    // 权重保证不会把背景的光柱拖到前景剪影上。
-    //
-    // 2026-10-07：3×3 的**前提是"光柱跑在 1/2 分辨率上"**（见上面那段与文件头第 6 行）。
-    // 2026-10-06 光柱 march 已升到原分辨率（VulkanCore.cpp 的 godRayWidth = g_rtOutputWidth）
-    // ⇒ 现在 1 输出纹素 = 1 输入纹素，"覆盖 2×2 输入纹素"这个需求不存在了，多出来的
-    // 四个角 tap 既贵（4/9 的取样 + 4 次 sceneDistanceForDepth 的矩阵乘）又只是在做
-    // 全分辨率模糊。所以按尺寸判定：
-    //   · 1:1（当前档）  ⇒ 跳过四个角，保留"中心 + 4 邻域"的同深度侧平均（治剪影闪
-    //                      的那部分作用仍在，只是不再有覆盖性）
-    //   · 真的在放大     ⇒ 走完整 3×3（原语义，留给把光柱降回 1/2 的那条路）
-    // 判定用 textureSize 而不是某个开关：将来分辨率策略再变也自动正确。
     const bool upsampling =
         inputSize.x > float(imageSize(sceneOutput).x) ||
         inputSize.y > float(imageSize(sceneOutput).y);
@@ -105,14 +54,12 @@ vec4 bilateralGodRay(vec2 uv, float centerDistance)
         {
             if(!upsampling && x != 0 && y != 0)
             {
-                continue;   // 1:1：四个角没有覆盖作用，省掉
+                continue;
             }
             vec2 tapUv = (center + vec2(float(x), float(y)) + 0.5) * texel;
             vec4 value = textureLod(godRayInput, tapUv, 0.0);
             float tapDepth = textureLod(sceneDepth, tapUv, 0.0).r;
             float tapDistance = sceneDistanceForDepth(ndcForUv(tapUv), tapDepth);
-            // 天空对天空（两者都是哨兵值）时差为 0 ⇒ 权重 1，不会除零。
-            // 有符号差：远侧（>0，本像素身后还有介质）走硬档，近侧（<0）走软档。
             float depthDelta = tapDistance - centerDistance;
             float depthSharpness = depthDelta > 0.0
                 ? VL_UPSAMPLE_DEPTH_SHARPNESS_FAR
@@ -145,7 +92,6 @@ void main()
     vec4 scene = imageLoad(sceneOutput, pixel);
     if(scene.r < 0.0 || scene.g < 0.0 || scene.b < 0.0)
     {
-        // 负值只可能来自上游异常，别让 `* a` 把它放大。
         scene.rgb = max(scene.rgb, vec3(0.0));
     }
     scene.rgb = scene.rgb * godRay.a + godRay.rgb;

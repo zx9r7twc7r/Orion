@@ -40,7 +40,6 @@ public final class CameraPathStore {
         if (minecraft == null || minecraft.level == null) {
             return null;
         }
-        // 26.3 的 ResourceKey 用 identifier()（26.2 时代叫 location()）。
         final Identifier dimension = minecraft.level.dimension().identifier();
         final String dimensionPart = sanitize(dimension.toString());
         final String override = System.getProperty("orion.campath.world");
@@ -66,7 +65,6 @@ public final class CameraPathStore {
                 return server.ip;
             }
         } catch (final Throwable ignored) {
-            // 世界名只是目录标签，取不到不该影响录制。
         }
         return "unknown";
     }
@@ -92,7 +90,6 @@ public final class CameraPathStore {
             throw new IOException("no camera-path file resolved (not in a world?)");
         }
         Files.createDirectories(file.getParent());
-        // 头部注释会让严格解码器拒绝整份文件，所以注释单独落在 README，不进 JSON。
         Files.writeString(file, path.toJson(), StandardCharsets.UTF_8);
     }
 
@@ -135,7 +132,6 @@ public final class CameraPathStore {
             Files.createDirectories(directory);
             Files.writeString(readme, HEADER, StandardCharsets.UTF_8);
         } catch (final IOException ignored) {
-            // 说明文件不是必需品。
         }
     }
 

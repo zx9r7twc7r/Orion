@@ -1,10 +1,6 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-// Local Evan-style wavefront-area caustic map.  This is deliberately a
-// light-space optical pass: it does not move water vertices, alter the BLAS,
-// or change the persistent ripple simulation.  Each texel estimates the
-// refracted-wavefront Jacobian around one flat-water source point.
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -21,9 +17,6 @@ const float WATER_SIM_WORLD_SIZE = 32.0;
 const float WATER_IOR = 1.33;
 const float REFERENCE_RECEIVER_DEPTH = 1.0;
 
-// Matches the time-driven solar direction used by the RayGen water path.
-// 2026-10-07 末地光源球开关（定义见 sky_model_common.glsl，本文件不 include
-// 它，提前兜底；重复定义同值合法）。
 #ifndef END_ORB_ENABLE
 #define END_ORB_ENABLE 1
 #endif
@@ -32,13 +25,8 @@ vec3 getTimeDrivenSunDirection()
 {
     const float TWO_PI = 6.28318530718;
 #if END_ORB_ENABLE
-    // 末地光源球：固定天顶（只自转、不公转）（endOrbDirection，见
-    // sky_model_common.glsl；本文件不 include 那个头，字面量内联），
-    // 焦散波前跟着这根向量投影。
-    // ⚠ 六个方向副本必须同一向量，否则可见球与直射光方向分家。
     if(abs(cam.weatherParams.z - 3.0) < 0.25)
     {
-        // 2026-10-18：光源球固定在末地天顶（只自转、不公转）。
         return vec3(0.0, 1.0, 0.0);
     }
 #endif
@@ -88,10 +76,6 @@ vec2 evaluateNaturalGradient(vec2 worldXZ)
 {
     const float TAU = 6.28318530718;
     const float WATER_WAVE_SPEED = 3.0;
-    // Match the closest-hit water normal exactly.  The native steady clock is
-    // stored bitwise in padding and remains monotonic across MC day wraps.
-    // This must retain the same bounded optical-time scale as rt_test.rchit;
-    // otherwise moving caustics would disagree with the visible water normal.
     const float WATER_OPTICAL_TIME_SCALE = 0.025;
     float waveTime = uintBitsToFloat(cam.padding) *
         WATER_OPTICAL_TIME_SCALE * WATER_WAVE_SPEED;
@@ -136,8 +120,6 @@ vec2 evaluateNaturalGradient(vec2 worldXZ)
     accumulateFineGerstnerOpticalWave(gradient, warpedXZ, vec2(0.8944272, -0.4472136), 3.54, 0.0030, -waveTime * 109.0, detailFade, 0.40, warpAmplitude0, warpAmplitude1, warpPhaseGradient0, warpPhaseGradient1, warpCos0, warpCos1);
     accumulateFineGerstnerOpticalWave(gradient, warpedXZ, vec2(0.1414214, 0.9899495), 4.62, 0.0020, waveTime * 137.0, microFade, 0.42, warpAmplitude0, warpAmplitude1, warpPhaseGradient0, warpPhaseGradient1, warpCos0, warpCos1);
     accumulateFineGerstnerOpticalWave(gradient, warpedXZ, vec2(-0.8574929, 0.5144958), 5.94, 0.0013, -waveTime * 167.0, microFade, 0.44, warpAmplitude0, warpAmplitude1, warpPhaseGradient0, warpPhaseGradient1, warpCos0, warpCos1);
-    // Water style wave dial: applied identically on the closest-hit normal
-    // paths, so the caustic pattern keeps tracking the visible surface.
     return gradient * 1.22 * clamp(cam.waterStyleParams0.x, 0.0, 2.0);
 }
 
@@ -170,10 +152,6 @@ vec2 evaluateInteractionGradient(vec2 worldXZ)
         (0.19 / max(worldTexel, 1.0e-4)) * valid;
 }
 
-// W4: per-texel wave-field evaluations are replaced by one shared 18x18
-// gradient grid (16x16 domain plus a two-texel halo).  The inversion and
-// density stencils bilinearly sample this grid instead of re-evaluating
-// the ten Gerstner bands at every stencil point.
 shared vec2 sNaturalGradient[18][18];
 shared vec2 sInteractionGradient[18][18];
 ivec2 gGridBaseTexel;
@@ -204,8 +182,6 @@ vec2 sampleOpticalGradient(vec2 worldXZ, bool includeInteraction)
     return gradient;
 }
 
-// W4 legacy: direct per-stencil wave-field evaluation.  Shielded as the
-// fallback interface if the shared-grid sampling ever needs reversal.
 #if 0
 vec3 evaluateOpticalNormalDirect(vec2 worldXZ, bool includeInteraction)
 {
@@ -281,8 +257,6 @@ vec2 invertWavefrontProjection(
 )
 {
     vec2 sourceXZ = receiverPlaneXZ;
-    // W4: two corrections already recover the source within a fraction of
-    // a cell; the third iteration only refined sub-visible micro-bands.
     for(int iteration = 0; iteration < 2; ++iteration)
     {
         vec2 projected = projectRefractedWavefront(
@@ -303,10 +277,6 @@ void main()
         return;
     }
 
-    // W4: fill the shared gradient grid (324 slots over 256 threads) from
-    // the analytic wave field before any stencil samples it.  This must
-    // complete before the sun-direction early-out below, otherwise the
-    // group barrier would deadlock.
     gGridBaseTexel = ivec2(gl_WorkGroupID.xy) * 16 - 1;
     const float cell = WATER_SIM_WORLD_SIZE / 256.0;
     for(int slot = int(gl_LocalInvocationIndex); slot < 18 * 18; slot += 256)
@@ -328,9 +298,6 @@ void main()
         return;
     }
 
-    // Treat this texel as a point on the receiver reference plane.  Natural
-    // and interaction variants retain independent inverse maps so their
-    // density fields remain physically aligned with their own wave normals.
     vec2 receiverPlaneXZ = cam.waterSimSurfaceAndOrigin.yz +
         (vec2(texel) + 0.5) * (WATER_SIM_WORLD_SIZE / 256.0);
     vec2 naturalSourceXZ = invertWavefrontProjection(

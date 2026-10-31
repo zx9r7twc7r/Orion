@@ -1,33 +1,6 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-// ===========================================================================
-// vol_restir_spatial.comp —— 体积光 ReSTIR（S3：空间复用）
-//
-// 5 个 dispatch 的第 3 个：
-//
-//   initial(RIS) → temporal → spatial → integrate
-//                              ^^^^^^^^ 本文件
-//
-// 职责：把 restir 网格上 3D 邻域（自身 + 8 个对角邻居）的 reservoir 合并，
-// 用更多样本来换噪点下降。邻居跨 x/y（屏幕相邻块）和 z（相邻距离层），所以
-// 合并不会把"近处的火把"糊到"远处的雾"上——z 差一层的世界距离差远小于
-// 灯的衰减尺度。
-//
-// 合并权重用彼此的 weightSum（= 该 reservoir 的 WRS 全和）。严格说 ReSTIR
-// 应在新位置重算 target function p̂(y)，但那需要为每个邻居重新查灯表并算相位；
-// 本工程 stage 数量已经不小，这里先用 weightSum 作为合并权重（同一套
-// decodeLocalLightColor / VPT 衰减口径，灯身份不变），偏差体现为空间过渡略软，
-// 不会产生亮度漂移。若将来需要严格无偏，再引入 p̂ 重算。
-//
-// 输出写 R1（上一帧最终结果那张），因为 R0 此刻是本帧 temporal 的输出、
-// integrate 之前还要留着；两图角色固定不轮换（见 vol_restir_temporal.comp 头注释）。
-//
-// 绑定（set 0）———————————————————————————————————————————————
-//   0 CameraProperties   （camera_ubo.glsl；只有帧号用得到）
-//   1 reservoir 输入      rgba32ui image3D，只读
-//   2 reservoir 输出      rgba32ui image3D，只写
-// ===========================================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -43,7 +16,6 @@ layout(rgba32ui, set = 0, binding = 2) uniform writeonly uimage3D volReservoirOu
 
 layout(push_constant) uniform VolRestirSpatialPush
 {
-    // x = 邻域半径（当前恒 1）, y = 保留, z = 保留, w = 帧种子
     vec4 spatialParams;
 } pc;
 
@@ -86,8 +58,6 @@ void main()
         VolReservoir reservoir = volRestirUnpack(
             imageLoad(volReservoirIn, sampleCoord));
 
-        // 空 reservoir（无灯 froxel）不参与合并：它的 weightSum 是 0，
-        // 保留它只会让"有灯的邻居"被稀释。
         if(reservoir.sampleCount == 0u || reservoir.lightIndex == 0u)
         {
             continue;
@@ -106,7 +76,6 @@ void main()
         return;
     }
 
-    // ---- 按 weightSum 做一次 WRS ----
     uint randomState = volRestirSeed(restirCoord,
         cam.frameCount + uint(pc.spatialParams.w));
 

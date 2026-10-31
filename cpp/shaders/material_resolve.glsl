@@ -87,9 +87,6 @@ void resolveHitMaterial(vec3 rayOrigin, vec3 rayDirection)
         payload.pomSelfShadow = 1.0;
         payload.pomMicroOcclusion = 1.0;
         payload.glassAlpha = 1.0;
-        payload.prevOffsetX = 0.0;
-        payload.prevOffsetY = 0.0;
-        payload.prevOffsetZ = 0.0;
         #ifdef RT_DEBUG_ALBEDO
         if(getRayPurpose(payload.state) == RT_PURPOSE_PRIMARY_SKY)
         {
@@ -190,9 +187,6 @@ void resolveHitMaterial(vec3 rayOrigin, vec3 rayDirection)
             }
         }
 
-        payload.prevOffsetX = hitWorldOffset.x;
-        payload.prevOffsetY = hitWorldOffset.y;
-        payload.prevOffsetZ = hitWorldOffset.z;
     }
 
 float interpU =
@@ -430,7 +424,7 @@ bool isRtWeatherRain =
         // =====================================================
         // 2026-10-06 近水掉帧降本：classify 的 albedo 只有一个消费者 ——
         // traceSunTransmittanceThroughWater 的**玻璃染色**分支
-        //（rgen `glassSheetTransmission(payload.albedo, ...)`，仅
+        //（rgen `glassSheetTransmission(unpackAlbedoUnorm(payload.albedoPacked), ...)`，仅
         // hitMaterialId ∈ [2.5,3.5]）。另一个消费者 traceWaterReflectedSun
         // 根本不读 albedo。所以水命中 / 不透明地形命中 / LOD 命中时，下面这次
         // 图集采样是**死算**（每水像素有 5~15 次 classify 命中）。
@@ -475,8 +469,8 @@ bool isRtWeatherRain =
         payload.normal =
             normalize(fixedNormal);
 
-        payload.albedo =
-            classifyAlbedo.rgb;
+        payload.albedoPacked = packAlbedoUnorm(
+            classifyAlbedo.rgb);
 
         payload.glassAlpha =
             classifyIsGlass
@@ -581,7 +575,7 @@ bool isRtWeatherRain =
         payload.pomSelfShadow = 1.0;
         payload.pomMicroOcclusion = 1.0;
         payload.normal = normalize(fixedNormal);
-        payload.albedo = voxyAlbedo;
+        payload.albedoPacked = packAlbedoUnorm(voxyAlbedo);
         payload.glassAlpha = isVoxyGlass ? clamp(interpColor.a, 0.06, 0.72) : 1.0;
         // LOD 水是**稀疏代理边界**，不拥有闭合介质 —— 用水的界面着色
         // （低粗糙度 + 介质 IOR），但**不声明介质进出**（RT_WATER_NONE 而非
@@ -681,7 +675,7 @@ bool isRtWeatherRain =
         payload.pomSelfShadow = 1.0;
         payload.pomMicroOcclusion = 1.0;
         payload.normal = normalize(dhNormal);
-        payload.albedo = dhAlbedo;
+        payload.albedoPacked = packAlbedoUnorm(dhAlbedo);
         payload.glassAlpha = 1.0;
         payload.state = dhIsWater
             ? makeHitState(
@@ -858,7 +852,7 @@ bool isRtWeatherRain =
                     entityBitangent * gradient.y));
         }
         payload.normal = entityNormal;
-        payload.albedo = entityAlbedo.rgb;
+        payload.albedoPacked = packAlbedoUnorm(entityAlbedo.rgb);
         payload.state = makeHitState(
             getRayPurpose(payload.state), RT_HIT_OPAQUE,
             RT_WATER_NONE, false, false, 0u
@@ -2024,8 +2018,8 @@ payload.glassAlpha =
 payload.normal =
     normalize(fixedNormal);
 
-payload.albedo =
-    albedoColor.rgb;
+payload.albedoPacked = packAlbedoUnorm(
+    albedoColor.rgb);
 
 
 /// =====================================================
@@ -2058,8 +2052,8 @@ bool t12IsGlass =
     t12IsPortal;
 
 
-payload.albedo =
-    albedoColor.rgb;
+payload.albedoPacked = packAlbedoUnorm(
+    albedoColor.rgb);
 
 // ===== 探针已迁至 rt_test_translucent.rchit（染色玻璃的真实入口）=====
 

@@ -1,74 +1,11 @@
-// ===========================================================================
-// vendored from takram-design-engineering/three-geospatial (MIT):
-//   packages/atmosphere/src/shaders/bruneton/{file}
-// 上游基于 Eric Bruneton "Precomputed Atmospheric Scattering" (BSD-2)。
-// 本文件为原样入库（本移植仅做 include guard / 精度声明 / 坐标注入适配，
-// 数学与常量未动）。授权全文保留在文件头部原注释中。
-// 消费者须已声明 #extension GL_GOOGLE_include_directive : require。
-// ===========================================================================
 #ifndef BRUNETON_COMMON
 #define BRUNETON_COMMON
 precision highp float;
 precision highp sampler3D;
 
-// Based on: https://github.com/ebruneton/precomputed_atmospheric_scattering/blob/master/atmosphere/functions.glsl
 
-/**
- * Copyright (c) 2017 Eric Bruneton
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the copyright holders nor the names of its
- *    contributors may be used to endorse or promote products derived from
- *    this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
- * THE POSSIBILITY OF SUCH DAMAGE.
- *
- * Precomputed Atmospheric Scattering
- * Copyright (c) 2008 INRIA
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the copyright holders nor the names of its
- *    contributors may be used to endorse or promote products derived from
- *    this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
- * THE POSSIBILITY OF SUCH DAMAGE.
- */
+
+
 
 Number ClampCosine(const Number mu) {
   return clamp(mu, Number(-1.0), Number(1.0));
@@ -120,14 +57,10 @@ vec2 GetTransmittanceTextureUvFromRMu(const AtmosphereParameters atmosphere,
     const Length r, const Number mu) {
   assert(r >= atmosphere.bottom_radius && r <= atmosphere.top_radius);
   assert(mu >= -1.0 && mu <= 1.0);
-  // Distance to top atmosphere boundary for a horizontal ray at ground level.
   Length H = sqrt(atmosphere.top_radius * atmosphere.top_radius -
       atmosphere.bottom_radius * atmosphere.bottom_radius);
-  // Distance to the horizon.
   Length rho =
       SafeSqrt(r * r - atmosphere.bottom_radius * atmosphere.bottom_radius);
-  // Distance to the top atmosphere boundary for the ray (r,mu), and its minimum
-  // and maximum values over all mu - obtained for (r,1) and (r,mu_horizon).
   Length d = DistanceToTopAtmosphereBoundary(atmosphere, r, mu);
   Length d_min = atmosphere.top_radius - r;
   Length d_max = rho + H;
@@ -143,9 +76,7 @@ DimensionlessSpectrum GetTransmittanceToTopAtmosphereBoundary(
     const Length r, const Number mu) {
   assert(r >= atmosphere.bottom_radius && r <= atmosphere.top_radius);
   vec2 uv = GetTransmittanceTextureUvFromRMu(atmosphere, r, mu);
-  // @shotamatsuda: Added for the precomputation stage in half-float precision.
   #ifdef TRANSMITTANCE_PRECISION_LOG
-  // Manually interpolate the transmittance instead of the optical depth.
   const vec2 size = vec2(TRANSMITTANCE_TEXTURE_WIDTH, TRANSMITTANCE_TEXTURE_HEIGHT);
   const vec3 texel_size = vec3(1.0 / size, 0.0);
   vec2 coord = (uv * size) - 0.5;
@@ -156,11 +87,10 @@ DimensionlessSpectrum GetTransmittanceToTopAtmosphereBoundary(
   vec4 t3 = exp(-textureLod(transmittance_texture, i + texel_size.zy, 0.0));
   vec4 t4 = exp(-textureLod(transmittance_texture, i + texel_size.xy, 0.0));
   return DimensionlessSpectrum(mix(mix(t1, t2, f.x), mix(t3, t4, f.x), f.y));
-  #else // TRANSMITTANCE_PRECISION_LOG
+  #else
   return DimensionlessSpectrum(textureLod(transmittance_texture, uv, 0.0));
-  #endif // TRANSMITTANCE_PRECISION_LOG
+  #endif
 }
-
 DimensionlessSpectrum GetTransmittance(
     const AtmosphereParameters atmosphere,
     const TransmittanceTexture transmittance_texture,
@@ -221,32 +151,23 @@ vec4 GetScatteringTextureUvwzFromRMuMuSNu(const AtmosphereParameters atmosphere,
   assert(mu_s >= -1.0 && mu_s <= 1.0);
   assert(nu >= -1.0 && nu <= 1.0);
 
-  // Distance to top atmosphere boundary for a horizontal ray at ground level.
   Length H = sqrt(atmosphere.top_radius * atmosphere.top_radius -
       atmosphere.bottom_radius * atmosphere.bottom_radius);
-  // Distance to the horizon.
   Length rho =
       SafeSqrt(r * r - atmosphere.bottom_radius * atmosphere.bottom_radius);
   Number u_r = GetTextureCoordFromUnitRange(rho / H, SCATTERING_TEXTURE_R_SIZE);
 
-  // Discriminant of the quadratic equation for the intersections of the ray
-  // (r,mu) with the ground (see RayIntersectsGround).
   Length r_mu = r * mu;
   Area discriminant =
       r_mu * r_mu - r * r + atmosphere.bottom_radius * atmosphere.bottom_radius;
   Number u_mu;
   if (ray_r_mu_intersects_ground) {
-    // Distance to the ground for the ray (r,mu), and its minimum and maximum
-    // values over all mu - obtained for (r,-1) and (r,mu_horizon).
     Length d = -r_mu - SafeSqrt(discriminant);
     Length d_min = r - atmosphere.bottom_radius;
     Length d_max = rho;
     u_mu = 0.5 - 0.5 * GetTextureCoordFromUnitRange(d_max == d_min ? 0.0 :
         (d - d_min) / (d_max - d_min), SCATTERING_TEXTURE_MU_SIZE / 2);
   } else {
-    // Distance to the top atmosphere boundary for the ray (r,mu), and its
-    // minimum and maximum values over all mu - obtained for (r,1) and
-    // (r,mu_horizon).
     Length d = -r_mu + SafeSqrt(discriminant + H * H);
     Length d_min = atmosphere.top_radius - r;
     Length d_max = rho + H;
@@ -262,10 +183,6 @@ vec4 GetScatteringTextureUvwzFromRMuMuSNu(const AtmosphereParameters atmosphere,
   Length D = DistanceToTopAtmosphereBoundary(
       atmosphere, atmosphere.bottom_radius, atmosphere.mu_s_min);
   Number A = (D - d_min) / (d_max - d_min);
-  // An ad-hoc function equal to 0 for mu_s = mu_s_min (because then d = D and
-  // thus a = A), equal to 1 for mu_s = 1 (because then d = d_min and thus
-  // a = 0), and with a large slope around mu_s = 0, to get more texture
-  // samples near the horizon.
   Number u_mu_s = GetTextureCoordFromUnitRange(
       max(1.0 - a / A, 0.0) / (1.0 + a), SCATTERING_TEXTURE_MU_S_SIZE);
 
@@ -292,4 +209,4 @@ IrradianceSpectrum GetIrradiance(
   return IrradianceSpectrum(textureLod(irradiance_texture, uv, 0.0));
 }
 
-#endif // BRUNETON_COMMON
+#endif

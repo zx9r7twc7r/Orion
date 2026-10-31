@@ -53,21 +53,6 @@ public class TextGlyphRendererMixin {
 
     @Inject(method = "acceptRenderable", at = @At("HEAD"), cancellable = true)
     private void rtx$captureTextGlyph(TextRenderable renderable, CallbackInfo ci) {
-        // 2026-10-13：从 TAIL 移到 HEAD，并且**先镜像、再按需取消原版这一遍**。
-        //
-        // 位置为什么可以移到 HEAD：三个字段里 pose 是 @Final（原版改不了它），
-        // lightCoords/displayMode 是调用方在进来之前设好的"当前文字元素"状态 ——
-        // 所以 HEAD 读到的东西与 TAIL 逐位相同，镜像几何不会偏。
-        //
-        // 取消的条件是"本字形**镜像成功**"：镜像失败的早退路径（texture 解析不出、
-        // 槽号为 0）一律不取消，那些字形照旧由原版画 —— 所以不会出现"两边都没有"。
-        //
-        // 收益（2026-10-13 实测，城市图招牌区）：textEmitUs（原版函数体内）63.9~89.6ms
-        // 占 textPathUs 的 96%，而字形之间的间隙只有 1.5~3.4ms ⇒ 这一遍几乎全是
-        // "造一份马上被整帧替换掉的顶点"。原版 profiler 同期报 Text = 整帧 76.24%。
-        //
-        // ⚠ 必须 HEAD+cancel：Mixin 的 ci.cancel() 会让方法立刻返回，因此原方法的
-        // TAIL 注入点不会再执行 —— 若还把镜像留在 TAIL，取消之后镜像也没了。
         final boolean mirrored = EntityRtCapture.captureTextGlyph(
                 renderable, this.pose, this.lightCoords, this.displayMode);
 

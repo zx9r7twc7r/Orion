@@ -52,21 +52,12 @@ public final class FrameBudget {
 
     private static final int WINDOW = 60;
 
-    /** 上一帧 render() HEAD 的时刻。 */
     private static long lastHeadNanos;
-    /** 上一帧 render() 自身的耗时（ms），由 tail() 写入。 */
     private static double lastRenderMs;
 
-    // ---------------------------------------------------------------
-    // 2026-10-14 第二段：runTick 的三个时刻（见类注释的图）。
-    // ---------------------------------------------------------------
-    /** 本帧 runTick() 入口时刻。 */
     private static long tickHeadNanos;
-    /** 本帧 renderFrame() 之前那一刻（模拟段结束）。 */
     private static long beforeRenderFrameNanos;
-    /** 上一帧的模拟段耗时（ms）。 */
     private static double lastSimMs;
-    /** 上一帧 renderFrame() 减去 render() 的剩余耗时（ms）。 */
     private static double lastFrameTailMs;
 
     private static int frames;
@@ -78,22 +69,6 @@ public final class FrameBudget {
     private static double sumAcquireMs;
     private static double sumPresentMs;
 
-    // ---------------------------------------------------------------
-    // 2026-10-22 A1：把 renderFrameTail 的 9ms 再拆一刀。
-    //
-    // 实测（242 个 60 帧窗口）：frameTail 中位数 9.22ms，而 acquire+present 只有
-    // 0.21ms ⇒ 剩下约 9ms 在日志里没有任何归属。三个新读数全部纯读时钟：
-    //   renderFrameInnerMs = render() 返回到 renderFrame() 返回（renderFrame 内剩余）
-    //   postRenderFrameMs  = renderFrame() 返回到 runTick() 返回（runTick 内剩余）
-    //   submitMs           = VulkanCommandEncoder.submit 的墙钟（含 vkQueueSubmit 与
-    //                        队列/fence 等待；一帧可能多次 ⇒ 按帧累加）
-    //
-    // 判读（这是 A1 的全部目的，先定靶再优化）：
-    //   · submitMs ≈ frameTail ⇒ 卡在队列等待（GPU 满 / 帧生成排队 / 帧节奏），
-    //     此时减 GPU pass 才有 fps 收益；
-    //   · renderFrameInnerMs 大而 submitMs 小 ⇒ 原版 renderFrame 自己的活；
-    //   · 两者都小 ⇒ 卡在我们之外的 Java 逻辑（HUD/GUI/窗口事件）。
-    // ---------------------------------------------------------------
     private static long renderTailNanos;
     private static long afterRenderFrameNanos;
     private static double lastRenderFrameInnerMs;
@@ -113,42 +88,17 @@ public final class FrameBudget {
     private static double maxRenderMs;
     private static double maxSimMs;
 
-    // ---------------------------------------------------------------
-    // 2026-10-14 第三段：交换链 acquire / present（它们落在 renderFrame 里、
-    // GameRenderer.render 之外 ⇒ 正是上面那个"稳态 7.5~9ms 的 frameTail"）。
-    // 见 com.mojang.renderpearl.api.device.GpuSurface 的接口。
-    // 注意：一帧里可能调用多次（帧生成会把 present 调多次）⇒ 这里**按帧累加**。
-    // ---------------------------------------------------------------
     private static long acquireStartNanos;
     private static long presentStartNanos;
-    /** 本帧累计（多次调用求和）。 */
     private static double frameAcquireMs;
     private static double framePresentMs;
-    /** 上一帧的合计。 */
     private static double lastAcquireMs;
     private static double lastPresentMs;
 
-    // ---------------------------------------------------------------
-    // 2026-10-14 第四段：原版 Minecraft.tick() 本身的耗时（simMs 的第一刀）。
-    // 一帧里可能调用多次（追帧时 MAX_TICKS_PER_UPDATE）⇒ 按帧累加。
-    // 先例：交换链只占 0.26ms ⇒ simMs 的 7.6ms 只可能来自"原版 tick / 区块结果消费 /
-    // 我们自己的上传与 JNI"。这一刀把"原版 tick"这一项单独摘出来。
-    // ---------------------------------------------------------------
     private static long vanillaTickStartNanos;
     private static double frameVanillaTickMs;
     private static double lastVanillaTickMs;
 
-    // ---------------------------------------------------------------
-    // 2026-10-15 第五段：主线程任务泵（BlockableEventLoop.runAllTasks/doRunTask）。
-    // javap 实证 Minecraft.runTick 的字节码里有 3 处 runAllTasks:()V 调用 ——
-    // 区块编译完成后的消费/上传任务就在这个队列里跑，它是"simMs − vanillaTickMs"
-    // 的大头嫌疑（移动时 simMs 20.28 vs vanillaTick 0.56）。runAllTasks 计整段
-    // 抽干，doRunTask 计单个任务（次数/合计/单任务最大值，用于抓离群任务）。
-    // BlockableEventLoop 也被 worker 线程的循环继承，所以用 tickHead 时记录的
-    // 主线程引用做门卫：非主线程一律不累计。
-    // 注意口径：tick() 内部若也 pump 任务，taskMs 会与 vanillaTickMs 重叠，
-    // 读数时相减要留意。
-    // ---------------------------------------------------------------
     private static volatile Thread mainThread;
     private static long taskPumpStartNanos;
     private static long taskRunStartNanos;
@@ -165,31 +115,12 @@ public final class FrameBudget {
     private static int sumTaskCount;
     private static double maxTaskMaxMs;
 
-    // ---------------------------------------------------------------
-    // 2026-10-15 第六段：runTick HEAD 处我们自己的三个 JNI。
-    // 任务泵已排除（runAllTasksMs ≈ 0.03ms）⇒ simMs − vanillaTickMs − taskMs
-    // 的 ~6.5ms 剩余嫌疑就在 tickHead 钩子本身：beginStreamlineFrame（头号
-    // 嫌疑，可能含帧围栏/GPU 等待）、markSimulationStart、setFullscreenMenuOpen。
-    // 槽位：0=beginStreamlineFrame 1=markSimulationStart 2=setFullscreenMenuOpen。
-    // 计时点在 MinecraftReflexMixin.reflex$beginStreamlineFrame 里，调用方用
-    // System.nanoTime 夹住单个 JNI 调用后喂进来。
-    // ---------------------------------------------------------------
     private static final int JNI_HEAD_SLOTS = 3;
     private static final double[] frameJniHeadMs = new double[JNI_HEAD_SLOTS];
     private static final double[] lastJniHeadMs = new double[JNI_HEAD_SLOTS];
     private static final double[] sumJniHeadMs = new double[JNI_HEAD_SLOTS];
     private static final double[] maxJniHeadMs = new double[JNI_HEAD_SLOTS];
 
-    // ---------------------------------------------------------------
-    // 2026-10-15 第七段：帧间空档 + GC（Outside 30-36ms 的归因）。
-    // A/B 局读数：interval 40 ≈ sim 7.7（≈全部是 beginStreamline 的 Reflex
-    // 睡眠）+ render 5 + frameTail 7.9（交换链只占 0.26）⇒ 还有 ~19ms 未归因，
-    // 候选：runTick RETURN 到下一帧 runTick HEAD 的主循环空档、GC 暂停、
-    // runTick 内其它未钩的段。两个新读数都零侵入：
-    //   · gapMs：tickTail 记 RETURN 时刻，下一帧 tickHead 差分；
-    //   · gcMs：GarbageCollectorMXBean 累计值在 report() 差分（免 JVM 参数；
-    //     G1 并行/concurrent 时间都计入，口径是墙钟）。
-    // ---------------------------------------------------------------
     private static long lastTickTailNanos;
     private static double lastGapMs;
     private static double sumGapMs;
@@ -197,16 +128,6 @@ public final class FrameBudget {
     private static long prevGcTimeMs;
     private static long prevGcCount;
 
-    // ---------------------------------------------------------------
-    // 2026-10-15 第八段：sim 段四路细拆（runTick HEAD → renderFrame HEAD）。
-    // 为什么量：帧间空档 gapMs=0.03、gcMs=0 已排除 ⇒ Outside 的归因落到 runTick
-    // 内部，而 vanillaTick(0.13)/taskPump(0.03)/三个 JNI 全部只占 ~0.5ms，
-    // sim 的 12-16ms 还没着落。对照反编译源（26.3 Minecraft.runTick）按嫌疑排序：
-    //   0=PacketProcessor.processQueuedPackets（主线程网络包——流式期区块数据洪水）
-    //   1=LevelExtractor.collectPerFrameMainThreadGizmos（26.3 新管线主线程区块提取）
-    //   2=SoundManager.updateSource        3=MouseHandler.handleAccumulatedMovement
-    // 计时点在 FrameSimSplitMixin 四个类里，纯读时钟。
-    // ---------------------------------------------------------------
     private static final int SIM_SUB_SLOTS = 4;
     private static final double[] frameSimSubMs = new double[SIM_SUB_SLOTS];
     private static final double[] lastSimSubMs = new double[SIM_SUB_SLOTS];
@@ -220,7 +141,6 @@ public final class FrameBudget {
         frameJniHeadMs[slot] += nanos / 1_000_000.0;
     }
 
-    /** sim 段四路子项的计时（start/end 由 FrameSimSplitMixin 四个类调用；slot 见第八段说明）。 */
     private static final long[] simSubStartNanos = new long[SIM_SUB_SLOTS];
 
     /** 是否处于"主线程 + 本帧 runTick 段内"——四路子项只在这个窗口里累计。 */
@@ -256,7 +176,6 @@ public final class FrameBudget {
     public static void tickHead() {
         mainThread = Thread.currentThread();
         tickHeadNanos = System.nanoTime();
-        // 2026-10-15 第七段：与上一帧 runTick RETURN 的差分 = 帧间空档。
         if (lastTickTailNanos != 0L) {
             lastGapMs = (tickHeadNanos - lastTickTailNanos) / 1_000_000.0;
         } else {
@@ -264,8 +183,6 @@ public final class FrameBudget {
         }
         beforeRenderFrameNanos = 0L;
         afterRenderFrameNanos = 0L;
-        // 2026-10-22 A1：本帧没走到 render() 时（全屏菜单等），不能让上一帧的
-        // renderTail 参与本帧的 frameTail 拆分。
         renderTailNanos = 0L;
         frameAcquireMs = 0.0;
         framePresentMs = 0.0;
@@ -387,17 +304,13 @@ public final class FrameBudget {
         final double tickMs = (tickTailNanos - tickHeadNanos) / 1_000_000.0;
         lastFrameTailMs = tickMs - lastSimMs - lastRenderMs;
 
-        // 2026-10-22 A1：frameTail 的第二刀。renderFrame 返回后到 runTick 返回。
-        // 若某帧没走 renderFrame（全屏菜单等）则记 0，此时 frameTail 全算在 post 之外。
         if (afterRenderFrameNanos != 0L) {
             lastPostRenderFrameMs = (tickTailNanos - afterRenderFrameNanos) / 1_000_000.0;
         } else {
-            // 本帧没调 renderFrame（全屏菜单/加载中）：两段都记 0，frameTail 只剩交换链。
             lastPostRenderFrameMs = 0.0;
             lastRenderFrameInnerMs = 0.0;
         }
 
-        // 本帧的 acquire/present 合计（下一帧的 head() 才结算，与其它项同口径）。
         lastAcquireMs = frameAcquireMs;
         lastPresentMs = framePresentMs;
         lastSubmitMs = frameSubmitMs;
@@ -410,8 +323,6 @@ public final class FrameBudget {
         System.arraycopy(frameJniHeadMs, 0, lastJniHeadMs, 0, JNI_HEAD_SLOTS);
         System.arraycopy(frameSimSubMs, 0, lastSimSubMs, 0, SIM_SUB_SLOTS);
 
-        // 2026-10-15 第七段：runTick RETURN 时刻（下一帧 tickHead 差分出 gap）。
-        // 2026-10-22 A1：与上面的 tickMs 用同一个采样点，避免两次 nanoTime 带来微秒级错位。
         lastTickTailNanos = tickTailNanos;
 
         tickHeadNanos = 0L;
@@ -429,15 +340,11 @@ public final class FrameBudget {
             sumRenderMs += lastRenderMs;
             sumOutsideMs += intervalMs - lastRenderMs;
 
-            // 2026-10-14 第二段：runTick 的三段（上一帧的读数在本帧才结算，
-            // 与 lastRenderMs 同为"上一帧"口径）。
             sumSimMs += lastSimMs;
             sumFrameTailMs += lastFrameTailMs;
-            // 2026-10-15 第七段：帧间空档（本帧 tickHead 已差分好）。
             sumGapMs += lastGapMs;
             sumAcquireMs += lastAcquireMs;
             sumPresentMs += lastPresentMs;
-            // 2026-10-22 A1：frameTail 的两段 + 我们自己的 submit 墙钟。
             sumRenderFrameInnerMs += lastRenderFrameInnerMs;
             sumPostRenderFrameMs += lastPostRenderFrameMs;
             sumSubmitMs += lastSubmitMs;
@@ -455,7 +362,6 @@ public final class FrameBudget {
                     maxJniHeadMs[slot] = lastJniHeadMs[slot];
                 }
             }
-            // 2026-10-15 第八段：sim 四路子项同帧结算。
             for (int slot = 0; slot < SIM_SUB_SLOTS; ++slot) {
                 sumSimSubMs[slot] += lastSimSubMs[slot];
             }
@@ -482,7 +388,6 @@ public final class FrameBudget {
             return;
         }
 
-        // 2026-10-22 A1：同一个采样点既算 render() 自身，也作为 frameTail 第一刀的起点。
         final long now = System.nanoTime();
         lastRenderMs = (now - lastHeadNanos) / 1_000_000.0;
         renderTailNanos = now;
@@ -556,7 +461,6 @@ public final class FrameBudget {
                         + " presentMs=" + round(sumPresentMs / inv)
                         + "  (= frameTail 里交换链的占比；"
                         + "acquire 阻塞 ⇒ 队列满/FG 排队；present 阻塞 ⇒ 驱动/vsync)");
-        // 2026-10-22 A1：frameTail 的第二刀（见字段区注释的判读）。
         System.out.println(
                 "                [FRAME TAIL SPLIT] renderFrameInnerMs="
                         + round(sumRenderFrameInnerMs / inv)
@@ -570,7 +474,6 @@ public final class FrameBudget {
                 "                [FRAME SIM] vanillaTickMs=" + round(sumVanillaTickMs / inv)
                         + "  (= simMs 里的原版 tick；"
                         + "simMs − vanillaTickMs = 区块结果消费 + 我们的上传/JNI)");
-        // 2026-10-15 第八段：sim 段四路细拆。
         System.out.println(
                 "                [FRAME SIM SPLIT] packetsMs=" + round(sumSimSubMs[0] / inv)
                         + " extractMs=" + round(sumSimSubMs[1] / inv)
@@ -594,7 +497,6 @@ public final class FrameBudget {
                         + " menuMs=" + round(sumJniHeadMs[2] / inv)
                         + "  (= simMs 里我们自己的三个 JNI；"
                         + "beginStreamline 大 ⇒ 帧围栏/GPU 等待藏在 sim 段)");
-        // 2026-10-15 第七段：GC 时间（MXBean 差分，免 JVM 参数）。
         long gcTimeMs = 0L;
         long gcCount = 0L;
         for (java.lang.management.GarbageCollectorMXBean bean
@@ -638,7 +540,6 @@ public final class FrameBudget {
         sumGapMs = 0.0;
         sumAcquireMs = 0.0;
         sumPresentMs = 0.0;
-        // 2026-10-22 A1
         sumRenderFrameInnerMs = 0.0;
         sumPostRenderFrameMs = 0.0;
         sumSubmitMs = 0.0;

@@ -1,25 +1,6 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
-// ============================================================================
-// vol_diag.comp —— 体积 ReSTIR / SH 辐照度缓存的**诊断视图**
-//
-// 目的：回答"体积 ReSTIR 到底有没有生效、SH 缓存里到底有没有数据"。
-// 之前只能靠看画面猜（玻璃背后亮不亮），而 SH 全黑与"没灯"无法区分。
-//
-// 由 ORION_VOL_DIAG=1..4 打开（push.dbgMode = 1 + mode），在 finish 之后
-// 覆盖 rtOutput —— 整屏显示诊断量；关掉时本 pass 不 dispatch。
-//
-//   mode 1：SH 球谐辐照度（shLoadFiltered3D → hanning(0.7) → getIrradiance）
-//           全黑 ⇒ SH 缓存没数据（vol_restir 没跑 / 没注入）
-//   mode 2：体积 radiance（vol_restir_integrate 写的入散射辐亮度）
-//           全黑 ⇒ ReSTIR 没选到灯（灯表空 / reservoir 空）
-//   mode 3：SH 累积 age（越亮 = 历史越稳定；黑 = 每帧重置）
-//   mode 4：reservoir 有效性（绿 = lightIndex 非 0 且 sampleCount 非 0，红 = 空）
-//
-// 复用 glass_alpha_blend 的 descriptor set 与 push constant（同一 layout），
-// 所以 binding 编号与那边一致，多出的 13/14/15 是本 pass 专用。
-// ============================================================================
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -31,11 +12,9 @@ layout(set = 0, binding = 8) uniform CameraProperties
     #include "camera_ubo.glsl"
 } cam;
 
-// 与 glass_alpha_blend.comp 同编号（同一 set layout）。
 layout(rgba16f, set = 0, binding = 11) uniform readonly image3D volumeShY;
 layout(rgba16f, set = 0, binding = 12) uniform readonly image3D volumeShCoCg;
 
-// 本 pass 专用（blend/finish 不声明它们，布局是超集所以合法）。
 layout(rgba16f, set = 0, binding = 13) uniform readonly image3D volRadianceDebug;
 layout(r8,      set = 0, binding = 14) uniform readonly image3D volAgeDebug;
 layout(rgba32ui, set = 0, binding = 15) uniform readonly uimage3D volReservoirDebug;
@@ -61,9 +40,8 @@ layout(push_constant) uniform GlassAlphaBlendPush
     uint  shFroxelW;
     uint  shFroxelH;
     uint  shFroxelDepth;
-    uint  dbgMode;                // 1 = blend 诊断；2..5 = 本 pass 的 mode 1..4
+    uint  dbgMode;
 } pc;
-
 #include "spherical_harmonics.glsl"
 
 // reverse-Z 深度 → 相机到该像素几何的距离（与 glass_alpha_blend.comp 同款）。
@@ -99,7 +77,6 @@ vec3 volDiagSampleWorldPosition(ivec2 pixel, ivec2 extent)
     const float distance =
         volDiagSceneDistance(ndc, imageLoad(sceneDepth, pixel).r);
 
-    // 天空/无几何：用最远一层，避免整屏黑掉分不清"没数据"与"没几何"。
     const float usableDistance =
         distance > 0.0 ? distance : (pc.shMaxDistance * 0.95);
 
@@ -156,7 +133,6 @@ void main()
         return;
     }
 
-    // 色盲友好：黑底 + 先给一个明确的"不可用"红，避免和"数据为 0"混淆。
     vec3 debugColor = vec3(0.15, 0.0, 0.0);
 
     const ivec3 froxelSize =
@@ -177,10 +153,6 @@ void main()
 
             if(mode == 1u)
             {
-                // SH 球谐辐照度（消费端的**同一条**路径）。
-                //
-                // ⚠ 这里必须手写三线性：binding 11/12 是 storage image（没有 sampler），
-                //   spherical_harmonics.glsl 的 shLoadFiltered3D 收的是 sampler3D。
                 const vec3 normalized = clamp(
                     coordinate / vec3(froxelSize), vec3(0.0), vec3(1.0));
                 const vec3 texelPosition =
@@ -214,7 +186,6 @@ void main()
                 }
 
                 shHanningFilter(sh, 0.7);
-                // ×4 只是让低动态范围可见；数值本身没有做任何修改。
                 debugColor = shGetIrradiance(sh) * 4.0;
             }
             else if(mode == 2u)
@@ -229,9 +200,6 @@ void main()
             else
             {
                 const uvec4 raw = imageLoad(volReservoirDebug, clamped);
-                // 与 vol_restir_common.glsl:66-78 的 packing 对齐：
-                //   x = lightIndex(16b) | flags(2b)<<16 | age(8b)<<18
-                //   w = M（样本数）
                 const uint lightIndex = raw.x & 0xFFFFu;
                 const uint sampleCount = raw.w;
                 debugColor = (lightIndex != 0u && sampleCount != 0u)

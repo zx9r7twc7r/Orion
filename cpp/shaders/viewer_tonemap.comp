@@ -1,20 +1,15 @@
 #version 460
 
-// 交互预览器的最后一道：HDR 云图（rgba16f，预乘辐亮度 + 透射率）→ 窗口 LDR 图。
-// 与游戏里的合成口径一致：rgb + sky * transmittance，然后固定曝光 + sRGB 近似。
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform sampler2D cloudImage;
-// 不加 format 限定：presentImage 跟着交换链格式走（多为 B8G8R8A8），
-// 写死 rgba8 会与图像格式不匹配，dispatch 被丢弃 -> 黑屏。
 layout(set = 0, binding = 1) uniform writeonly image2D presentImage;
 
 layout(push_constant) uniform Push
 {
-    vec4 skyColor;      // rgb = 天空辐亮度，a = 曝光
+    vec4 skyColor;
 } push;
-
 void main()
 {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -29,9 +24,6 @@ void main()
 
     color *= max(push.skyColor.a, 0.05);
 
-    // ACES 近似（Narkowicz）：原来用 Reinhard(x/(1+x))，问题是它**不去饱和** ——
-    // 日落那种强饱和光会把高光也压成同一种橙色（实测整幅 G≈0.77R、B≈0.49R），
-    // 而真实照片里最亮的部分是接近白的金白。ACES 的高光段会自然向白收敛。
     const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
     color = clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
 

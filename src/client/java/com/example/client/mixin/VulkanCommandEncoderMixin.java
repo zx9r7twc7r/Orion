@@ -164,9 +164,8 @@ public abstract class VulkanCommandEncoderMixin {
 
         if(currentCommandBuffer == null)
         {
-            return;   // 这里不要清零
+            return;
         }
-
 
         long handle =
                 currentCommandBuffer.address();
@@ -216,15 +215,6 @@ public abstract class VulkanCommandEncoderMixin {
         NativeVulkan.markRenderSubmitEnd();
     }
 
-    // ---------------------------------------------------------------
-    // 2026-10-22 A1（帧预算第九段）：submit 的整体墙钟。
-    //
-    // 为什么量它：实测 frameTail 中位数 9.22ms，而 acquire(0.015)+present(0.197)
-    // 只占 0.21ms ⇒ 剩下约 9ms 无处归因。vkQueueSubmit 在队列满 / 帧生成排队 /
-    // 帧节奏受限时是会阻塞的，而这一段恰好落在 render() 之外 ⇒ 它是头号嫌疑。
-    // 一帧可能 submit 多次（多 pass / 帧生成）⇒ FrameBudget 按帧累加并计数。
-    // 纯读时钟，不改任何渲染行为。
-    // ---------------------------------------------------------------
     @Inject(method = "submit", at = @At("HEAD"), remap = false)
     private void frameBudget$submitHead(CallbackInfo ci) {
         FrameBudget.submitHead();
